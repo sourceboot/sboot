@@ -13,10 +13,16 @@
 //	│   └── labs/<stage>/lab.toml  the tests, one lab at a time
 //	└── work/<repo-key>/         ← scratch build root, one per repo (see stageRun)
 //
-// THE GRADER IS NOT IN HERE. It used to be (`xtask/`, a Rust crate); since 2026-08-02
-// it is grader/, compiled into this binary and into the server-side runner alike. What
-// is cached is a course's own build command and its tests — so a C course caches a
-// LICENCE and some TOML, and needs no Rust anywhere.
+// THE GRADER IS IN HERE, as `bin/sboot-judge` — a compiled binary fetched per
+// platform, digest-checked and exec'd, and NOT part of this program (it is not
+// published with the MIT CLI; see the grading-engine distribution decision). What else is cached is
+// a course's own build tooling and its tests — so a C course caches a LICENCE, some
+// TOML and the engine, and needs no Rust anywhere.
+//
+// It has been three things in a month, which is why every comment about it is dated:
+// a Rust crate in the learner's repo (`xtask/`), then code compiled into this binary
+// (Phase 4 of the Rust→Go port, 2026-08-02), then this. The middle one lasted hours —
+// it made publishing the CLI mean publishing the engine under an irreversible licence.
 //
 // macOS uses ~/Library/Application Support/sboot, Windows %LOCALAPPDATA%\sboot.
 // SBOOT_CACHE_DIR overrides all of it (tests use that rather than a real home).
@@ -87,10 +93,10 @@ type specManifest struct {
 	// what judgeRelease reports as "this course publishes no engine for you".
 	Judge specJudge `json:"judge"`
 	// How this course is BUILT and where its artifact lands — course.yaml's
-	// `grader:` block, served by the platform's getGrader. Since Phase 4 the CLI
-	// judges in process, so the build command is the only thing it still has to be
-	// told; before that it hardcoded `cargo xtask grade`, which is exactly why a C
-	// or Zig course could not have used the same CLI (docs/multi-language-options.md).
+	// `grader:` block, served by the platform's getGrader. The CLI runs the build
+	// itself and passes the artifact path to the engine; it once hardcoded
+	// `cargo xtask grade`, which is exactly why a C or Zig course could not have used
+	// the same CLI (docs/multi-language-options.md).
 	//
 	// Deliberately NOT part of the spec version's content hash: it is configuration
 	// rather than content, and renaming a build command must not invalidate every
@@ -211,7 +217,7 @@ func platformKey() string { return runtime.GOOS + "-" + runtime.GOARCH }
 
 // buildToolDir is the course's own build tooling, when it has any — `cargo xtask
 // build` for the Rust courses, nothing at all for a Makefile course. NOT the grader:
-// that is compiled into this binary.
+// that is judgePath, a separate binary.
 func (s spec) buildToolDir() string       { return filepath.Join(s.dir, "xtask") }
 func (s spec) labsDir() string            { return filepath.Join(s.dir, "labs") }
 func (s spec) labDir(stage string) string { return filepath.Join(s.labsDir(), stage) }

@@ -1,8 +1,9 @@
 // sboot — the learner's CLI. Two-tier grading (the content-protection rules):
 //
-//	sboot test <stage>    practice — builds locally and judges the published checks
-//	                    in-process (grade.go); fast, offline-friendly, recorded as a
-//	                    practice run, never completes a stage.
+//	sboot test <stage>    practice — builds locally, then execs the grading engine
+//	                    (grade.go) against the published checks; fast,
+//	                    offline-friendly, recorded as a practice run, never
+//	                    completes a stage.
 //	sboot submit <stage>  official — gates on a local run, then uploads the os/
 //	                    source tree; the platform's runner builds it with the pinned
 //	                    toolchain, boots it in QEMU server-side, and grades the full
@@ -938,13 +939,14 @@ func uploadCapture(run, id, prepared string, a *shadowAssignment) {
 
 	blob := readCapture(prepared)
 	if blob == nil {
-		// Nothing to compare. Since the grader is compiled into this binary there is
-		// no longer a "the workspace pinned an xtask too old for --capture-out" case
-		// to fall back from (that fallback — a second build and a second boot via
-		// `cargo xtask capture` — was deleted with the shell-out in Phase 4). What is
-		// left is a real local failure: the gate could not run, or the blob could not
-		// be written. Either way the authoritative verdict is the server's, so this
-		// costs the shadow comparison and nothing else.
+		// Nothing to compare. There is no longer a "the workspace pinned an xtask too
+		// old for --capture-out" case to fall back from — that fallback, a second
+		// build and a second boot via `cargo xtask capture`, was deleted with the
+		// shell-out in Phase 4, and the engine's capture flag is not optional now that
+		// the CLI fetches the engine with the tests. What is left is a real local
+		// failure: the gate could not run, or the blob could not be written. Either
+		// way the authoritative verdict is the server's, so this costs the shadow
+		// comparison and nothing else.
 		logf("the local check produced no capture; skipping the dual-run comparison")
 		return
 	}
