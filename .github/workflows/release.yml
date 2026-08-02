@@ -1,0 +1,79 @@
+name: release
+on:
+  push:
+    tags: ["sboot-v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with: { go-version: "1.24" }
+      - run: go test ./...
+      - name: cross-compile
+        run: |
+          VERSION="${GITHUB_REF_NAME#sboot-}"
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            GOOS="${target%/*}"; GOARCH="${target#*/}"
+            ext=""; [ "$GOOS" = "windows" ] && ext=".exe"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+              go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+              -o "dist/sboot-${GOOS}-${GOARCH}${ext}" ./cmd/sboot
+          done
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with: { name: dist, path: dist/* }
+
+  verify:
+    needs: build
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: ubuntu-latest,  artifact: sboot-linux-amd64 }
+          - { os: macos-latest,   artifact: sboot-darwin-arm64 }
+          - { os: windows-latest, artifact: sboot-windows-amd64.exe }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      # Run the exact bytes about to be published. A wrong -ldflags stamp would make
+      # "which versions are affected?" unanswerable during a bad-release recovery.
+      - shell: bash
+        run: |
+          BIN="dist/${{ matrix.artifact }}"
+          chmod +x "$BIN" || true
+          GOT="$("./$BIN" version)"
+          WANT="${GITHUB_REF_NAME#sboot-}"
+          echo "$BIN reports: $GOT (tag says $WANT)"
+          case "$GOT" in *"$WANT"*) ;; *) echo "::error::version mismatch"; exit 1 ;; esac
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - env: { GH_TOKEN: "${{ github.token }}" }
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Install:
+          \`\`\`sh
+          curl -fsSL https://sourceboot.com/install.sh | sh
+          \`\`\`
+
+          Pin this version:
+          \`\`\`sh
+          SBOOT_VERSION=$GITHUB_REF_NAME curl -fsSL https://sourceboot.com/install.sh | sh
+          \`\`\`
+
+          Verify downloads against \`SHA256SUMS\`. Releases are never deleted or
+          re-tagged, so this version stays installable."
