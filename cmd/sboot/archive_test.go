@@ -1,5 +1,5 @@
 // The submit archive's wire format: what `sboot submit` uploads has to be a tree the
-// runner's extractor can put back together, on every OS release.yml ships a binary for.
+// server's extractor can put back together, on every OS release.yml ships a binary for.
 //
 // Why these live here and not only in the client matrix: L11's assertions in
 // clientmatrix/matrix_test.go can only fail where the host separator is not "/", so they
@@ -20,7 +20,7 @@ import (
 	"testing"
 )
 
-// Tar entry names are "/"-separated by spec. runner/main.go's extractTarGz reads them
+// Tar entry names are "/"-separated by spec. grader.ExtractSourceTar reads them
 // that way, so `kernel\main.rs` is not a path to it — it is one file with a backslash in
 // its name, and the learner's tree arrives flattened. This is L11, which a real
 // windows-latest runner confirmed on 2026-07-27.
@@ -41,7 +41,7 @@ func TestTarEntryNamesAreAlwaysSlashSeparated(t *testing.T) {
 
 	for _, name := range append(append([]string{}, files...), dirs...) {
 		if strings.Contains(name, `\`) {
-			t.Errorf("tar entry %q carries the host separator; the runner unpacks that as ONE "+
+			t.Errorf("tar entry %q carries the host separator; the server unpacks that as ONE "+
 				"flat file with a backslash in its name, not as a path", name)
 		}
 	}

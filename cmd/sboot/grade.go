@@ -12,9 +12,9 @@
 // So the engine is now a separate program, `sboot-judge`, fetched per platform with
 // the course spec and exec'd from the cache (cache.go, judgeBinary). Phase 4's real
 // win is untouched: it is still ONE implementation, compiled once, linked by the
-// server-side runner and shipped to the learner — a practice verdict and an official
-// one cannot disagree by reimplementation. Only the call boundary moved, from a
-// function call to a process.
+// server-side judge (platform/judgehttp) and shipped to the learner — a practice
+// verdict and an official one cannot disagree by reimplementation. Only the call
+// boundary moved, from a function call to a process.
 //
 // EVERYTHING A LEARNER SEES IS UNCHANGED, deliberately and down to the byte: the
 // `── grading <lab>` header on stderr, the build output streamed live, the blank
@@ -86,10 +86,15 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 	// The engine owns FindLab's prefix rule and the lab.toml parse, so that WHICH
 	// rubric gets graded has exactly one implementation. It prints its own refusal
 	// on stderr; exit 2 is a usage error, not a grade.
-	var labDirOut bytes.Buffer
-	resolve := exec.Command(engine, "resolve", "--root", runDir, "--lab", labID, "--course", course)
-	resolve.Stdout, resolve.Stderr = &labDirOut, os.Stderr
-	if err := resolve.Run(); err != nil {
+	//
+	// `--grader` (2026-08-13) additionally asks for the lab's OWN build/artifact
+	// (os2-rust builds a different image per lab). An older cached engine rejects
+	// the flag with exit 2, so on any exit failure the resolve is retried without
+	// it: a real refusal (unknown lab, unreadable rubric) fails identically both
+	// times and its message reaches the learner once, from the retry, while an
+	// old engine's "unknown argument" complaint is swallowed with the first run.
+	labDir, labGrader, err := resolveLab(engine, runDir, course, labID)
+	if err != nil {
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) {
 			run.launchFailed = true
@@ -99,7 +104,6 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 		run.exitCode = ee.ExitCode()
 		return run
 	}
-	labDir := strings.TrimSpace(labDirOut.String())
 	if labDir == "" {
 		run.launchFailed = true
 		run.launchErr = fmt.Errorf("%s resolve printed no lab directory", filepath.Base(engine))
@@ -109,8 +113,17 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 	fmt.Fprintf(os.Stderr, "── grading %s\n", filepath.Base(labDir))
 
 	// ── Build (the one subprocess this file owns, and the course's own) ────────
+	// Precedence: the LAB's own build command (lab.toml, via resolve --grader),
+	// then the course-level manifest (course.yaml `grader:`), then the compiled-in
+	// Rust/QEMU default. Same rule for the artifact below. NO SHELL either way —
+	// argv is strings.Fields, and the command comes only from server-side content
+	// we author, never from anything a learner writes.
 	gm := courseGrader(course)
-	build := argv(gm.Build, defaultBuildCmd)
+	buildCmd := labGrader.build
+	if buildCmd == "" {
+		buildCmd = gm.Build
+	}
+	build := argv(buildCmd, defaultBuildCmd)
 	cmd := exec.Command(build[0], build[1:]...)
 	cmd.Dir = runDir
 	// INHERITED, not captured. The build is the slow part of a practice run and its
@@ -151,9 +164,16 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 	// now's, which is a wrong number rather than an error.
 	_ = os.Remove(protocolPath)
 
+	// The resolved artifact travels on the command line even though `grade` would
+	// fall back to the lab.toml value on its own — passing it keeps the CLI's idea
+	// and the engine's idea visibly the same value, resolved by one rule.
+	artifact := labGrader.artifact
+	if artifact == "" {
+		artifact = gm.Artifact
+	}
 	args := []string{"grade", "--root", runDir, "--lab-dir", labDir, "--protocol", protocolPath}
-	if gm.Artifact != "" {
-		args = append(args, "--artifact", gm.Artifact)
+	if artifact != "" {
+		args = append(args, "--artifact", artifact)
 	}
 	if tierSpec != "" {
 		args = append(args, "--tier", tierSpec)
@@ -211,9 +231,76 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 	return run
 }
 
+// labGraderManifest is what `resolve --grader` reported about the lab itself:
+// its own build command and artifact path, both possibly empty ("use the course
+// default"). See grader/lab.go — the build command is split with strings.Fields,
+// no shell.
+type labGraderManifest struct {
+	build    string
+	artifact string
+}
+
+// resolveLab runs `sboot-judge resolve --grader` and parses the lab directory
+// plus the lab's own grader manifest off its stdout:
+//
+//	<lab dir>
+//	build=<cmd or empty>
+//	artifact=<rel or empty>
+//
+// An engine cached before the flag existed exits 2 on it, so ANY exit failure is
+// retried once without the flag — course-level values then apply, which is
+// exactly what that engine's rubrics could express. A genuine refusal (unknown
+// lab, unreadable rubric) fails both runs; only the retry's stderr is shown, so
+// the learner reads the real message exactly once and never the old engine's
+// "unknown argument" complaint. A launch failure (the binary cannot start) is
+// not retried: the second run cannot start either.
+func resolveLab(engine, runDir, course, labID string) (labDir string, lg labGraderManifest, err error) {
+	base := []string{"resolve", "--root", runDir, "--lab", labID, "--course", course}
+
+	var out, errBuf bytes.Buffer
+	first := exec.Command(engine, append(base, "--grader")...)
+	first.Stdout, first.Stderr = &out, &errBuf
+	if runErr := first.Run(); runErr != nil {
+		var ee *exec.ExitError
+		if !errors.As(runErr, &ee) {
+			return "", lg, runErr
+		}
+		out.Reset()
+		retry := exec.Command(engine, base...)
+		retry.Stdout, retry.Stderr = &out, os.Stderr
+		if runErr := retry.Run(); runErr != nil {
+			return "", lg, runErr
+		}
+		return strings.TrimSpace(out.String()), lg, nil
+	}
+	// Success: forward anything resolve said on stderr (today: nothing).
+	if errBuf.Len() > 0 {
+		fmt.Fprint(os.Stderr, errBuf.String())
+	}
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) > 0 {
+		labDir = strings.TrimSpace(lines[0])
+	}
+	for _, l := range lines[1:] {
+		l = strings.TrimSpace(l)
+		switch {
+		case strings.HasPrefix(l, "build="):
+			lg.build = strings.TrimSpace(strings.TrimPrefix(l, "build="))
+		case strings.HasPrefix(l, "artifact="):
+			lg.artifact = strings.TrimSpace(strings.TrimPrefix(l, "artifact="))
+		}
+		// Unknown lines are ignored on purpose: the record list is append-only,
+		// and a CLI on a learner's machine must keep parsing a newer engine's
+		// output (the same rule as parseVerdict).
+	}
+	return labDir, lg, nil
+}
+
 // argv splits a command string into argv — whitespace, no shell, no quoting — falling
-// back to `def` when the manifest says nothing. Same rule as the runner's cmdOr:
-// commands come only from server-side config, never from anything a learner writes.
+// back to `def` when the manifest says nothing. The rule that makes it safe to
+// execute: commands come only from server-side config, never from anything a
+// learner writes.
 func argv(cmd, def string) []string {
 	if f := strings.Fields(cmd); len(f) > 0 {
 		return f

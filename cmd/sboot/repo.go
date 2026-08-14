@@ -47,6 +47,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 )
 
 // manifestName is the marker file. Workspace detection used to look for `labs/` +
@@ -166,7 +167,7 @@ func writeRepoFiles(dir, course, title, firstStage string) error {
 		{manifestName, sbootToml(course)},
 		{"LICENSE", mitLicense()},
 		{".gitignore", gitignore()},
-		{"README.md", readme(course, title, firstStage, buildHint(dir))},
+		{"README.md", readme(course, title, firstStage, buildHint(course))},
 	} {
 		p := filepath.Join(dir, f.name)
 		// Never clobber: a learner re-running `sboot start` in a repo they have
@@ -241,22 +242,34 @@ build/
 // public, so anyone who lands on it should be able to find the course (plan.md's
 // public-template-repo item). It leads with what the learner built, because that is
 // what a reader — or a hiring manager — came for.
-// buildHint is the README's "Build it" section, READ OFF THE SCAFFOLD THAT JUST
-// LANDED rather than told to us by the server.
+// buildHint is the README's "Build it" section, DERIVED FROM THE COURSE'S OWN
+// BUILD COMMAND — the resolved `grader.build` on the cached spec manifest, the
+// same value `sboot test` executes.
 //
-// It used to be one hardcoded paragraph: `cd os/kernel && cargo build --release`,
-// "the toolchain is pinned by rust-toolchain.toml", "you need a nightly Rust
-// toolchain". In a C learner's repo every word of that is false, and it is the most
-// visible file they have — the whole point of the learner-owned repo is that it
-// reads like their work, and a README telling a C programmer to install Rust reads
-// like a template nobody looked at.
+// It used to sniff the scaffold's files: any repo with a rust-toolchain.toml got
+// "cd os/kernel && cargo build --release … you need a nightly Rust toolchain".
+// For os2-rust every word of that is false — stable Rust, built by `cargo xtask`
+// as one workspace — and the README is the most visible file the learner has:
+// the whole point of the learner-owned repo is that it reads like their work,
+// not like a template nobody looked at. The build command cannot lie the way a
+// file sniff can, because it is literally what grades the repo.
 //
-// Deriving it from the files is better than a `language:` field on the wire for one
-// reason: the scaffold is the ground truth about what builds this repo, and it
-// cannot disagree with itself. A course that ships neither marker gets no build
-// section at all, which is honest — better silence than a guess.
-func buildHint(dir string) string {
-	if _, err := os.Stat(filepath.Join(dir, "rust-toolchain.toml")); err == nil {
+// The two known course shapes keep their existing text VERBATIM, keyed on the
+// course id AND its exact resolved command (os-rust's default and os-c's
+// `make -C os`). The command alone is not enough: os2-rust's course-level
+// fallback is ALSO `cargo xtask build`, and its repo is stable Rust with the
+// workspace at `os/`, so the os-rust text ("nightly", `cd os/kernel && cargo
+// build --release`) would be false in every particular. Anything not matching
+// a known pair gets an honest section built around its actual command. A blank
+// command cannot happen (the default fills it), but an unrecognisable one
+// still names itself rather than guessing at a toolchain lecture.
+func buildHint(course string) string {
+	build := strings.TrimSpace(courseGrader(course).Build)
+	if build == "" {
+		build = defaultBuildCmd
+	}
+	switch {
+	case course == "os-rust" && build == defaultBuildCmd: // text unchanged
 		return `## Build it
 
 The toolchain is pinned by ` + "`rust-toolchain.toml`" + `, so a plain build works on a
@@ -267,8 +280,7 @@ fresh clone:
 You need a nightly Rust toolchain (rustup installs the pinned one from that file),
 plus ` + "`nasm`" + ` and ` + "`qemu-system-x86_64`" + `.
 `
-	}
-	if _, err := os.Stat(filepath.Join(dir, "os", "Makefile")); err == nil {
+	case course == "os-c" && build == "make -C os": // text unchanged
 		return `## Build it
 
 A plain build works on a fresh clone, with no course tooling installed:
@@ -280,7 +292,19 @@ You need a C compiler (` + "`gcc`" + ` or ` + "`clang`" + `), ` + "`binutils`" +
 and checks the markers.
 `
 	}
-	return ""
+	toolchain := "You need the course's toolchain installed"
+	if strings.HasPrefix(build, "cargo ") {
+		toolchain = "You need Rust (rustup installs it; if the repo carries a " +
+			"`rust-toolchain.toml`, that pins the exact toolchain)"
+	}
+	return `## Build it
+
+The course builds with one command — the same one ` + "`sboot test`" + ` runs for you:
+
+    ` + build + `
+
+` + toolchain + `, plus ` + "`qemu-system-x86_64`" + ` to run what it builds.
+`
 }
 
 func readme(course, title, firstStage, build string) string {

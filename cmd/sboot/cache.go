@@ -839,10 +839,11 @@ func prefetchLab(course, stage string) {
 // The course's build runs with this root as its working directory: it builds `os/`
 // into the artifact course.yaml names, and the CLI reads <root>/labs/<NN>/lab.toml from
 // the same place. So the build tooling, the tests and the learner's `os/` have to appear
-// under one root — which is exactly the problem the server already solved.
-// runner/main.go stages OUR xtask + .cargo + rust-toolchain.toml into a scratch dir,
-// drops the learner's os/ on top, and judges with --os <dir>. This is that same model on
-// the client, so there is one mental model instead of two:
+// under one root — which is exactly the problem the server-side grading worker used
+// to solve by staging OUR xtask + .cargo + rust-toolchain.toml into a scratch dir,
+// dropping the learner's os/ on top, and judging with --os <dir>. That worker is
+// gone (nothing of ours builds anything now), but the model it established is what
+// the client still uses:
 //
 //	<cache>/courses/<course>/work/<repo-key>/
 //	├── xtask/ labs/ .cargo/ rust-toolchain.toml   ← synced from the spec, if present

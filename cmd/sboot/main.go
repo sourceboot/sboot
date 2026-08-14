@@ -4,16 +4,18 @@
 //	                    (grade.go) against the published checks; fast,
 //	                    offline-friendly, recorded as a practice run, never
 //	                    completes a stage.
-//	sboot submit <stage>  official — gates on a local run, then uploads the os/
-//	                    source tree; the platform's runner builds it with the pinned
-//	                    toolchain, boots it in QEMU server-side, and grades the full
-//	                    rubric. Only a passing submission completes.
+//	sboot submit <stage>  official — gates on a local run, then uploads that run's
+//	                    capture and the os/ source tree; the platform judges the
+//	                    capture against the full private rubric, inside the request
+//	                    that carries it, and answers with the verdict. Since D8
+//	                    nothing on our side builds or boots. Only a passing
+//	                    submission completes.
 //
 // ── THE SUBMIT GATE (D3, the grading design) ──────────────────
 //
 //	build once → boot once → capture
 //	judge locally (published checks) → instant feedback
-//	  FAIL → stop. No submission is created, no queue wait.
+//	  FAIL → stop. No submission is created, nothing is uploaded.
 //	  PASS → upload that same capture; the server judges and owns the verdict.
 //
 // Three properties, and each one is a property of this ordering rather than of any
@@ -26,13 +28,15 @@
 //  2. test ⇒ submit, BY CONSTRUCTION on the client side. The bytes the server
 //     judges are the bytes the local judge just judged — not a re-run that ought
 //     to agree.
-//  3. INSTANT FEEDBACK BEFORE THE QUEUE. A failing run is answered by the grader
-//     in the learner's own terminal, with the full guidance ladder, instead of
-//     minutes later by a server.
+//  3. INSTANT FEEDBACK, LOCALLY FIRST. A failing run is answered by the grader in
+//     the learner's own terminal, with the full guidance ladder, instead of by a
+//     round trip. What the upload adds is the official record, and since 2026-08-03
+//     it adds it in one request: the platform judges inline, so there is no queue
+//     to wait behind and no verdict to poll for.
 //
-// The server still builds and boots independently — that is what measures
-// environment divergence between machines, and removing it would collapse the two
-// dual-run measurements into one (see grader.ClientVerdict).
+// The server does NOT build or boot (D8). What it still does independently is
+// JUDGE, from the same compiled engine, which is what makes the cross-check in
+// grader.ClientVerdict meaningful.
 //
 // ── TWO DIRECTORIES, ONE COMMAND (the workspace split, 2026-07-26) ──────────────
 //
@@ -50,6 +54,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
@@ -99,6 +104,8 @@ usage:
                        your os/ tree, build config, README, LICENSE
   sboot test <stage>     practice: run the lab's checks locally
                        (fast loop; does not complete the stage)
+  sboot hint <stage> [check]  a hint for a failing check — each time you run
+                       it, the hint goes one rung deeper
   sboot submit <stage>   official: check locally first, then upload for the
                        server-side grade (completes the stage)
   sboot where            print where your repo, tests and grader live
@@ -155,6 +162,29 @@ func main() {
 			exitWith(2)
 		}
 		exitWith(runDebug(r, os.Args[2]))
+	}
+	if len(os.Args) >= 2 && os.Args[1] == "hint" {
+		// Its own dispatch (like debug) because it takes an OPTIONAL second
+		// positional — the check id — which the generic stage-plus-flags parser
+		// below would reject as "unexpected argument".
+		if len(os.Args) < 3 || len(os.Args) > 4 {
+			fmt.Fprintln(os.Stderr, "usage: sboot hint <stage> [check-id]")
+			exitWith(2)
+		}
+		stage, check := os.Args[2], ""
+		if len(os.Args) == 4 {
+			check = os.Args[3]
+		}
+		if regexp.MustCompile(`^\d+`).FindString(stage) == "" {
+			fmt.Fprintf(os.Stderr, "sboot: stage %q must start with its lab number (e.g. 01-boot)\n", stage)
+			exitWith(2)
+		}
+		r, err := findRepo()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
+			exitWith(2)
+		}
+		exitWith(runHint(r, stage, check))
 	}
 	if len(os.Args) >= 2 && os.Args[1] == "fetch" {
 		// No `--all`: removed 2026-07-26. It read as "cache the whole course before a
@@ -333,10 +363,94 @@ func reportPracticeFailure(err error) {
 }
 
 // reportGraderMissing explains a grader that never started, as opposed to one that
-// ran and failed the code.
+// ran and failed the code. Shared by `sboot test` and `sboot submit` — the missing
+// piece is the same one either way, and submit adds the sentence that explains why
+// it needs the same tools practice does.
 func reportGraderMissing(err error) {
-	fmt.Fprintf(os.Stderr, "sboot: could not run the grader: %v\n", err)
-	fmt.Fprintln(os.Stderr, "sboot: is the Rust toolchain installed? (rustup, nasm, qemu)")
+	tool := missingTool(err)
+	if tool == "" {
+		fmt.Fprintf(os.Stderr, "sboot: could not run the grader: %v\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "sboot: %s is not installed (or is not on your PATH).\n", tool)
+	}
+	for _, line := range installHint(tool) {
+		fmt.Fprintf(os.Stderr, "sboot:   %s\n", line)
+	}
+}
+
+// reportSubmitGraderMissing is the submit half, and it teaches the relationship
+// rather than reporting a failure.
+//
+// The learner's likely model is "test runs here, submit runs there", so "missing
+// binary" reads as our problem to fix. It is not: since D8 the official grade is
+// computed from the run THEIR machine makes (the grading design),
+// so a machine that cannot run `sboot test` cannot submit either, and no flag
+// changes that. Say what submit actually does, then name the tool and how to get it.
+func reportSubmitGraderMissing(stage string, err error) {
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "sboot: nothing was submitted.")
+	fmt.Fprintln(os.Stderr, "sboot: `sboot submit` runs `sboot test` on your machine and sends the captured")
+	fmt.Fprintln(os.Stderr, "sboot: result to us for the official grade, so it needs the same tools")
+	fmt.Fprintln(os.Stderr, "sboot: `sboot test` does — and they are not there yet:")
+	fmt.Fprintln(os.Stderr)
+	reportGraderMissing(err)
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintf(os.Stderr, "sboot: then get `sboot test %s` passing — that is the run submit sends.\n", stage)
+	// Deliberately does NOT offer --force. It used to work here, because the server
+	// would build and boot for a learner whose machine could not; that is exactly the
+	// capability D8 costs, and pointing at a flag that now fails on the server is
+	// worse than not mentioning it.
+}
+
+// missingTool names the executable that could not be started, from the error
+// os/exec returns for it. Empty when the error is not that shape.
+func missingTool(err error) string {
+	var ee *exec.Error
+	if errors.As(err, &ee) {
+		return ee.Name
+	}
+	return ""
+}
+
+// installHint returns how to get `tool` on this platform.
+//
+// Keyed on the tool rather than on the course, because the CLI learns the build
+// command from the course's own manifest (`grader.build`) and a C course's missing
+// piece is `make`, not rustup. An unknown tool still gets the honest generic answer
+// instead of advice about the wrong language.
+func installHint(tool string) []string {
+	switch tool {
+	case "cargo", "rustc", "rustup":
+		return []string{
+			"install Rust (nightly is pinned by the course's rust-toolchain.toml):",
+			"curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+		}
+	case "nasm":
+		return []string{pkgInstall("nasm")}
+	case "qemu-system-x86_64", "qemu":
+		return []string{pkgInstall("qemu-system-x86")}
+	case "make", "gcc", "cc", "ld":
+		return []string{pkgInstall("build-essential")}
+	case "":
+		return []string{"the course's build needs a working toolchain — check `sboot where`."}
+	default:
+		return []string{pkgInstall(tool)}
+	}
+}
+
+// pkgInstall renders the package-manager line for this OS. macOS gets Homebrew and
+// Linux gets apt: both are the overwhelmingly common case, and a learner on neither
+// still reads a line that names the package they need.
+func pkgInstall(pkg string) string {
+	switch runtime.GOOS {
+	case "darwin":
+		if pkg == "build-essential" {
+			return "xcode-select --install"
+		}
+		return "brew install " + strings.TrimSuffix(pkg, "-system-x86")
+	default:
+		return "sudo apt install " + pkg
+	}
 }
 
 // apiError is a reply we DID get: the platform answered, and the answer was no.
@@ -478,8 +592,8 @@ type graderRun struct {
 //	LBX_SCORE\t{got}\t{total}
 //
 // Fields are append-only, so accept >= 4 and treat 5 and 6 as optional — the same
-// rule (and the same reason) as the runner's parser: a record from a grader newer
-// than this binary must still parse, or every check silently vanishes.
+// rule (and the same reason) as the server-side parser: a record from a grader
+// newer than this binary must still parse, or every check silently vanishes.
 //
 // The guidance field is ignored here. The grader has already rendered it, capped at
 // the tier we asked for; re-rendering it in the CLI would be a second place for the
@@ -540,7 +654,90 @@ func authedRequest(method, url string, body io.Reader) (*http.Request, error) {
 	// procedure and cannot be answered retroactively.
 	req.Header.Set("User-Agent", fmt.Sprintf("sboot/%s (%s/%s)", version, runtime.GOOS, runtime.GOARCH))
 	req.Header.Set(hdrCLIVersion, version)
+	// On EVERY request, or on none (see vercelBypass). There is no subset that
+	// would work: a 302 on the spec fetch is exactly as fatal as a 302 on the
+	// submit, and every call this binary makes goes through this function.
+	if s := vercelBypass(); s != "" {
+		req.Header.Set(hdrVercelBypass, s)
+	}
 	return req, nil
+}
+
+// ── Vercel Deployment Protection: a TESTING affordance, never a learner one ──────
+//
+// A preview deployment answers 302 to any request carrying no bypass credential, so
+// without this the CLI cannot talk to a preview AT ALL — the environment that exists
+// to be exercised before production was untestable by the one client that matters.
+// `sboot start` got the auth page instead of a workspace and nothing downstream ever
+// ran. That is why the header goes on every request rather than on the interesting
+// ones.
+//
+// A LEARNER WILL NEVER SET THIS. It is deliberately absent from `sboot --help`
+// (documented in harness/README.md and docs/commands.md instead), production is not
+// protected, and nothing anywhere branches on the header being present — so it
+// cannot become load-bearing for a normal run. Unset, the request bytes are
+// byte-identical to what they were before this existed.
+//
+// ONE SECRET, ONE PLACE, FOUR READERS. Same two sources as scripts/smoke.sh,
+// scripts/canary-grade.sh and e2e/pages_test.go's target mode: the environment
+// first, then `<state dir>/vercel-bypass` (chmod 600). Drop it in the file once and
+// every probe we point at a deployment — including this binary — picks it up.
+// SBOOT_STATE_DIR moves that file with the rest of the CLI's state, which is why a
+// runner that relocates the state dir (canary-grade.sh does) passes the value in the
+// environment instead.
+//
+// NEVER PRINTED. Not in --help, not in any error path, not under SBOOT_DEBUG — the
+// debug line below says only that one is configured. Go itself is careful here too
+// (net/http's validateHeaders: "Don't include the value in the error, because it may
+// be sensitive"), and the validity check below means we never hand it a value that
+// could reach that path anyway.
+const hdrVercelBypass = "x-vercel-protection-bypass"
+
+// bypassFile is read from the state dir, so it sits next to state.json in
+// ~/.config/sboot — the path scripts/smoke.sh has always used.
+const bypassFile = "vercel-bypass"
+
+func vercelBypass() string {
+	if v := strings.TrimSpace(os.Getenv("SBOOT_VERCEL_BYPASS")); v != "" {
+		return validBypass(v, "SBOOT_VERCEL_BYPASS")
+	}
+	dir, err := stateDir()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(dir, bypassFile))
+	if err != nil {
+		return "" // the overwhelmingly common case: there is no such file
+	}
+	return validBypass(strings.TrimSpace(string(b)), filepath.Join(dir, bypassFile))
+}
+
+// bypassNoted keeps the debug line to one per run rather than one per request. This
+// binary has no goroutines (nothing in harness/ starts one), so a plain bool is the
+// whole synchronisation story.
+var bypassNoted bool
+
+// validBypass drops anything that is not a plain one-line token. A file with a stray
+// control character would otherwise be refused by net/http at send time, turning a
+// misconfiguration into "connection error" on every command — and the source is named
+// here, where the VALUE never is.
+func validBypass(v, source string) string {
+	noteOnce := func(format string, args ...any) {
+		if !bypassNoted {
+			bypassNoted = true
+			debugf(format, args...)
+		}
+	}
+	for _, r := range v {
+		if r < 0x20 || r > 0x7e {
+			noteOnce("ignoring the deployment-protection bypass from %s: not a single-line ASCII token", source)
+			return ""
+		}
+	}
+	if v != "" {
+		noteOnce("sending %s (configured via %s; value not shown)", hdrVercelBypass, source)
+	}
+	return v
 }
 
 // send performs a request and records whatever the platform said about CLI
@@ -608,6 +805,20 @@ func reportPractice(course, stage string, score, max int, passed bool, detail st
 
 // ── submit: the official, server-graded run ─────────────────────────────────────
 
+// submissionResp is what POST /api/v1/submissions answers with, and since
+// 2026-08-03 that answer IS THE VERDICT: the platform judges the capture inside
+// the request that carries it, so there is nothing to wait for and nothing to poll.
+//
+// What used to be here: a 202 saying `status: "pending"`, then a loop that GET'd
+// /api/v1/submissions/<id> every two seconds for up to five minutes while a
+// separate grading worker claimed the job off a queue. The queue, the worker and
+// the loop are all gone. The route still answers `pending` in exactly one case —
+// the judge could not be reached at all — and that is reported rather than waited
+// on, because nothing else will ever grade it.
+//
+// A `Shadow *shadowAssignment` field lived here too, for the Beta-1 dual run.
+// Gone with the executor (D8 phase 4). An unknown JSON field is ignored, so a
+// platform that still sent one would simply be un-listened-to.
 type submissionResp struct {
 	ID        string `json:"id"`
 	Status    string `json:"status"`
@@ -619,28 +830,11 @@ type submissionResp struct {
 		Title string `json:"title"`
 		Live  bool   `json:"live"`
 	} `json:"next_stage"`
-	// Beta-1 dual-run: when present, the server asks us to ALSO upload the machine
-	// state from our local run. The authoritative verdict is still the server's;
-	// this only feeds the client-vs-server comparison.
-	Shadow *shadowAssignment `json:"shadow"`
-	Err    string            `json:"error"`
-}
-
-type shadowAssignment struct {
-	Nonce string `json:"nonce"`
-	// UNREAD by this binary, and kept only because the wire shape is append-only
-	// and the platform still sends it. The capture the gate uploads is bounded by
-	// the stage's own `timeout_secs` and settles on the stage's own marker — the
-	// same window the server's judge uses, which is the point — so a server-supplied
-	// timeout has nothing left to govern. It was last read by the pre-D3 fallback
-	// capture, deleted with the shell-out in Phase 4.
-	CaptureTimeoutSecs int `json:"capture_timeout_secs"`
-	TTLSecs            int `json:"ttl_secs"`
+	Err string `json:"error"`
 }
 
 // runSubmit is a thin wrapper so the body can `return` an exit code and let its
-// defers run — the temp capture file and the bounded wait for the capture upload
-// both need cleanup, and `os.Exit` skips defers.
+// defers run — the temp capture file needs cleanup, and `os.Exit` skips defers.
 func runSubmit(r repo, stage string, force bool) {
 	exitWith(submit(r, stage, force))
 }
@@ -695,9 +889,9 @@ func submit(r repo, stage string, force bool) int {
 	// makes `--force` unable to corrupt the counter by construction rather than by
 	// care.
 	//
-	// Note this is not the rule the runner's `maxTier` implements. That one caps
-	// what the SERVER's verdict renders, and stays at tier 1: the server has
-	// nothing honest to escalate to. Local rendering is local rendering.
+	// Note this is not the rule grader.SubmitMaxTier implements. That one caps what
+	// the SERVER's verdict renders, and stays at tier 1: the server has nothing
+	// honest to escalate to. Local rendering is local rendering.
 	if !force {
 		st.record(course, stage, res.checks)
 		if err := st.save(); err != nil {
@@ -706,13 +900,21 @@ func submit(r repo, stage string, force bool) int {
 	}
 
 	switch {
-	case res.launchFailed && !force:
-		reportGraderMissing(res.launchErr)
-		fmt.Fprintf(os.Stderr, "sboot: to submit without the local check: sboot submit %s --force\n", stage)
-		return 2
 	case res.launchFailed:
-		fmt.Fprintf(os.Stderr, "\nsboot: the local check could not run (%v) — submitting anyway (--force).\n",
-			res.launchErr)
+		// NO CAPTURE, NO SUBMISSION — and --force does not change that (D8).
+		//
+		// This used to be the one thing `--force` could still do here: submit with no
+		// local run at all and let the server build and boot for us. There is no
+		// server-side build any more, so there is nothing on the other end to produce
+		// a verdict from — a submission with no capture is refused by the platform
+		// too (submissions/route.ts), and refusing here saves the round trip and gives
+		// a message that can actually name the missing tool.
+		//
+		// `--force` keeps its real meanings: a local run that FAILED can still be
+		// submitted (below), for a learner who disputes the local verdict or wants the
+		// failure on the record. What it can no longer do is submit without one.
+		reportSubmitGraderMissing(stage, res.launchErr)
+		return 2
 	case res.exitCode != 0 && !force:
 		reportGateFailure(stage, res)
 		return 1
@@ -729,21 +931,31 @@ func submit(r repo, stage string, force bool) int {
 		return 2
 	}
 
+	// THE UPLOAD IS THE EVIDENCE, not a request for one (D8). The capture is the
+	// machine state of the boot whose verdict the learner just watched, and the
+	// server judges THOSE bytes against the private rubric — so it travels with the
+	// submission rather than chasing it afterwards under a nonce. The source goes
+	// too, unchanged: 66 of the rubric's checks are read from it.
+	body, contentType, err := submitBody(archive, readCapture(capturePath))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sboot: package: %v\n", err)
+		return 2
+	}
+
 	url := fmt.Sprintf("%s/api/v1/submissions?course=%s&stage=%s", apiURL(), course, stage)
-	req, err := authedRequest("POST", url, bytes.NewReader(archive))
+	req, err := authedRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
 		return 2
 	}
-	req.Header.Set("Content-Type", "application/gzip")
-	// SPEC-SKEW SEAM (the CLI release policy §6). Which tests produced the verdict the
-	// learner is about to see? Under the `server` backend the answer cannot change
-	// the grade — the runner grades with the in-repo template — but under the probe
-	// backend the capture is produced with THIS spec's script, settle marker and
-	// timeout, so a stale spec must be refused with a message that names the cause
-	// rather than silently judged. The server ignores this header today; the refusal
-	// belongs in platform/app/api/v1/submissions/route.ts once a backend consumes a
-	// client capture, and lib/spec.ts `specStamp` is the value to compare against.
+	req.Header.Set("Content-Type", contentType)
+	// SPEC SKEW (the CLI release policy §6). Which tests produced the verdict the
+	// learner is about to see? Under the retired `server` backend the answer could
+	// not change the grade — the runner rebuilt and rebooted with the in-repo rubric
+	// — but the capture above was produced with THIS spec's script, settle marker and
+	// timeout, so a stale one is judged against another run's criteria. The server
+	// compares this against lib/spec.ts `specStamp` and refuses a mismatch by name
+	// (409), which is the whole reason the header exists.
 	if s, ok := cachedSpec(course); ok {
 		req.Header.Set("X-Sboot-Spec", course+"@"+s.version)
 	}
@@ -763,92 +975,67 @@ func submit(r repo, stage string, force bool) int {
 		}
 		return 2
 	}
-	fmt.Printf("── submitted (%d KB) — grading on the server", len(archive)/1024)
+	fmt.Printf("── submitted (%d KB) — graded on the server\n", len(body)/1024)
 
-	// Beta-1 dual-run: hand the server the machine state from the run above, so its
-	// shadow judgement acts on the same bytes our local judge just scored. Nothing
-	// is built or booted again. Best-effort in a goroutine: the upload is small, but
-	// an old cached spec can still fall back to a real capture, and no failure here
-	// may affect the official verdict or the exit code.
-	var shadowDone chan struct{}
-	if created.Shadow != nil {
-		shadowDone = make(chan struct{})
-		go func() {
-			defer close(shadowDone)
-			uploadCapture(run, created.ID, capturePath, created.Shadow)
-		}()
-	}
-	// Wait (bounded) for the capture upload before exiting, so a fast server verdict
-	// doesn't kill it mid-flight. Everything it does has its own timeout, so this
-	// always returns.
-	defer func() {
-		if shadowDone != nil {
-			select {
-			case <-shadowDone:
-			case <-time.After(90 * time.Second):
-			}
-		}
-	}()
-
-	deadline := time.Now().Add(5 * time.Minute)
-	last := "pending"
-	for {
-		if time.Now().After(deadline) {
-			fmt.Printf("\nsboot: still %s after 5 minutes — check the dashboard later.\n", last)
-			return 2
-		}
-		time.Sleep(2 * time.Second)
-		s, err := fetchSubmission(created.ID)
-		if err != nil {
-			fmt.Print("!")
-			continue
-		}
-		if s.Status == last || s.Status == "pending" || s.Status == "running" {
-			fmt.Print(".")
-			last = s.Status
-			continue
-		}
+	// THE VERDICT IS ALREADY IN `created`. The platform judges the capture inside
+	// the request that carried it, so there is no queue to wait behind and nothing
+	// to poll — the five-minute deadline, the `.`/`!` progress dots and the Ctrl-C
+	// window they created are all gone with the runner that made them necessary.
+	if created.Detail != "" {
 		fmt.Println()
-		if s.Detail != "" {
-			fmt.Println()
-			fmt.Println(indent(s.Detail, "  "))
-		}
-		switch s.Status {
-		case "passed":
-			fmt.Printf("\n  ✅ official grade: %d/%d — stage complete!", deref(s.Score), deref(s.MaxScore))
-			if s.NextStage != nil {
-				// OPPORTUNISTIC PREFETCH. Completing this lab is the moment the next
-				// one becomes fetchable (sequential unlock just opened it), and it is
-				// also the moment the learner is most likely to close the laptop. Pull
-				// its tests now so a per-lab fetch never becomes the reason someone
-				// cannot start work on a train. Best-effort and silent: it is an
-				// optimisation, and failing it costs one download later.
-				if s.NextStage.Live {
-					prefetchLab(course, s.NextStage.ID)
-					fmt.Printf(" Next up: %s\n", s.NextStage.ID)
-				} else {
-					fmt.Printf(" Next up: %s (coming soon)\n", s.NextStage.Title)
-				}
+		fmt.Println(indent(created.Detail, "  "))
+	}
+	switch created.Status {
+	case "passed":
+		fmt.Printf("\n  ✅ official grade: %d/%d — stage complete!", deref(created.Score), deref(created.MaxScore))
+		if created.NextStage != nil {
+			// OPPORTUNISTIC PREFETCH. Completing this lab is the moment the next one
+			// becomes fetchable (sequential unlock just opened it), and it is also the
+			// moment the learner is most likely to close the laptop. Pull its tests now
+			// so a per-lab fetch never becomes the reason someone cannot start work on
+			// a train. Best-effort and silent: it is an optimisation, and failing it
+			// costs one download later.
+			if created.NextStage.Live {
+				prefetchLab(course, created.NextStage.ID)
+				fmt.Printf(" Next up: %s\n", created.NextStage.ID)
 			} else {
-				fmt.Println(" Course complete!")
+				fmt.Printf(" Next up: %s (coming soon)\n", created.NextStage.Title)
 			}
-			return 0
-		case "failed":
-			fmt.Printf("\n  ❌ official grade: %d/%d\n", deref(s.Score), deref(s.MaxScore))
-			// This line used to read "the server rubric includes hidden checks; make
-			// it work, not just print". D1 removed the hidden checks, so blaming a
-			// stricter rubric would now be false — and D3 makes the honest reading
-			// exact. If the local gate went green and the server did not, the two
-			// runs graded the SAME checks, so what differs is the two machines.
-			if res.exitCode == 0 && !res.launchFailed {
-				fmt.Println("     Your local run passed, so the difference is between your machine and")
-				fmt.Println("     ours, not between two sets of checks. Please report it.")
-			}
-			return 1
-		default: // error
-			fmt.Println("\n  ⚠ grading error on the server — please retry; if it persists, report it.")
-			return 2
+		} else {
+			fmt.Println(" Course complete!")
 		}
+		return 0
+	case "failed":
+		fmt.Printf("\n  ❌ official grade: %d/%d\n", deref(created.Score), deref(created.MaxScore))
+		// This line used to read "the server rubric includes hidden checks; make it
+		// work, not just print". D1 removed the hidden checks, so blaming a stricter
+		// rubric would now be false — and D3 makes the honest reading exact. If the
+		// local gate went green and the server did not, the two runs graded the SAME
+		// checks, so what differs is the two machines.
+		if res.exitCode == 0 && !res.launchFailed {
+			fmt.Println("     Your local run passed, so the difference is between your machine and")
+			fmt.Println("     ours, not between two sets of checks. Please report it.")
+		}
+		return 1
+	case "error":
+		fmt.Println("\n  ⚠ grading error on the server — please retry; if it persists, report it.")
+		return 2
+	default:
+		// `pending` or `running`: the platform accepted the upload and could not
+		// grade it — the judge was unreachable, errored, or this deployment has none
+		// configured. NOTHING WILL PICK IT UP LATER; there is no queue and no worker.
+		// So this says so immediately instead of implying a wait, which is the whole
+		// difference from the old poll loop: that one printed dots for five minutes
+		// and then "still pending — check the dashboard later".
+		//
+		// Re-running the command is the right advice and costs nothing extra: the
+		// same work carries the same idempotency key, so a retry lands on this same
+		// submission rather than creating a second one.
+		fmt.Println("\n  ⚠ your work was uploaded, but nothing graded it. This is a problem on our")
+		fmt.Println("     side, not with your code — nothing about your submission was judged.")
+		fmt.Printf("     Run `sboot submit %s` again in a few minutes. If it happens twice in a\n", stage)
+		fmt.Println("     row the grading service is down, and re-submitting will not help.")
+		return 2
 	}
 }
 
@@ -918,54 +1105,40 @@ func submitPreflight(course, stage string) *apiError {
 	return nil
 }
 
-// uploadCapture hands the server the machine state for the dual-run comparison —
-// inert bytes only (serial + VGA + reset: NO source, NO rubric) — under the
-// single-use nonce the server issued.
+// submitBody packs a submission: the source tarball, and the capture of the boot
+// the gate just judged.
 //
-// `prepared` is the capture the GATE already wrote: the very boot whose verdict the
-// learner just saw. That is what makes the server's shadow judgement act on the
-// same evidence rather than on a re-run, and it is why a submit no longer costs a
-// second build and a second boot.
-//
-// Entirely best-effort: every failure is logged (only under SBOOT_DEBUG) and
-// swallowed, because the authoritative verdict is the server's regardless.
-func uploadCapture(run, id, prepared string, a *shadowAssignment) {
-	dbg := os.Getenv("SBOOT_DEBUG") != ""
-	logf := func(format string, args ...any) {
-		if dbg {
-			fmt.Fprintf(os.Stderr, "\nsboot: shadow: "+format+"\n", args...)
+// MULTIPART, and only when there is a capture. The tarball is byte for byte the one
+// this CLI has always uploaded — it is now a named part next to the capture, because
+// the server judges the capture and reads the source, and one request that either
+// wholly succeeds or wholly fails leaves no half-submitted state to reason about.
+// With no capture (nothing but `--force` past a failed local run can produce that,
+// and the platform refuses it) the body is the raw tarball, exactly as before.
+func submitBody(archive, capture []byte) (body []byte, contentType string, err error) {
+	if capture == nil {
+		return archive, "application/gzip", nil
+	}
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for _, part := range []struct {
+		field, filename string
+		data            []byte
+	}{
+		{"archive", "os.tar.gz", archive},
+		{"capture", "capture.json", capture},
+	} {
+		f, err := w.CreateFormFile(part.field, part.filename)
+		if err != nil {
+			return nil, "", err
+		}
+		if _, err := f.Write(part.data); err != nil {
+			return nil, "", err
 		}
 	}
-
-	blob := readCapture(prepared)
-	if blob == nil {
-		// Nothing to compare. There is no longer a "the workspace pinned an xtask too
-		// old for --capture-out" case to fall back from — that fallback, a second
-		// build and a second boot via `cargo xtask capture`, was deleted with the
-		// shell-out in Phase 4, and the engine's capture flag is not optional now that
-		// the CLI fetches the engine with the tests. What is left is a real local
-		// failure: the gate could not run, or the blob could not be written. Either
-		// way the authoritative verdict is the server's, so this costs the shadow
-		// comparison and nothing else.
-		logf("the local check produced no capture; skipping the dual-run comparison")
-		return
+	if err := w.Close(); err != nil {
+		return nil, "", err
 	}
-
-	url := fmt.Sprintf("%s/api/v1/submissions/%s/capture", apiURL(), id)
-	req, err := authedRequest("POST", url, bytes.NewReader(blob))
-	if err != nil {
-		logf("request: %v", err)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Sboot-Shadow-Nonce", a.Nonce)
-	resp, err := send(&http.Client{Timeout: 30 * time.Second}, req)
-	if err != nil {
-		logf("upload: %v", err)
-		return
-	}
-	resp.Body.Close()
-	logf("uploaded capture (%d bytes) → HTTP %d", len(blob), resp.StatusCode)
+	return buf.Bytes(), w.FormDataContentType(), nil
 }
 
 // readCapture returns the gate's capture, or nil if there isn't a usable one.
@@ -978,26 +1151,6 @@ func readCapture(path string) []byte {
 		return nil
 	}
 	return b
-}
-
-func fetchSubmission(id string) (*submissionResp, error) {
-	req, err := authedRequest("GET", apiURL()+"/api/v1/submissions/"+id, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := send(&http.Client{Timeout: 10 * time.Second}, req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-	var s submissionResp
-	if err := json.NewDecoder(resp.Body).Decode(&s); err != nil {
-		return nil, err
-	}
-	return &s, nil
 }
 
 // ── start: create the learner's repo ────────────────────────────────────────────
@@ -1127,9 +1280,9 @@ func tarGzDirSep(dir string, sep rune) ([]byte, error) {
 		if rel == "." {
 			return nil
 		}
-		// Tar entry names are "/"-separated BY SPEC, and the runner's extractor reads
-		// them that way (runner/main.go, which uses filepath.ToSlash for the same
-		// reason). A Windows walk hands us `kernel\main.rs`, which the extractor takes
+		// Tar entry names are "/"-separated BY SPEC, and the server's extractor reads
+		// them that way (grader.ExtractSourceTar). A Windows walk hands us
+		// `kernel\main.rs`, which the extractor takes
 		// for a FILENAME, not a path: the learner's whole tree would land on the server
 		// as flat files with backslashes in their names, and grading would score an
 		// empty kernel (L11 — confirmed on a windows-latest runner 2026-07-27).
