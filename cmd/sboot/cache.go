@@ -115,6 +115,11 @@ type specGrader struct {
 	Judge        string `json:"judge"`
 	JudgeCapture string `json:"judgeCapture"`
 	Artifact     string `json:"artifact"`
+	// The capture shape ("boot" | "cmd", 2026-08-13). Carried for round-trip
+	// fidelity like the judge overrides: the ENGINE decides how to capture from
+	// the rubric's own `[[run]]` block, so the CLI reads nothing from this — a
+	// cmd-capture lab simply never boots, and Artifact goes unused.
+	Capture string `json:"capture"`
 }
 
 // specJudge is the grading engine's release, keyed by "<goos>-<goarch>".
@@ -138,6 +143,10 @@ type specLab struct {
 	Digest string `json:"digest"`
 	Bytes  int    `json:"bytes"`
 	Live   bool   `json:"live"`
+	// The human title (ux-plan §7.3, additive): what the status rows and the
+	// `grading <stage> — "<title>"` header render. Absent from an older
+	// platform's manifest, and every consumer falls back to the stage id.
+	Title string `json:"title"`
 }
 
 func (m *specManifest) lab(stage string) *specLab {

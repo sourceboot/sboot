@@ -61,6 +61,21 @@ type guidanceState struct {
 	// once a stage has ids to say something about, so the e2e stub grader (no
 	// check ids) still creates no state file.
 	LastFailed map[string][]string `json:"last_failed,omitempty"`
+	// course id -> what the SERVER said about this course the last time we could
+	// ask it (ux-plan §5/§7.5, the v0.4 orientation release). This is the offline
+	// half of "server truth when online, cache offline": bare `sboot` and the
+	// stage-defaulting commands read it when the platform is unreachable, and
+	// every successful GET /api/v1/completions refreshes it. Append-only like
+	// every other field here — stateVersion stays 1.
+	Sync map[string]*courseSync `json:"course_sync,omitempty"`
+	// "course/stage" -> the last LOCAL practice score ("3/5"), written by every
+	// graded run. Purely presentational (the ▸ row's "last practice 3/5"), so
+	// losing it costs one dash in the status screen and nothing else.
+	LastScore map[string]string `json:"last_score,omitempty"`
+	// The course catalog as of the last successful GET /api/v1/courses, so
+	// `sboot courses` and the out-of-repo status degrade to cached orientation
+	// rather than a wall (P7).
+	Catalog *catalogCache `json:"catalog,omitempty"`
 	// Where this was loaded from. Unexported, so never serialized.
 	path string
 	// Whether record() actually changed anything. Nothing to record means nothing
@@ -68,6 +83,29 @@ type guidanceState struct {
 	// drives a stub grader emitting no check ids) should not have a state file
 	// created for it at all.
 	dirty bool
+}
+
+// courseSync is one course's server-derived progress, cached for offline
+// orientation ("as of last sync").
+type courseSync struct {
+	// stage id -> the official score ("4/4"; may be "" when the server did not
+	// say). Presence in the map is what means "verified".
+	Verified map[string]string `json:"verified"`
+	// stage id -> the latest PRACTICE score the server has seen for a stage not
+	// yet verified — what makes "last practice 3/5" true on a fresh machine,
+	// where the local LastScore has never been written.
+	Practice map[string]string `json:"practice,omitempty"`
+	// The most recent stage a PRACTICE run touched, per the server's attempt
+	// list — what lets the out-of-repo course rows say "lab 02 in progress".
+	LastAttempt string `json:"last_attempt,omitempty"`
+	// RFC3339. When this course was last synced from the server.
+	SyncedAt string `json:"synced_at,omitempty"`
+}
+
+// catalogCache is the course catalog as of the last successful fetch.
+type catalogCache struct {
+	Courses  []catalogCourse `json:"courses"`
+	SyncedAt string          `json:"synced_at,omitempty"`
 }
 
 // stateDir resolves the config directory. SBOOT_STATE_DIR overrides it (tests and
@@ -104,6 +142,8 @@ func loadState() *guidanceState {
 		Fails:      map[string]int{},
 		Rungs:      map[string]int{},
 		LastFailed: map[string][]string{},
+		Sync:       map[string]*courseSync{},
+		LastScore:  map[string]string{},
 	}
 	dir, err := stateDir()
 	if err != nil {
@@ -127,6 +167,13 @@ func loadState() *guidanceState {
 	if loaded.LastFailed != nil {
 		s.LastFailed = loaded.LastFailed
 	}
+	if loaded.Sync != nil {
+		s.Sync = loaded.Sync
+	}
+	if loaded.LastScore != nil {
+		s.LastScore = loaded.LastScore
+	}
+	s.Catalog = loaded.Catalog
 	return s
 }
 
@@ -231,6 +278,49 @@ func (s *guidanceState) record(course, stage string, checks []localCheck) {
 func (s *guidanceState) lastFailed(course, stage string) ([]string, bool) {
 	f, ok := s.LastFailed[course+"/"+stage]
 	return f, ok
+}
+
+// recordScore keeps the last local practice score for the status screen's
+// "last practice 3/5". Never recorded as 0/0 — a run with no verdict is a launch
+// failure, not a score (the L2a rule).
+func (s *guidanceState) recordScore(course, stage string, score, max int) {
+	if max <= 0 {
+		return
+	}
+	v := fmt.Sprintf("%d/%d", score, max)
+	k := course + "/" + stage
+	if s.LastScore[k] == v {
+		return
+	}
+	s.LastScore[k] = v
+	s.dirty = true
+}
+
+// setSync replaces one course's cached server progress after a successful fetch.
+func (s *guidanceState) setSync(course string, sync *courseSync) {
+	s.Sync[course] = sync
+	s.dirty = true
+}
+
+// markVerified folds one freshly verified stage into the cache — called when a
+// submit just passed, so the next offline status does not un-verify it.
+func (s *guidanceState) markVerified(course, stage, score string) {
+	cs := s.Sync[course]
+	if cs == nil {
+		cs = &courseSync{Verified: map[string]string{}}
+		s.Sync[course] = cs
+	}
+	if cs.Verified == nil {
+		cs.Verified = map[string]string{}
+	}
+	cs.Verified[stage] = score
+	s.dirty = true
+}
+
+// setCatalog replaces the cached catalog after a successful fetch.
+func (s *guidanceState) setCatalog(c *catalogCache) {
+	s.Catalog = c
+	s.dirty = true
 }
 
 // bumpRung climbs one rung of the hint ladder for a check and returns the rung

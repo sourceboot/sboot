@@ -129,12 +129,15 @@ func renderNotice(w io.Writer, running string, now time.Time) {
 	if channel.latest != "" && !sameVersion(channel.latest, running) {
 		deprecated := versionBelow(running, channel.deprecatedBelow)
 		if deprecated || dueForNudge(now) {
+			// The remedy is the installer, spelled out: `sboot upgrade` does not
+			// exist (the CLI release policy §3 — "do not build yet"), and a nudge
+			// naming a command that errors is worse than no nudge.
 			line := fmt.Sprintf(
-				"sboot %s → %s available · run: sboot upgrade · notes: github.com/sourceboot/sboot/releases",
+				"sboot %s → %s available · update: curl -fsSL https://sourceboot.com/install.sh | sh · notes: github.com/sourceboot/sboot/releases",
 				running, channel.latest)
 			if deprecated {
 				line = fmt.Sprintf(
-					"sboot %s is deprecated (minimum supported is %s) · update: sboot upgrade · %s available",
+					"sboot %s is deprecated (minimum supported is %s) · update to %s: curl -fsSL https://sourceboot.com/install.sh | sh",
 					running, channel.min, channel.latest)
 			}
 			lines = append(lines, line)

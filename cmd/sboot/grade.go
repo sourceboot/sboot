@@ -54,6 +54,12 @@ import (
 // a path and therefore what must clamp it (sboot-judge grade, artifactPath).
 const defaultBuildCmd = "cargo xtask build"
 
+// jsonMode: `--json` promised a machine-readable stdout, so while it is set the
+// engine's human verdict is captured rather than teed to the terminal and the
+// build's stdout joins stderr. Set by the command dispatch before runGrader;
+// package-level because this binary has no goroutines.
+var jsonMode bool
+
 // runGrader builds the staged workspace and grades this lab against its PUBLISHED
 // checks, returning everything the CLI needs to report and record the run.
 //
@@ -110,7 +116,9 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 		return run
 	}
 
-	fmt.Fprintf(os.Stderr, "── grading %s\n", filepath.Base(labDir))
+	// (The old `── grading <lab>` line moved up a level: the caller prints
+	// `grading <stage> — "<title>"` BEFORE the spec fetch, so the defaulted stage
+	// is visible even while the network is being asked which rubric this is.)
 
 	// ── Build (the one subprocess this file owns, and the course's own) ────────
 	// Precedence: the LAB's own build command (lab.toml, via resolve --grader),
@@ -129,7 +137,12 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 	// INHERITED, not captured. The build is the slow part of a practice run and its
 	// output is the learner's own compiler errors: they have to arrive as they
 	// happen, and they must keep whatever colour and interleaving cargo gave them.
+	// (Under --json, stdout belongs to the verdict object, so the build's stdout
+	// joins the messaging on stderr.)
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+	if jsonMode {
+		cmd.Stdout = os.Stderr
+	}
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) {
@@ -186,6 +199,9 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 	judge := exec.Command(engine, args...)
 	judge.Dir = runDir
 	judge.Stdout = io.MultiWriter(os.Stdout, &captured)
+	if jsonMode {
+		judge.Stdout = &captured // stdout is reserved for the JSON verdict
+	}
 	judge.Stderr = os.Stderr
 	err = judge.Run()
 	if err != nil {

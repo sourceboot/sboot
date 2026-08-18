@@ -1,15 +1,21 @@
 // sboot — the learner's CLI. Two-tier grading (the content-protection rules):
 //
-//	sboot test <stage>    practice — builds locally, then execs the grading engine
+//	sboot test [stage]    practice — builds locally, then execs the grading engine
 //	                    (grade.go) against the published checks; fast,
 //	                    offline-friendly, recorded as a practice run, never
 //	                    completes a stage.
-//	sboot submit <stage>  official — gates on a local run, then uploads that run's
+//	sboot submit [stage]  official — gates on a local run, then uploads that run's
 //	                    capture and the os/ source tree; the platform judges the
 //	                    capture against the full private rubric, inside the request
 //	                    that carries it, and answers with the verdict. Since D8
 //	                    nothing on our side builds or boots. Only a passing
 //	                    submission completes.
+//
+// The stage is OPTIONAL since v0.4 (ux-plan §11.c): it defaults to the CURRENT
+// lab — the first live stage the server has not verified (status.go currentLab)
+// — and the defaulted choice is always printed. Bare `sboot` is the orientation
+// screen (§11.b), `sboot help` is where usage moved, and status.go's file
+// comment is the map of the orientation machinery.
 //
 // ── THE SUBMIT GATE (D3, the grading design) ──────────────────
 //
@@ -96,164 +102,304 @@ func env(key, fallback string) string {
 	return fallback
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, `sboot — learn by building
+// stageRe is the explicit-stage validation: an argument that names a stage must
+// start with its lab number. It is also how `sboot hint` tells a stage argument
+// from a check id (`serial.burst`) — stages always lead with digits, check ids
+// never do.
+var stageRe = regexp.MustCompile(`^\d+`)
 
-usage:
-  sboot start [course]   create the course repo in ./<course>/ (run once):
-                       your os/ tree, build config, README, LICENSE
-  sboot test <stage>     practice: run the lab's checks locally
-                       (fast loop; does not complete the stage)
-  sboot hint <stage> [check]  a hint for a failing check — each time you run
-                       it, the hint goes one rung deeper
-  sboot submit <stage>   official: check locally first, then upload for the
-                       server-side grade (completes the stage)
-  sboot where            print where your repo, tests and grader live
-  sboot debug <stage>    boot this stage under QEMU frozen for a debugger on :1234
-  sboot fetch [course]   download the current lab's tests on purpose (refresh, or
-                       pre-cache before losing your connection)
+// gradedArgs is one graded command's parsed invocation.
+type gradedArgs struct {
+	stage     string // "" until defaulted
+	check     string // hint only
+	defaulted bool   // the stage came from the current-lab rule, not the learner
+	force     bool
+	jsonOut   bool
+	yes       bool
+}
 
-flags:
-  --force, -f          submit even if the local check fails — for when you think
-                       the local grader is wrong, or you want the failed attempt
-                       on the record
+// parseCommon walks a command's arguments: positionals in order, the flags the
+// command declared, `--` ending options (POSIX), unknown flags refused with the
+// help pointer. Returns the positionals.
+func parseCommon(cmd string, args []string, maxPos int, opts *gradedArgs) []string {
+	var pos []string
+	terminated := false
+	for _, a := range args {
+		switch {
+		case !terminated && a == "--":
+			terminated = true
+		case !terminated && (a == "--force" || a == "-f"):
+			if cmd != "submit" {
+				usageError("--force only means something for `sboot submit`")
+			}
+			opts.force = true
+		case !terminated && a == "--json":
+			if cmd != "test" && cmd != "submit" {
+				usageError("--json is not available on `sboot %s` (it is on `sboot`, test and submit)", cmd)
+			}
+			opts.jsonOut = true
+		case !terminated && (a == "--yes" || a == "-y"):
+			if cmd != "start" && cmd != "repo" {
+				usageError("--yes only means something for `sboot start` and `sboot repo`")
+			}
+			opts.yes = true
+		case !terminated && a == "--no-color":
+			noColorFlag = true
+		case !terminated && (a == "--help" || a == "-h"):
+			printHelp(os.Stdout, false)
+			exitWith(0)
+		case !terminated && strings.HasPrefix(a, "-") && a != "-":
+			usageError("unknown flag %q", a)
+		default:
+			if len(pos) >= maxPos {
+				usageError("unexpected argument %q", a)
+			}
+			pos = append(pos, a)
+		}
+	}
+	return pos
+}
 
-environment:
-  SBOOT_API_URL      platform URL           (default %s)
-  SBOOT_TOKEN        your API token         (default the local dev token)
-  SBOOT_COURSE       course id              (default: read from sboot.toml)
-  SBOOT_COURSE_DIR   your course repo       (default: walk up from cwd)
-  SBOOT_CACHE_DIR    tests + grader cache   (default: the OS data dir)
-  SBOOT_OFFLINE      set to skip every network call (cached tests still grade)
-`, defaultAPI)
-	exitWith(2)
+// requireRepo locates the workspace or refuses with the copy every graded verb
+// shares (the ux-v2 error tile): what is missing, then the next move.
+func requireRepo(doing string) repo {
+	r, err := findRepo()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sboot: no course workspace here — nothing to %s.\n", doing)
+		fmt.Fprintln(os.Stderr, "sboot: `sboot courses` lists them; `sboot start <id>` begins one.")
+		exitWith(2)
+	}
+	return r
+}
+
+// resolveGradedStage settles which stage a graded verb runs against: an explicit
+// argument wins (validated, cosmetically resolved to the manifest's id); no
+// argument means the CURRENT lab — first live stage the server has not verified,
+// server truth online, cache offline (§11.c).
+//
+// The frontier ("every live lab is verified") is a normal state, not an error:
+// `onFrontier` renders it and its return becomes the exit code.
+func resolveGradedStage(r repo, ga *gradedArgs, verb string, onFrontier func(*frontierInfo) int) string {
+	if ga.stage != "" {
+		if stageRe.FindString(ga.stage) == "" {
+			fmt.Fprintf(os.Stderr, "sboot: stage %q must start with its lab number (e.g. 01-boot)\n", ga.stage)
+			exitWith(2)
+		}
+		resolved, _ := resolveStageArg(r.course, ga.stage)
+		return resolved
+	}
+	ga.defaulted = true
+	st := loadState()
+	lab, fr, _, err := currentLab(st, r.course)
+	saveQuietly(st)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
+		fmt.Fprintf(os.Stderr, "sboot: name the lab instead: `sboot %s <stage>` — or reconnect (`sboot login`) and retry.\n", verb)
+		exitWith(2)
+	}
+	if fr != nil {
+		exitWith(onFrontier(fr))
+	}
+	return lab.Stage
+}
+
+// frontierMessage is the S5 tile: every live lab verified, said plainly, exit 0.
+func frontierMessage(course string, fr *frontierInfo) int {
+	fmt.Printf("all live labs in %s are verified — nothing new to grade.\n", course)
+	if fr.next != nil {
+		fmt.Printf("lab %s (%s) is next and not yet published; labs open in order as they land.\n",
+			labNumber(fr.next.Stage), labSlug(fr.next.Stage))
+	} else {
+		fmt.Println("new labs open in order as they land.")
+	}
+	fmt.Println("meanwhile: `sboot courses` — the rest of your path.")
+	return 0
+}
+
+// gradedHeader prints the always-visible stage line — `grading 02-glass-cockpit
+// — "The glass cockpit"` — on stderr (messaging; the verdict on stdout must
+// survive `2>/dev/null`). When the stage was defaulted, the line says so and
+// names the override, which is what makes the default legible (§11.c).
+func gradedHeader(verbing, course, stage, verb string, defaulted bool) {
+	p := painter(os.Stderr)
+	line := verbing + " " + stage
+	if t := labTitle(course, stage); t != "" {
+		line += fmt.Sprintf(" — %q", t)
+	}
+	line = p(ansiAmber, line)
+	if defaulted {
+		line += p(ansiDim, fmt.Sprintf("   # your current lab; sboot %s <stage> overrides", verb))
+	}
+	fmt.Fprintln(os.Stderr, line)
 }
 
 func main() {
-	if len(os.Args) == 2 && (os.Args[1] == "version" || os.Args[1] == "--version") {
-		fmt.Println("sboot", version)
-		return
+	args := os.Args[1:]
+	if next, found := stripFlag(args, "--no-color"); found {
+		noColorFlag = true
+		args = next
 	}
-	if len(os.Args) >= 2 && os.Args[1] == "start" {
-		course := env("SBOOT_COURSE", defaultCourse)
-		if len(os.Args) >= 3 {
-			course = os.Args[2]
-		}
-		runStart(course)
+	if hasFlagBefore(args, "--version") {
+		fmt.Println("sboot", version)
 		exitWith(0)
 	}
-	if len(os.Args) >= 2 && os.Args[1] == "where" {
+
+	// Bare `sboot` is the orientation screen — where am I, what's next, how —
+	// exit 0 (§11.b). Usage lives in `sboot help`.
+	if len(args) == 0 {
+		exitWith(runStatus(false))
+	}
+	if len(args) == 1 && args[0] == "--json" {
+		exitWith(runStatus(true))
+	}
+	if args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
+		printHelp(os.Stdout, hasFlagBefore(args[1:], "--all"))
+		exitWith(0)
+	}
+
+	cmd, rest := args[0], args[1:]
+	var ga gradedArgs
+
+	switch cmd {
+	case "version":
+		fmt.Println("sboot", version)
+		exitWith(0)
+
+	case "courses":
+		parseCommon(cmd, rest, 0, &ga)
+		exitWith(runCourses())
+
+	case "login":
+		parseCommon(cmd, rest, 0, &ga)
+		exitWith(runLogin())
+
+	case "logout":
+		parseCommon(cmd, rest, 0, &ga)
+		exitWith(runLogout())
+
+	case "whoami":
+		parseCommon(cmd, rest, 0, &ga)
+		exitWith(runWhoami())
+
+	case "repo":
+		parseCommon(cmd, rest, 0, &ga)
+		exitWith(runRepo(ga.yes))
+
+	case "start":
+		pos := parseCommon(cmd, rest, 1, &ga)
+		course := env("SBOOT_COURSE", "")
+		if len(pos) == 1 {
+			course = pos[0]
+		}
+		if course == "" {
+			exitWith(startNoArg())
+		}
+		runStart(course, ga.yes)
+		exitWith(0)
+
+	case "where":
+		parseCommon(cmd, rest, 0, &ga)
 		exitWith(runWhere())
-	}
-	if len(os.Args) >= 2 && os.Args[1] == "debug" {
-		// Added 2026-07-26 to repair a regression the workspace split caused. The
-		// split moved xtask/ out of the learner's repo into the cache, which left
-		// `cargo xtask debug` — an instruction 04-debugging's brief and lesson both
-		// give — failing with "manifest path does not exist" in their own repo.
-		// The grader lives where `sboot where` says it does; wrapping is what every
-		// other xtask invocation already does.
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "usage: sboot debug <stage>")
-			exitWith(2)
-		}
-		r, err := findRepo()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
-			exitWith(2)
-		}
-		exitWith(runDebug(r, os.Args[2]))
-	}
-	if len(os.Args) >= 2 && os.Args[1] == "hint" {
-		// Its own dispatch (like debug) because it takes an OPTIONAL second
-		// positional — the check id — which the generic stage-plus-flags parser
-		// below would reject as "unexpected argument".
-		if len(os.Args) < 3 || len(os.Args) > 4 {
-			fmt.Fprintln(os.Stderr, "usage: sboot hint <stage> [check-id]")
-			exitWith(2)
-		}
-		stage, check := os.Args[2], ""
-		if len(os.Args) == 4 {
-			check = os.Args[3]
-		}
-		if regexp.MustCompile(`^\d+`).FindString(stage) == "" {
-			fmt.Fprintf(os.Stderr, "sboot: stage %q must start with its lab number (e.g. 01-boot)\n", stage)
-			exitWith(2)
-		}
-		r, err := findRepo()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
-			exitWith(2)
-		}
-		exitWith(runHint(r, stage, check))
-	}
-	if len(os.Args) >= 2 && os.Args[1] == "fetch" {
-		// No `--all`: removed 2026-07-26. It read as "cache the whole course before a
-		// flight" but was bounded by SEQUENTIAL UNLOCK, not entitlement — on a fresh
-		// account it cached 2 labs and reported "16 not open to you yet". A command
-		// whose name promises the course and delivers the next lab is worse than no
-		// command. The lab-boundary case it was meant to cover is already handled by
-		// the opportunistic prefetch on completion (see cache.go).
+
+	case "fetch":
+		pos := parseCommon(cmd, rest, 1, &ga)
 		course := ""
-		for _, a := range os.Args[2:] {
-			if strings.HasPrefix(a, "-") {
-				fmt.Fprintf(os.Stderr, "sboot: unknown flag %q\n", a)
-				usage()
-			}
-			course = a
+		if len(pos) == 1 {
+			course = pos[0]
 		}
 		exitWith(runFetch(course))
-	}
-	if len(os.Args) < 3 {
-		usage()
-	}
-	command := os.Args[1]
 
-	// Hand-rolled rather than `flag`: the stage is positional and must be accepted
-	// on either side of the flags, because `sboot submit 01-boot --force` is what a
-	// learner will actually type and stdlib `flag` stops parsing at the first
-	// positional.
-	var stage string
-	var force bool
-	for _, a := range os.Args[2:] {
-		switch {
-		case a == "--force" || a == "-f":
-			force = true
-		case strings.HasPrefix(a, "-"):
-			fmt.Fprintf(os.Stderr, "sboot: unknown flag %q\n", a)
-			usage()
-		case stage == "":
-			stage = a
-		default:
-			fmt.Fprintf(os.Stderr, "sboot: unexpected argument %q\n", a)
-			usage()
+	case "debug":
+		// Wraps the course grader's own `debug` (the workspace split moved xtask/
+		// out of the learner's repo, so `cargo xtask debug` is inert there).
+		pos := parseCommon(cmd, rest, 1, &ga)
+		if len(pos) == 1 {
+			ga.stage = pos[0]
+		}
+		r := requireRepo("debug")
+		stage := resolveGradedStage(r, &ga, "debug", func(fr *frontierInfo) int {
+			fmt.Fprintln(os.Stderr, "sboot: all live labs are verified — name the stage to boot: `sboot debug <stage>`.")
+			return 2
+		})
+		gradedHeader("debugging", r.course, stage, "debug", ga.defaulted)
+		exitWith(runDebug(r, stage))
+
+	case "hint":
+		// Two optional positionals: [stage] [check]. A stage always leads with
+		// digits and a check id never does, so one argument is unambiguous.
+		pos := parseCommon(cmd, rest, 2, &ga)
+		switch len(pos) {
+		case 1:
+			if stageRe.FindString(pos[0]) != "" {
+				ga.stage = pos[0]
+			} else {
+				ga.check = pos[0]
+			}
+		case 2:
+			ga.stage, ga.check = pos[0], pos[1]
+		}
+		r := requireRepo("hint")
+		stage := resolveGradedStage(r, &ga, "hint", func(fr *frontierInfo) int {
+			fmt.Println("all live labs are verified — nothing to hint. Nice work.")
+			return 0
+		})
+		exitWith(runHint(r, stage, ga.check, ga.defaulted))
+
+	case "test":
+		pos := parseCommon(cmd, rest, 1, &ga)
+		if len(pos) == 1 {
+			ga.stage = pos[0]
+		}
+		r := requireRepo("grade")
+		stage := resolveGradedStage(r, &ga, "test", func(fr *frontierInfo) int {
+			return frontierMessage(r.course, fr)
+		})
+		runTest(r, stage, ga)
+
+	case "submit":
+		pos := parseCommon(cmd, rest, 1, &ga)
+		if len(pos) == 1 {
+			ga.stage = pos[0]
+		}
+		r := requireRepo("submit")
+		stage := resolveGradedStage(r, &ga, "submit", func(fr *frontierInfo) int {
+			return frontierMessage(r.course, fr)
+		})
+		runSubmit(r, stage, ga)
+
+	default:
+		usageError("unknown command %q", cmd)
+	}
+}
+
+// startNoArg answers a bare `sboot start`: the catalog and how to pick — nothing
+// is created (the ux-v2 start tile; dogfood P4/C2).
+func startNoArg() int {
+	st := loadState()
+	cat, _ := catalog(st)
+	saveQuietly(st)
+	p := painter(os.Stdout)
+	fmt.Println("which course? the catalog:")
+	fmt.Println()
+	if len(cat) == 0 {
+		fmt.Printf("  (unreachable right now — browse it at %s/courses)\n", siteURL())
+	} else {
+		var live []catalogCourse
+		for _, c := range cat {
+			if c.Live > 0 {
+				live = append(live, c)
+			}
+		}
+		idW, titleW := courseColumns(live, nil)
+		rows, _ := catalogRows(p, live, nil, idW, titleW)
+		for _, line := range rows {
+			fmt.Println(line)
 		}
 	}
-	if stage == "" {
-		usage()
-	}
-	if regexp.MustCompile(`^\d+`).FindString(stage) == "" {
-		fmt.Fprintf(os.Stderr, "sboot: stage %q must start with its lab number (e.g. 01-boot)\n", stage)
-		exitWith(2)
-	}
-	if force && command != "submit" {
-		fmt.Fprintf(os.Stderr, "sboot: --force only means something for `sboot submit`\n")
-		exitWith(2)
-	}
-
-	r, err := findRepo()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
-		exitWith(2)
-	}
-
-	switch command {
-	case "test":
-		runTest(r, stage)
-	case "submit":
-		runSubmit(r, stage, force)
-	default:
-		usage()
-	}
+	fmt.Println()
+	fmt.Printf("pick one:  %s\n", p(ansiGreen, "sboot start "+firstLive(cat)))
+	fmt.Println(p(ansiDim, "(nothing was created)"))
+	return 2
 }
 
 // prepare resolves everything a local grading run needs: the lab's tests and the
@@ -281,27 +427,62 @@ func prepare(r repo, stage string) string {
 	return run
 }
 
-func runTest(r repo, stage string) {
+func runTest(r repo, stage string, ga gradedArgs) {
+	gradedHeader("grading", r.course, stage, "test", ga.defaulted)
 	run := prepare(r, stage)
 
 	// Failure guidance: read the per-check consecutive-failure counters BEFORE
 	// grading, so we can tell the grader which checks have earned the Layer 2
 	// ladder (the failure-guidance spec). The grader itself stays historyless.
 	st := loadState()
+	jsonMode = ga.jsonOut
 	res := runGrader(run, r.course, stage, st.tierSpec(r.course, stage), "")
 	if res.launchFailed {
 		reportGraderMissing(res.launchErr)
 		exitWith(2)
 	}
 	st.record(r.course, stage, res.checks)
+	st.recordScore(r.course, stage, res.score, res.max)
 	if err := st.save(); err != nil {
 		debugf("could not save guidance state: %v", err)
 	}
 
+	if ga.jsonOut {
+		printVerdictJSON("test", r.course, stage, res)
+	}
 	if err := reportPractice(r.course, stage, res.score, res.max, res.passed, res.detail); err != nil {
 		reportPracticeFailure(err)
 	}
+	if res.exitCode != 0 {
+		// The stuck deep link (§11.i): the free ladder in the terminal, the
+		// explain chat on the page — never a terminal AI command.
+		p := painter(os.Stderr)
+		fmt.Fprintf(os.Stderr, "stuck?  %s · %s\n", p(ansiGreen, "sboot hint"),
+			stageStuckURL(r.course, stage))
+	}
 	exitWith(res.exitCode)
+}
+
+// stageStuckURL is the lab page's Stuck? anchor — where the ladder's web mirror
+// and the metered explain chat live (§11.i).
+func stageStuckURL(course, stage string) string {
+	return fmt.Sprintf("%s/courses/%s/stages/%s#stuck", siteURL(), course, stage)
+}
+
+// printVerdictJSON is `--json`'s verdict object (§12.2 rule 6), on stdout.
+func printVerdictJSON(command, course, stage string, res graderRun) {
+	checks := make([]map[string]any, 0, len(res.checks))
+	for _, c := range res.checks {
+		checks = append(checks, map[string]any{
+			"id": c.id, "pass": c.pass, "points": c.points, "desc": c.desc,
+		})
+	}
+	b, _ := json.MarshalIndent(map[string]any{
+		"command": command, "course": course, "stage": stage,
+		"score": res.score, "max_score": res.max, "passed": res.passed,
+		"exit": res.exitCode, "checks": checks,
+	}, "", "  ")
+	fmt.Println(string(b))
 }
 
 // runDebug boots the stage under QEMU frozen for a debugger, by handing off to the
@@ -354,7 +535,8 @@ func reportPracticeFailure(err error) {
 			return
 		case http.StatusUnauthorized:
 			fmt.Fprintf(os.Stderr, "\nsboot: the platform did not accept your token: %s\n", ae.msg)
-			fmt.Fprintf(os.Stderr, "sboot: get a fresh one at %s/account and set SBOOT_TOKEN.\n", apiURL())
+			fmt.Fprintf(os.Stderr, "sboot: reconnect with `sboot login`, or paste a fresh token from\n")
+			fmt.Fprintf(os.Stderr, "sboot:   %s/account   into SBOOT_TOKEN.\n", siteURL())
 			return
 		}
 	}
@@ -645,7 +827,12 @@ func authedRequest(method, url string, body io.Reader) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+env("SBOOT_TOKEN", "sboot-dev-token"))
+	// The token order is auth.go's resolveToken: SBOOT_TOKEN env → the stored
+	// login (site-matched) → the dev default. Until `sboot login` existed this
+	// line read the env var directly with the same default, so a machine with
+	// no credentials file behaves byte-identically to every earlier release.
+	token, _ := resolveToken()
+	req.Header.Set("Authorization", "Bearer "+token)
 	// WHO IS ASKING (the CLI release policy §1). Two spellings on purpose: the
 	// User-Agent is conventional and carries the platform tuple, and the explicit
 	// header is what the server keys on because proxies and corporate middleboxes
@@ -795,10 +982,16 @@ func reportPractice(course, stage string, score, max int, passed bool, detail st
 		return &apiError{status: resp.StatusCode, msg: "unexpected response"}
 	}
 
+	// In --json mode stdout is the verdict object and nothing else; the human
+	// line moves to stderr with the rest of the messaging.
+	w := io.Writer(os.Stdout)
+	if jsonMode {
+		w = os.Stderr
+	}
 	if passed {
-		fmt.Printf("\n→ practice run recorded ✅ — %s\n", r.Hint)
+		fmt.Fprintf(w, "\n→ practice run recorded ✅ — %s\n", r.Hint)
 	} else {
-		fmt.Printf("\n→ practice run recorded (%d/%d) — keep going.\n", score, max)
+		fmt.Fprintf(w, "\n→ practice run recorded (%d/%d) — keep going.\n", score, max)
 	}
 	return nil
 }
@@ -830,27 +1023,52 @@ type submissionResp struct {
 		Title string `json:"title"`
 		Live  bool   `json:"live"`
 	} `json:"next_stage"`
-	Err string `json:"error"`
+	// ADDITIVE (2026-08-17, the flagship bridge — docs/ai-features.md): present
+	// on a pass when the platform created its AI review. Its presence is what
+	// switches the pass print to "Submitted → <url>": the lab is finished on
+	// that page's Complete button now, not by the submit. Absent from an older
+	// platform ⇒ the pre-review verdict print runs unchanged.
+	ReviewURL string `json:"review_url"`
+	Err       string `json:"error"`
 }
 
 // runSubmit is a thin wrapper so the body can `return` an exit code and let its
 // defers run — the temp capture file needs cleanup, and `os.Exit` skips defers.
-func runSubmit(r repo, stage string, force bool) {
-	exitWith(submit(r, stage, force))
+func runSubmit(r repo, stage string, ga gradedArgs) {
+	exitWith(submit(r, stage, ga))
 }
 
-func submit(r repo, stage string, force bool) int {
+// reportSubmitAuthFailure is the 401 tile: both doors (`sboot login` and the
+// copied-token path), and what was NOT lost.
+func reportSubmitAuthFailure(msg string) {
+	if msg == "" {
+		msg = "invalid or missing token"
+	}
+	fmt.Fprintf(os.Stderr, "sboot: the platform did not accept your token (401: %s).\n", msg)
+	fmt.Fprintln(os.Stderr, "sboot: reconnect with `sboot login`, or paste a fresh token from")
+	fmt.Fprintf(os.Stderr, "sboot:   %s/account   into SBOOT_TOKEN.\n", siteURL())
+	fmt.Fprintln(os.Stderr, "sboot: nothing was submitted — your passing run is safe to resend.")
+}
+
+func submit(r repo, stage string, ga gradedArgs) int {
+	force := ga.force
+	gradedHeader("submitting", r.course, stage, "submit", ga.defaulted)
 	osDir := r.osDir()
 	if st, err := os.Stat(osDir); err != nil || !st.IsDir() {
 		fmt.Fprintf(os.Stderr, "sboot: no os/ tree at %s\n", osDir)
 		return 2
 	}
 	course := r.course
+	jsonMode = ga.jsonOut
 
 	// Ask whether this stage is even open to us before spending a build and a boot
 	// on it. Being told "finish the previous lab first" after a two-minute local
 	// run is the one bad outcome the gate creates, and one cheap GET removes it.
 	if ae := submitPreflight(course, stage); ae != nil {
+		if ae.status == http.StatusUnauthorized {
+			reportSubmitAuthFailure(ae.msg)
+			return 2
+		}
 		fmt.Fprintf(os.Stderr, "sboot: submission rejected: %s\n", ae.Error())
 		return 2
 	}
@@ -867,7 +1085,11 @@ func submit(r repo, stage string, force bool) int {
 		defer os.Remove(capturePath)
 	}
 
-	fmt.Printf("── checking %s locally first (one build, one boot)\n", stage)
+	// "one run", not "one boot": since the command capture (2026-08-13) a course
+	// may have nothing to boot — rust-primer's evidence is `cargo test` — and this
+	// line is printed for every course. The boot IS the run for the OS courses.
+	// Progress narration goes to stderr (§12.2 rule 3): stdout is for the verdict.
+	fmt.Fprintf(os.Stderr, "── checking %s locally first (one build, one run)\n", stage)
 	st := loadState()
 	res := runGrader(run, course, stage, st.tierSpec(course, stage), capturePath)
 
@@ -919,12 +1141,12 @@ func submit(r repo, stage string, force bool) int {
 		reportGateFailure(stage, res)
 		return 1
 	case res.exitCode != 0:
-		fmt.Printf("\n── local check FAILED (%s) — submitting anyway (--force)\n", scoreText(res))
+		fmt.Fprintf(os.Stderr, "\n── local check FAILED (%s) — submitting anyway (--force)\n", scoreText(res))
 	default:
-		fmt.Printf("\n── local check passed (%s)\n", scoreText(res))
+		fmt.Fprintf(os.Stderr, "\n── local check passed (%s)\n", scoreText(res))
 	}
 
-	fmt.Println("── packaging os/ (source only)")
+	fmt.Fprintln(os.Stderr, "── packaging os/ (source only)")
 	archive, err := tarGzDir(osDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sboot: package: %v\n", err)
@@ -968,26 +1190,69 @@ func submit(r repo, stage string, force bool) int {
 	err = json.NewDecoder(resp.Body).Decode(&created)
 	resp.Body.Close()
 	if err != nil || created.ID == "" {
-		if created.Err != "" {
+		switch {
+		case resp.StatusCode == http.StatusUnauthorized:
+			reportSubmitAuthFailure(created.Err)
+		case created.Err != "":
 			fmt.Fprintf(os.Stderr, "sboot: submission rejected: %s (HTTP %d)\n", created.Err, resp.StatusCode)
-		} else {
+		default:
 			fmt.Fprintf(os.Stderr, "sboot: unexpected response (HTTP %d)\n", resp.StatusCode)
 		}
 		return 2
 	}
-	fmt.Printf("── submitted (%d KB) — graded on the server\n", len(body)/1024)
+	fmt.Fprintf(os.Stderr, "── submitted (%d KB) — graded on the server\n", len(body)/1024)
+	if ga.jsonOut {
+		out := map[string]any{
+			"command": "submit", "course": course, "stage": stage,
+			"id": created.ID, "status": created.Status,
+			"score": deref(created.Score), "max_score": deref(created.MaxScore),
+		}
+		// Additive, mirroring the wire: absent when the platform sent none.
+		if created.ReviewURL != "" {
+			out["review_url"] = created.ReviewURL
+		}
+		b, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(b))
+	}
 
 	// THE VERDICT IS ALREADY IN `created`. The platform judges the capture inside
 	// the request that carried it, so there is no queue to wait behind and nothing
 	// to poll — the five-minute deadline, the `.`/`!` progress dots and the Ctrl-C
 	// window they created are all gone with the runner that made them necessary.
+	//
+	// The verdict is DATA: stdout (except under --json, where stdout is the one
+	// JSON object and the human rendering joins the messaging on stderr).
+	vw := io.Writer(os.Stdout)
+	if ga.jsonOut {
+		vw = os.Stderr
+	}
 	if created.Detail != "" {
-		fmt.Println()
-		fmt.Println(indent(created.Detail, "  "))
+		fmt.Fprintln(vw)
+		fmt.Fprintln(vw, indent(created.Detail, "  "))
 	}
 	switch created.Status {
 	case "passed":
-		fmt.Printf("\n  ✅ official grade: %d/%d — stage complete!", deref(created.Score), deref(created.MaxScore))
+		// THE FLAGSHIP BRIDGE (docs/ai-features.md; ux-plan §6): when the
+		// platform created a review, the pass is *submitted for review* — the
+		// lab is finished by the Complete button ON that page, so this print
+		// must not claim completion and the CLI must not mark the stage
+		// verified (the server hasn't; the next online status read is truth).
+		// An older platform sends no review_url and the pre-review print below
+		// runs unchanged — the fallback the append-only rule requires.
+		if created.ReviewURL != "" {
+			fmt.Fprintf(vw, "\n  ✅ official grade: %d/%d — recorded\n", deref(created.Score), deref(created.MaxScore))
+			fmt.Fprintf(vw, "  Submitted → %s\n", created.ReviewURL)
+			fmt.Fprintln(vw, "  read your review, then press Complete there — that's what finishes the lab")
+			return 0
+		}
+		// Keep the offline orientation truthful without a round trip: this stage
+		// is now verified, and the next status screen should say so even on a
+		// plane.
+		st.markVerified(course, stage, fmt.Sprintf("%d/%d", deref(created.Score), deref(created.MaxScore)))
+		if err := st.save(); err != nil {
+			debugf("could not save state: %v", err)
+		}
+		fmt.Fprintf(vw, "\n  ✅ official grade: %d/%d — stage complete!", deref(created.Score), deref(created.MaxScore))
 		if created.NextStage != nil {
 			// OPPORTUNISTIC PREFETCH. Completing this lab is the moment the next one
 			// becomes fetchable (sequential unlock just opened it), and it is also the
@@ -997,28 +1262,28 @@ func submit(r repo, stage string, force bool) int {
 			// costs one download later.
 			if created.NextStage.Live {
 				prefetchLab(course, created.NextStage.ID)
-				fmt.Printf(" Next up: %s\n", created.NextStage.ID)
+				fmt.Fprintf(vw, " Next up: %s\n", created.NextStage.ID)
 			} else {
-				fmt.Printf(" Next up: %s (coming soon)\n", created.NextStage.Title)
+				fmt.Fprintf(vw, " Next up: %s (coming soon)\n", created.NextStage.Title)
 			}
 		} else {
-			fmt.Println(" Course complete!")
+			fmt.Fprintln(vw, " Course complete!")
 		}
 		return 0
 	case "failed":
-		fmt.Printf("\n  ❌ official grade: %d/%d\n", deref(created.Score), deref(created.MaxScore))
+		fmt.Fprintf(vw, "\n  ❌ official grade: %d/%d\n", deref(created.Score), deref(created.MaxScore))
 		// This line used to read "the server rubric includes hidden checks; make it
 		// work, not just print". D1 removed the hidden checks, so blaming a stricter
 		// rubric would now be false — and D3 makes the honest reading exact. If the
 		// local gate went green and the server did not, the two runs graded the SAME
 		// checks, so what differs is the two machines.
 		if res.exitCode == 0 && !res.launchFailed {
-			fmt.Println("     Your local run passed, so the difference is between your machine and")
-			fmt.Println("     ours, not between two sets of checks. Please report it.")
+			fmt.Fprintln(vw, "     Your local run passed, so the difference is between your machine and")
+			fmt.Fprintln(vw, "     ours, not between two sets of checks. Please report it.")
 		}
 		return 1
 	case "error":
-		fmt.Println("\n  ⚠ grading error on the server — please retry; if it persists, report it.")
+		fmt.Fprintln(vw, "\n  ⚠ grading error on the server — please retry; if it persists, report it.")
 		return 2
 	default:
 		// `pending` or `running`: the platform accepted the upload and could not
@@ -1031,10 +1296,10 @@ func submit(r repo, stage string, force bool) int {
 		// Re-running the command is the right advice and costs nothing extra: the
 		// same work carries the same idempotency key, so a retry lands on this same
 		// submission rather than creating a second one.
-		fmt.Println("\n  ⚠ your work was uploaded, but nothing graded it. This is a problem on our")
-		fmt.Println("     side, not with your code — nothing about your submission was judged.")
-		fmt.Printf("     Run `sboot submit %s` again in a few minutes. If it happens twice in a\n", stage)
-		fmt.Println("     row the grading service is down, and re-submitting will not help.")
+		fmt.Fprintln(vw, "\n  ⚠ your work was uploaded, but nothing graded it. This is a problem on our")
+		fmt.Fprintln(vw, "     side, not with your code — nothing about your submission was judged.")
+		fmt.Fprintf(vw, "     Run `sboot submit %s` again in a few minutes. If it happens twice in a\n", stage)
+		fmt.Fprintln(vw, "     row the grading service is down, and re-submitting will not help.")
 		return 2
 	}
 }
@@ -1055,11 +1320,11 @@ func scoreText(res graderRun) string {
 // second place for the never-echo-the-rubric rule to be got wrong. The only facts
 // the grader cannot know are that nothing was submitted, and how to override.
 func reportGateFailure(stage string, res graderRun) {
-	fmt.Printf("\n── not submitted: the local check did not pass (%s)\n", scoreText(res))
-	fmt.Println("   `sboot submit` grades the same checks you just ran, so fix these first —")
-	fmt.Println("   no submission was created and nothing was sent.")
-	fmt.Printf("   Think the local grader is wrong, or want this failure on the record?\n")
-	fmt.Printf("     sboot submit %s --force\n", stage)
+	fmt.Fprintf(os.Stderr, "\n── not submitted: the local check did not pass (%s)\n", scoreText(res))
+	fmt.Fprintln(os.Stderr, "   `sboot submit` grades the same checks you just ran, so fix these first —")
+	fmt.Fprintln(os.Stderr, "   no submission was created and nothing was sent.")
+	fmt.Fprintf(os.Stderr, "   Think the local grader is wrong, or want this failure on the record?\n")
+	fmt.Fprintf(os.Stderr, "     sboot submit %s --force\n", stage)
 }
 
 // submitPreflight asks the platform whether it would accept a submission for this
@@ -1071,6 +1336,12 @@ func reportGateFailure(stage string, res graderRun) {
 // `sboot submit` must never start refusing because of a network blip, and the
 // local check itself works with no network at all.
 func submitPreflight(course, stage string) *apiError {
+	// SBOOT_OFFLINE promises "skip every network call", and this call is the
+	// easiest one to honor it with: it is an optimisation, and skipping it just
+	// means the POST decides — which offline it will, by failing to send.
+	if offline() {
+		return nil
+	}
 	url := fmt.Sprintf("%s/api/v1/submissions?course=%s&stage=%s", apiURL(), course, stage)
 	req, err := authedRequest("GET", url, nil)
 	if err != nil {
@@ -1153,7 +1424,7 @@ func readCapture(path string) []byte {
 	return b
 }
 
-// ── start: create the learner's repo ────────────────────────────────────────────
+// ── start: create the learner's workspace ───────────────────────────────────────
 //
 // What lands here is ONLY the learner's half — `os/`, the build config, and the four
 // files this command writes itself (sboot.toml, LICENSE, .gitignore, README.md). The
@@ -1161,11 +1432,14 @@ func readCapture(path string) []byte {
 // up ready to grade without ever having had our harness inside their repo.
 //
 // Both destinations are printed, because two directories is only a support burden if
-// nobody says where they are.
-func runStart(course string) {
+// nobody says where they are. After the workspace block comes the repo concierge
+// (ux-plan §11.j — one confirm, on their machine, skippable), then the handoff to
+// the first live lab with its lesson URL (P6: a URL at the decision moment).
+func runStart(course string, yes bool) {
 	dest := course
 	if entries, err := os.ReadDir(dest); err == nil && len(entries) > 0 {
 		fmt.Fprintf(os.Stderr, "sboot: ./%s already exists and is not empty — refusing to overwrite\n", dest)
+		fmt.Fprintf(os.Stderr, "sboot: resuming on this machine? cd %s && sboot — orientation is free.\n", dest)
 		exitWith(2)
 	}
 
@@ -1210,7 +1484,7 @@ func runStart(course string) {
 	// The tests + grader, into the cache. Deliberately AFTER the scaffold: if this
 	// half fails (offline mid-setup) the learner still has their repo and a later
 	// `sboot test` will finish the job, rather than being left with nothing.
-	title, firstStage := course, ""
+	title, firstStage, firstTitle := course, "", ""
 	if s, err := ensureSpec(course, ""); err == nil {
 		if m, err := fetchManifest(course); err == nil {
 			if m.Title != "" {
@@ -1219,6 +1493,7 @@ func runStart(course string) {
 			for _, l := range m.Labs {
 				if l.Live {
 					firstStage = l.Stage
+					firstTitle = l.Title
 					break
 				}
 			}
@@ -1242,23 +1517,41 @@ func runStart(course string) {
 	}
 
 	abs, _ := filepath.Abs(dest)
-	fmt.Printf("\n── your repo is ready: %s\n", abs)
+	fmt.Printf("\n── your workspace is ready: %s\n", abs)
 	fmt.Printf("   os/ is yours. sboot.toml says which course this is.\n")
 	fmt.Printf("   Our tests and grader are NOT in here — they live in the %s data dir,\n", brandName)
 	fmt.Printf("   so publishing this repo publishes your kernel and nothing else.\n")
 	if s, ok := cachedSpec(course); ok {
 		fmt.Printf("   tests + grader: %s\n", s.dir)
 	}
+
+	// Seed the progress cache: a fresh start means nothing is verified yet, and
+	// writing that down is what lets `sboot test` default its stage offline
+	// immediately after (currentLab needs SOME progress source).
+	st := loadState()
+	if st.Sync[course] == nil {
+		st.setSync(course, &courseSync{Verified: map[string]string{},
+			SyncedAt: time.Now().UTC().Format(time.RFC3339)})
+	}
+	saveQuietly(st)
+
+	// The repo concierge (§11.j): one confirm, entirely on this machine, never a
+	// blocker. Declining costs nothing — `sboot repo` re-offers any time.
+	startConcierge(course, abs, yes)
+
 	firstTest := firstStage
 	if firstTest == "" {
 		firstTest = "01-boot"
 	}
-	fmt.Printf(`
-  cd %s
-  git init && git add . && git commit -m "start %s"
-  sboot where              # both paths, any time
-  sboot test %s        # first practice run
-`, dest, course, firstTest)
+	headline := firstTitle
+	if headline == "" {
+		headline = labSlug(firstTest)
+	}
+	p := painter(os.Stdout)
+	fmt.Printf("\nbegin at lab %s — %s:\n", labNumber(firstTest), p(ansiAmber, headline))
+	fmt.Printf("  cd %s\n", dest)
+	fmt.Printf("  %s                  %s\n", p(ansiGreen, "sboot test"), p(ansiDim, "# grades "+firstTest))
+	fmt.Printf("  %s/courses/%s/stages/%s\n", siteURL(), course, firstTest)
 }
 
 // tarGzDir packages a directory (source only: build artifacts excluded).

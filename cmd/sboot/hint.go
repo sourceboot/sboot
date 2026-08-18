@@ -22,11 +22,12 @@
 // divergences: (1) the failing set comes from the recorded verdict rather than
 // a KTAP transcript — the CLI already has the engine's per-check results, so
 // re-parsing serial output would be a second opinion about what failed; (2) the
-// re-run command in the footer names the stage (`sboot hint <stage> <check>`),
-// because unlike the prototype this CLI needs the stage argument; (3) the
-// prototype's `--observed` evidence line is not wired — the render supports it,
-// but the capture is not retained between runs, so the command passes "" (the
-// evidence-selected L2 line arrives with the evidence bridge, not before).
+// ladder's last rung and its past-the-ladder copy hand off to the lab page's
+// `#stuck` anchor (ux-plan §11.i: the AI tier is web-only — there is no
+// terminal `sboot explain`, by design, ever); (3) the prototype's `--observed`
+// evidence line is not wired — the render supports it, but the capture is not
+// retained between runs, so the command passes "" (the evidence-selected L2
+// line arrives with the evidence bridge, not before).
 package main
 
 import (
@@ -41,7 +42,7 @@ const hintsFileName = "hints.json"
 
 // hintEntry is one check's authored rungs: L1 always, L2 when the check
 // warranted a full debug ladder. A check with no l2 shows `[hint 1 of 1]` and
-// hands straight off to `sboot explain`.
+// hands straight off to the lab page's #stuck anchor.
 type hintEntry struct {
 	L1 string `json:"l1"`
 	L2 string `json:"l2"`
@@ -56,7 +57,12 @@ type hintsFile struct {
 // runHint prints the next rung for one failing check. Exit codes: 0 for a hint
 // (or an honest "nothing to hint"), 1 for a check with no authored hint, 2 for
 // "run sboot test first" and setup problems.
-func runHint(r repo, stage, checkID string) int {
+//
+// `stageDefaulted` says the stage came from the current-lab rule rather than the
+// learner — the header then names both the stage and the chosen check, which is
+// how the defaults stay visible (§11.c) and how the learner discovers they can
+// target other checks.
+func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 	// Same prepare path as `sboot test`: the spec (and with it hints.json) is
 	// fetched and staged, offline falling back to the cache.
 	run := prepare(r, stage)
@@ -85,6 +91,7 @@ func runHint(r repo, stage, checkID string) int {
 	failing, graded := st.lastFailed(r.course, stage)
 
 	target := checkID
+	checkDefaulted := false
 	if target == "" {
 		if !graded {
 			fmt.Fprintf(os.Stderr, "Run `sboot test %s` first, then `sboot hint` picks up what failed "+
@@ -99,6 +106,7 @@ func runHint(r repo, stage, checkID string) int {
 		// the header below), which is how the learner discovers they can target
 		// others.
 		target = failing[0]
+		checkDefaulted = true
 	} else if graded && !containsString(failing, target) {
 		// A passing check cannot be the thing to hint — and refusing here is what
 		// lets the rung marker stay monotonic-forever without ever gating a
@@ -116,13 +124,25 @@ func runHint(r repo, stage, checkID string) int {
 		return 1
 	}
 
+	// The defaulted-target header (stderr — it is framing, not the hint): what
+	// this run is about, and how to aim elsewhere.
+	if stageDefaulted || checkDefaulted {
+		p := painter(os.Stderr)
+		line := p(ansiAmber, fmt.Sprintf("hint — %s · %s", stage, target))
+		if checkDefaulted {
+			line += p(ansiDim, " # your failing check; sboot hint <check> targets another")
+		}
+		fmt.Fprintln(os.Stderr, line)
+		fmt.Fprintln(os.Stderr)
+	}
+
 	// Advance the rung by one on every ask; monotonic per (course, stage, check).
 	rung := st.bumpRung(r.course, stage, target)
 	if err := st.save(); err != nil {
 		debugf("could not save hint state: %v", err)
 	}
 
-	fmt.Println(renderHint(stage, target, entry, rung, ""))
+	fmt.Println(renderHint(stage, target, entry, rung, "", stageStuckURL(r.course, stage)))
 	return 0
 }
 
@@ -140,12 +160,12 @@ func hintTiers(e hintEntry) []string {
 // renderHint renders the rung-th ask (1-based) for a check — the faithful port
 // of proto/hint.py's render(): a position header with a dynamic denominator, the
 // authored body, an optional evidence line on the deepest rung, and a footer
-// that always points somewhere: the next rung while one exists, then back to
-// the learner's own evidence and the lesson. The ladder never dead-ends on
-// "no more hints". (The v2 spec hands off to `sboot explain`/`sboot reveal`
-// here; those commands are not built yet, so the copy must not name them —
-// re-point the footers when the AI tutor lands.)
-func renderHint(stage, checkID string, e hintEntry, rung int, observed string) string {
+// that always points somewhere: the next rung while one exists, then the lab
+// page's `#stuck` anchor (`stuckURL`), where the ladder's web mirror and the
+// metered explain chat live. The ladder never dead-ends on "no more hints",
+// and it NEVER names a terminal AI command — the AI tier is web-only by design
+// (ux-plan §11.i; `sboot explain`/`reveal` are retired, not pending).
+func renderHint(stage, checkID string, e hintEntry, rung int, observed, stuckURL string) string {
 	tiers := hintTiers(e)
 	n := len(tiers)
 	if rung <= n {
@@ -162,22 +182,27 @@ func renderHint(stage, checkID string, e hintEntry, rung int, observed string) s
 		}
 		out = append(out, "")
 		if rung < n {
+			suffix := ""
+			if rung+1 == n && e.L2 != "" {
+				suffix = " — the debug ladder"
+			}
 			out = append(out, fmt.Sprintf(
-				"── Run `sboot hint %s %s` again for a step-by-step debug ladder.", stage, checkID))
+				"run it again for the next rung (%d of %d%s).", rung+1, n, suffix))
 		} else {
-			out = append(out, fmt.Sprintf(
-				"── That's the deepest written hint. Next: re-run `sboot test %s` and hold "+
-					"its failure evidence against the lesson's Stuck? section.", stage))
+			out = append(out,
+				"that's the last authored rung. more help — the explain chat, on this lab's page:",
+				"  "+stuckURL)
 		}
 		return strings.Join(out, "\n")
 	}
-	// Past the authored ladder: keep pointing at real next moves.
+	// Past the authored ladder: keep pointing at real next moves — the learner's
+	// own evidence, then the same #stuck page.
 	return fmt.Sprintf(
 		"[%s] You've seen every written hint for this check.\n"+
 			"── Re-run `sboot test %s` and read the failure evidence closely — "+
 			"it names the first byte or pixel that diverged.\n"+
-			"── The lesson's Stuck? section maps this check to its usual causes.",
-		checkID, stage)
+			"── more help — the explain chat, on this lab's page: %s",
+		checkID, stage, stuckURL)
 }
 
 func containsString(list []string, s string) bool {
