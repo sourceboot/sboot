@@ -81,6 +81,13 @@ type specManifest struct {
 	// server deploy — which is the only reason it could be switched on in the same
 	// commit as the change that made it load-bearing.
 	MinCLI string `json:"min_cli"`
+	// The learner's source directory name, or "" for the historical default "os"
+	// (repo.go, defaultTree). Added 2026-08-18 so a course whose subject is not an
+	// operating system stops shipping a top-level `os/`. Absent from every manifest
+	// written before then, and unknown to every binary released before then — which
+	// is why the empty value has to mean "os" rather than being an error, and why
+	// `sboot start` only writes the sboot.toml line when it differs from the default.
+	Tree string `json:"tree"`
 	// The course's BUILD TOOLING bundle (`xtask/` and cargo config for a Rust
 	// course; nothing but the LICENCE for a Makefile one). Named `engine` for the
 	// oldest of reasons — it used to hold the Rust grader — and kept because
@@ -952,10 +959,14 @@ func stageRun(s spec, r repo) (string, error) {
 	return run, nil
 }
 
-// linkOSTree points <run>/os at the learner's real os/ tree.
+// linkOSTree points <run>/os at the learner's real source tree.
+//
+// The STAGED name stays `os` whatever the course calls the learner's directory, which
+// is what keeps every course's `grader.build` (`--manifest-path os/Cargo.toml`) valid
+// after the per-course tree name landed 2026-08-18.
 func linkOSTree(src, dst string) error {
 	if st, err := os.Stat(src); err != nil || !st.IsDir() {
-		return fmt.Errorf("no os/ tree at %s — is this the right directory?", src)
+		return fmt.Errorf("no %s/ tree at %s — is this the right directory?", filepath.Base(src), src)
 	}
 	if cur, err := os.Readlink(dst); err == nil {
 		if cur == src {

@@ -1055,7 +1055,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	gradedHeader("submitting", r.course, stage, "submit", ga.defaulted)
 	osDir := r.osDir()
 	if st, err := os.Stat(osDir); err != nil || !st.IsDir() {
-		fmt.Fprintf(os.Stderr, "sboot: no os/ tree at %s\n", osDir)
+		fmt.Fprintf(os.Stderr, "sboot: no %s/ tree at %s\n", r.treeName(), osDir)
 		return 2
 	}
 	course := r.course
@@ -1485,11 +1485,13 @@ func runStart(course string, yes bool) {
 	// half fails (offline mid-setup) the learner still has their repo and a later
 	// `sboot test` will finish the job, rather than being left with nothing.
 	title, firstStage, firstTitle := course, "", ""
+	specTree := ""
 	if s, err := ensureSpec(course, ""); err == nil {
 		if m, err := fetchManifest(course); err == nil {
 			if m.Title != "" {
 				title = m.Title
 			}
+			specTree = m.Tree
 			for _, l := range m.Labs {
 				if l.Live {
 					firstStage = l.Stage
@@ -1511,7 +1513,7 @@ func runStart(course string, yes bool) {
 		fmt.Fprintln(os.Stderr, "sboot: run `sboot fetch` when you're back online.")
 	}
 
-	if err := writeRepoFiles(dest, course, title, firstStage); err != nil {
+	if err := writeRepoFiles(dest, course, title, firstStage, specTree); err != nil {
 		fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
 		exitWith(2)
 	}

@@ -58,11 +58,36 @@ const manifestName = "sboot.toml"
 type repo struct {
 	dir    string // absolute path to the repo root
 	course string // course id, from sboot.toml (or an env override)
+	tree   string // the learner's source dir, from sboot.toml; "" means defaultTree
 }
 
+// defaultTree is the learner's source directory when a course does not name one.
+//
+// It is "os" for the oldest of reasons — every course was an OS course — and it stays
+// the default because changing it would rename the tree under everyone who already has
+// a repo. A course names its own with `tree:` in course.yaml, which reaches the client
+// on the spec manifest and is written into sboot.toml by `sboot start`.
+//
+// Added 2026-08-18 for `rust-core`, which reads SQLite files: shipping a learner a
+// top-level `os/` holding a database reader — and an error message naming `os/` in a
+// course with no operating system in it — was the kind of detail that reads as
+// carelessness. It is now-or-never by nature: once a learner has pushed the repo, the
+// directory name is in their history and their muscle memory.
+const defaultTree = "os"
+
 // osDir is the tree the learner actually writes, and the only thing `sboot submit`
-// uploads.
-func (r repo) osDir() string { return filepath.Join(r.dir, "os") }
+// uploads. Named osDir, not treeDir, because renaming it would touch every caller for
+// no behavioural gain — the STAGED name is still `os` (cache.go), so nothing about the
+// build commands or `grader.build` changes with this.
+func (r repo) osDir() string { return filepath.Join(r.dir, r.treeName()) }
+
+// treeName is the directory name alone, for messages that have to say it out loud.
+func (r repo) treeName() string {
+	if r.tree == "" {
+		return defaultTree
+	}
+	return r.tree
+}
 
 // findRepo locates the learner's repo by walking up from the cwd looking for
 // sboot.toml, and resolves which course it is.
@@ -94,7 +119,7 @@ func findRepo() (repo, error) {
 	if course == "" {
 		course = defaultCourse
 	}
-	return repo{dir: abs, course: course}, nil
+	return repo{dir: abs, course: course, tree: treeFromManifest(abs)}, nil
 }
 
 func walkUpForManifest(start string) (string, error) {
@@ -139,6 +164,21 @@ func isPreSplitWorkspace(dir string) bool {
 // has no third-party dependencies at all — that is worth more than generality here.
 var courseRe = regexp.MustCompile(`(?m)^\s*course\s*=\s*"([^"]+)"`)
 
+// Same one-line shape as courseRe, and absent from every manifest written before
+// 2026-08-18 — which is exactly why it falls back to defaultTree rather than erroring.
+var treeRe = regexp.MustCompile(`(?m)^\s*tree\s*=\s*"([^"]+)"`)
+
+func treeFromManifest(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, manifestName))
+	if err != nil {
+		return ""
+	}
+	if m := treeRe.FindSubmatch(b); m != nil {
+		return string(m[1])
+	}
+	return ""
+}
+
 func courseFromManifest(dir string) string {
 	b, err := os.ReadFile(filepath.Join(dir, manifestName))
 	if err != nil {
@@ -159,12 +199,12 @@ func courseFromManifest(dir string) string {
 
 // `title` and `firstStage` come from the course's spec manifest, so the README names
 // the course the way the catalog does and points at a lab that actually exists.
-func writeRepoFiles(dir, course, title, firstStage string) error {
+func writeRepoFiles(dir, course, title, firstStage, tree string) error {
 	for _, f := range []struct {
 		name string
 		body string
 	}{
-		{manifestName, sbootToml(course)},
+		{manifestName, sbootToml(course, tree)},
 		{"LICENSE", mitLicense()},
 		{".gitignore", gitignore()},
 		{"README.md", readme(course, title, firstStage, buildHint(course))},
@@ -183,12 +223,19 @@ func writeRepoFiles(dir, course, title, firstStage string) error {
 	return nil
 }
 
-func sbootToml(course string) string {
+func sbootToml(course, tree string) string {
+	// The `tree` line is written ONLY when the course names a non-default one, so every
+	// existing repo's manifest stays byte-identical and older binaries — which know
+	// nothing of the key — keep reading these files unchanged.
+	extra := ""
+	if tree != "" && tree != defaultTree {
+		extra = fmt.Sprintf("# Your source lives in %s/ for this course.\ntree = %q\n", tree, tree)
+	}
 	return fmt.Sprintf(`# This file tells the `+"`sboot`"+` CLI which %s course this repo is for.
 # Everything else — the tests and the grading engine — lives outside this repo:
 # run `+"`sboot where`"+` to see exactly where.
 course = %q
-`, brandName, course)
+`, brandName, course) + extra
 }
 
 // MIT, per the workspace-split design "Licensing, per artifact" (2026-07-26).
