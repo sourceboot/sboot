@@ -437,8 +437,12 @@ func runTest(r repo, stage string, ga gradedArgs) {
 	st := loadState()
 	jsonMode = ga.jsonOut
 	res := runGrader(run, r.course, stage, st.tierSpec(r.course, stage), "")
+	// Recorded BEFORE the launch-failure exit, because a run that never reached a
+	// check is exactly the run `sboot hint` had nothing to say about (F00-5).
+	st.noteRunError(r.course, stage, res)
 	if res.launchFailed {
-		reportGraderMissing(res.launchErr)
+		saveQuietly(st)
+		reportGraderMissing(r, res.launchErr)
 		exitWith(2)
 	}
 	st.record(r.course, stage, res.checks)
@@ -447,11 +451,25 @@ func runTest(r repo, stage string, ga gradedArgs) {
 		debugf("could not save guidance state: %v", err)
 	}
 
-	if ga.jsonOut {
-		printVerdictJSON("test", r.course, stage, res)
-	}
-	if err := reportPractice(r.course, stage, res.score, res.max, res.passed, res.detail); err != nil {
-		reportPracticeFailure(err)
+	// A RUN THAT GRADED NOTHING IS NOT A SCORE OF ZERO (ledger L2a/L2b). The build
+	// failed, or the engine refused the lab: either way the learner has just read the
+	// real diagnosis — their compiler's own output, streamed live — and the honest
+	// record of that is NO record. Reporting 0/0 would tell them their work scored
+	// nothing, and would write a stage_completions row a broken toolchain and a hard
+	// lab are indistinguishable in.
+	//
+	// The run is not lost: noteRunError above put the REASON in state.json, which is
+	// what `sboot hint` answers with (L28), and the "stuck?" line below still points
+	// at it. Under --json nothing lands on stdout either, for the same reason and by
+	// the same rule the launch-failure path above already followed: no verdict, no
+	// verdict object.
+	if res.graded() {
+		if ga.jsonOut {
+			printVerdictJSON("test", r.course, stage, res)
+		}
+		if err := reportPractice(r.course, stage, res.score, res.max, res.passed, res.detail); err != nil {
+			reportPracticeFailure(err)
+		}
 	}
 	if res.exitCode != 0 {
 		// The stuck deep link (§11.i): the free ladder in the terminal, the
@@ -534,6 +552,18 @@ func reportPracticeFailure(err error) {
 			fmt.Fprintf(os.Stderr, "sboot: nothing is wrong with your setup — open %s to unlock it.\n", apiURL())
 			return
 		case http.StatusUnauthorized:
+			// NOT SIGNED IN is not the same event as a token that stopped working,
+			// and `sboot test` is promised as "free, offline, unlimited" — so a
+			// learner who never logged in must not have a green run closed by a
+			// three-line credentials error that reads as "your run did not count"
+			// (dogfood F00-8). resolveToken's "dev" source is exactly "nothing is
+			// configured here": one dim line, and what it would buy them.
+			if _, source := resolveToken(); source == "dev" {
+				p := painter(os.Stderr)
+				fmt.Fprintf(os.Stderr, "%s\n", p(ansiDim,
+					"not signed in, so this run stayed on your machine — `sboot login` to keep it on your dashboard."))
+				return
+			}
 			fmt.Fprintf(os.Stderr, "\nsboot: the platform did not accept your token: %s\n", ae.msg)
 			fmt.Fprintf(os.Stderr, "sboot: reconnect with `sboot login`, or paste a fresh token from\n")
 			fmt.Fprintf(os.Stderr, "sboot:   %s/account   into SBOOT_TOKEN.\n", siteURL())
@@ -548,14 +578,14 @@ func reportPracticeFailure(err error) {
 // ran and failed the code. Shared by `sboot test` and `sboot submit` — the missing
 // piece is the same one either way, and submit adds the sentence that explains why
 // it needs the same tools practice does.
-func reportGraderMissing(err error) {
+func reportGraderMissing(r repo, err error) {
 	tool := missingTool(err)
 	if tool == "" {
 		fmt.Fprintf(os.Stderr, "sboot: could not run the grader: %v\n", err)
 	} else {
 		fmt.Fprintf(os.Stderr, "sboot: %s is not installed (or is not on your PATH).\n", tool)
 	}
-	for _, line := range installHint(tool) {
+	for _, line := range installHint(tool, rustChannel(r.dir)) {
 		fmt.Fprintf(os.Stderr, "sboot:   %s\n", line)
 	}
 }
@@ -568,14 +598,14 @@ func reportGraderMissing(err error) {
 // computed from the run THEIR machine makes (the grading design),
 // so a machine that cannot run `sboot test` cannot submit either, and no flag
 // changes that. Say what submit actually does, then name the tool and how to get it.
-func reportSubmitGraderMissing(stage string, err error) {
+func reportSubmitGraderMissing(r repo, stage string, err error) {
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "sboot: nothing was submitted.")
 	fmt.Fprintln(os.Stderr, "sboot: `sboot submit` runs `sboot test` on your machine and sends the captured")
 	fmt.Fprintln(os.Stderr, "sboot: result to us for the official grade, so it needs the same tools")
 	fmt.Fprintln(os.Stderr, "sboot: `sboot test` does — and they are not there yet:")
 	fmt.Fprintln(os.Stderr)
-	reportGraderMissing(err)
+	reportGraderMissing(r, err)
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintf(os.Stderr, "sboot: then get `sboot test %s` passing — that is the run submit sends.\n", stage)
 	// Deliberately does NOT offer --force. It used to work here, because the server
@@ -600,11 +630,22 @@ func missingTool(err error) string {
 // command from the course's own manifest (`grader.build`) and a C course's missing
 // piece is `make`, not rustup. An unknown tool still gets the honest generic answer
 // instead of advice about the wrong language.
-func installHint(tool string) []string {
+//
+// `channel` is what the workspace's own rust-toolchain.toml pins, or "". It used to
+// be the word "nightly", hardcoded — true of the OS courses and false of a course
+// that pins stable, whose learners were told the opposite of what their own course
+// says (dogfood F00-6). The pin is a property of the repo the learner is standing
+// in, so it is read from there; unreadable or absent, the line says only that the
+// file decides.
+func installHint(tool, channel string) []string {
 	switch tool {
 	case "cargo", "rustc", "rustup":
+		pin := "the course's rust-toolchain.toml pins the exact toolchain"
+		if channel != "" {
+			pin = "this course pins " + channel + " in rust-toolchain.toml"
+		}
 		return []string{
-			"install Rust (nightly is pinned by the course's rust-toolchain.toml):",
+			"install Rust (rustup; " + pin + "):",
 			"curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
 		}
 	case "nasm":
@@ -696,15 +737,17 @@ func runWhere() int {
 			// It is exec'd from the cache now, so naming it would send anyone who went
 			// looking to an empty spot.
 			fmt.Printf("         └─ where the grader runs: our tests + this course's build\n")
-			fmt.Printf("            tooling, staged beside your os/.\n")
+			fmt.Printf("            tooling, staged beside your %s/.\n", r.treeName())
 			// Say which way os/ got there, because the answer decides where cargo
 			// writes and this command's whole job is to answer "where?" honestly.
 			// The symlink is the fast path (edits are picked up with no copy step),
 			// and its cost is that target/ lands in the repo rather than here — which
 			// is what `sboot start`'s .gitignore is for. Claiming "so your repo stays
 			// clean" was the opposite of what the symlink does.
+			// `os` is the STAGED name for every course (cache.go linkOSTree), so it
+			// is named literally here and the learner's own tree is named beside it.
 			if linked, err := os.Readlink(filepath.Join(run, "os")); err == nil && linked == r.osDir() {
-				fmt.Printf("            os/ there is a symlink to yours, so cargo's target/ dirs land\n")
+				fmt.Printf("            os/ there is a symlink to your %s/, so cargo's target/ dirs land\n", r.treeName())
 				fmt.Printf("            in your repo — `sboot start`'s .gitignore already covers them.\n")
 			}
 		}
@@ -760,6 +803,28 @@ type graderRun struct {
 	passed     bool
 	detail     string
 	exitCode   int
+	// The build command RAN and exited non-zero: the learner's own compile error, or
+	// a tool their build needed and could not launch. runGrader returns before a
+	// single check is scored, so this run has NO VERDICT — it is not a score of zero
+	// (ledger L2a/L2b), and it is what `sboot hint` needs to tell apart from "you
+	// have not run the test yet" (dogfood F00-4/5 — lab 00's whole "Stuck?" section
+	// is written around reading a red check, and a failed build reaches none).
+	//
+	// It was a METHOD sniffing the struct's shape (exit 1, nothing scored) until
+	// 2026-08-23, deliberately, so that L2a's reflective pin would keep failing while
+	// the practice record was still written as 0/0. That defect is now fixed, so the
+	// fact is recorded honestly, at the one place that knows it.
+	buildFailed bool
+	// The engine ran to a VERDICT and this run carries it: a protocol file was read
+	// back and it contained an LBX_SCORE record. False is every other outcome —
+	// the build failed, the engine refused the lab, it wrote nothing, it wrote half
+	// a file — and false is the DEFAULT, so a path added later that returns early
+	// records nothing rather than recording a zero (ledger L2a/L2b).
+	//
+	// It is a fact set where it is known, not a shape inferred afterwards: 0/0 with
+	// no checks is a real verdict for a rubric that has none, and only the code that
+	// read the protocol can tell that from a run that never reached one.
+	verdict bool
 	// The grader could not be STARTED (no cargo on PATH, not a staging root) — which
 	// is a different thing from a grader that ran and failed the code, and the two
 	// have different consequences on the submit path: `--force` may proceed past
@@ -767,6 +832,17 @@ type graderRun struct {
 	launchFailed bool
 	launchErr    error
 }
+
+// graded reports whether the ENGINE PRODUCED A VERDICT for this run — the `verdict`
+// field above, read through a name that says what the caller is asking.
+//
+// Everything that records or reports a practice result asks this first, because a
+// run that never got a verdict is a failure to grade and not a score of zero.
+// "practice run recorded (0/0)" tells a learner whose build just died that their
+// work scored nothing, and the row behind it is indistinguishable from "tried the
+// lab and failed every check" — a broken install reading as a hard lab in the one
+// dataset the dropout curve is built from (ledger L2a/L2b, the testing strategy §1.5).
+func (r graderRun) graded() bool { return r.verdict }
 
 // parseVerdict reads the grader's protocol output (grader.EmitProtocol):
 //
@@ -780,7 +856,12 @@ type graderRun struct {
 // The guidance field is ignored here. The grader has already rendered it, capped at
 // the tier we asked for; re-rendering it in the CLI would be a second place for the
 // "never echo the rubric" rule to be got wrong.
-func parseVerdict(out string) (checks []localCheck, score, max int) {
+//
+// `ok` is whether an LBX_SCORE record was there at all, and it is what `verdict` is
+// set from: a protocol the engine only half wrote (killed mid-write, out of disk)
+// parses to 0/0 and must not be recorded as a score of zero (ledger L2a). The score
+// line is the right anchor because the engine emits exactly one, always, last.
+func parseVerdict(out string) (checks []localCheck, score, max int, ok bool) {
 	for _, l := range strings.Split(out, "\n") {
 		f := strings.Split(strings.TrimRight(l, "\r"), "\t")
 		switch {
@@ -798,6 +879,7 @@ func parseVerdict(out string) (checks []localCheck, score, max int) {
 		case len(f) >= 3 && f[0] == "LBX_SCORE":
 			score, _ = strconv.Atoi(f[1])
 			max, _ = strconv.Atoi(f[2])
+			ok = true
 		}
 	}
 	return
@@ -1116,6 +1198,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	// honest to escalate to. Local rendering is local rendering.
 	if !force {
 		st.record(course, stage, res.checks)
+		st.noteRunError(course, stage, res)
 		if err := st.save(); err != nil {
 			debugf("could not save guidance state: %v", err)
 		}
@@ -1135,7 +1218,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		// `--force` keeps its real meanings: a local run that FAILED can still be
 		// submitted (below), for a learner who disputes the local verdict or wants the
 		// failure on the record. What it can no longer do is submit without one.
-		reportSubmitGraderMissing(stage, res.launchErr)
+		reportSubmitGraderMissing(r, stage, res.launchErr)
 		return 2
 	case res.exitCode != 0 && !force:
 		reportGateFailure(stage, res)
@@ -1146,7 +1229,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		fmt.Fprintf(os.Stderr, "\n── local check passed (%s)\n", scoreText(res))
 	}
 
-	fmt.Fprintln(os.Stderr, "── packaging os/ (source only)")
+	fmt.Fprintf(os.Stderr, "── packaging %s/ (source only)\n", r.treeName())
 	archive, err := tarGzDir(osDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sboot: package: %v\n", err)
@@ -1520,9 +1603,12 @@ func runStart(course string, yes bool) {
 
 	abs, _ := filepath.Abs(dest)
 	fmt.Printf("\n── your workspace is ready: %s\n", abs)
-	fmt.Printf("   os/ is yours. sboot.toml says which course this is.\n")
+	// The tree name and what it holds both come from the course (dogfood F00-1):
+	// `rust-core` unpacks a `db/` holding a SQLite reader, and was told `os/ is
+	// yours` and that publishing it publishes a kernel it does not have.
+	fmt.Printf("   %s/ is yours. sboot.toml says which course this is.\n", treeOr(specTree))
 	fmt.Printf("   Our tests and grader are NOT in here — they live in the %s data dir,\n", brandName)
-	fmt.Printf("   so publishing this repo publishes your kernel and nothing else.\n")
+	fmt.Printf("   so publishing this repo publishes %s and nothing else.\n", treeSubject(course))
 	if s, ok := cachedSpec(course); ok {
 		fmt.Printf("   tests + grader: %s\n", s.dir)
 	}

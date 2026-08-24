@@ -93,6 +93,14 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 	target := checkID
 	checkDefaulted := false
 	if target == "" {
+		// A run that produced no verdict at all is the freshest thing we know —
+		// noteRunError clears it the moment anything grades — and it is the case
+		// `sboot test` sends here with "stuck? sboot hint" only for hint to answer
+		// "run sboot test first" (dogfood F00-4/5). Answer the run they actually had.
+		if reason := st.lastRunError(r.course, stage); reason != "" {
+			fmt.Println(renderBlockedHint(r, stage, reason, stageStuckURL(r.course, stage)))
+			return 0
+		}
 		if !graded {
 			fmt.Fprintf(os.Stderr, "Run `sboot test %s` first, then `sboot hint` picks up what failed "+
 				"— or name a check: `sboot hint %s <check-id>`.\n", stage, stage)
@@ -102,10 +110,9 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 			fmt.Println("✓ all checks pass — nothing to hint. Nice work.")
 			return 0
 		}
-		// Bare `sboot hint` targets the FIRST failing check and prints its id (in
-		// the header below), which is how the learner discovers they can target
-		// others.
-		target = failing[0]
+		// Bare `sboot hint` targets one failing check and prints its id (in the
+		// header below), which is how the learner discovers they can target others.
+		target = defaultHintTarget(failing)
 		checkDefaulted = true
 	} else if graded && !containsString(failing, target) {
 		// A passing check cannot be the thing to hint — and refusing here is what
@@ -120,7 +127,7 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 
 	entry, ok := hf.Checks[target]
 	if !ok {
-		fmt.Fprintf(os.Stderr, "No authored hint for `%s` yet. Re-run `sboot test %s` and read its failure evidence — it names the first byte or pixel that diverged.\n", target, stage)
+		fmt.Fprintf(os.Stderr, "No authored hint for `%s` yet. Re-run `sboot test %s` and read its failure evidence — it names what the check looked for and what it found instead.\n", target, stage)
 		return 1
 	}
 
@@ -197,12 +204,78 @@ func renderHint(stage, checkID string, e hintEntry, rung int, observed, stuckURL
 	}
 	// Past the authored ladder: keep pointing at real next moves — the learner's
 	// own evidence, then the same #stuck page.
+	// COURSE-NEUTRAL, deliberately: "the first byte or pixel that diverged" was
+	// os2-rust's framebuffer talking, printed to every course by a message that
+	// belongs to none of them (dogfood F01-6 — `rust-core` has no pixels, and its
+	// evidence is an assert_eq! diff). What every check's evidence does have is a
+	// thing it looked for and a thing it found.
 	return fmt.Sprintf(
 		"[%s] You've seen every written hint for this check.\n"+
 			"── Re-run `sboot test %s` and read the failure evidence closely — "+
-			"it names the first byte or pixel that diverged.\n"+
+			"it names what the check looked for and what it found instead.\n"+
 			"── more help — the explain chat, on this lab's page: %s",
 		checkID, stage, stuckURL)
+}
+
+// umbrellaSuffix marks a lab's WHOLE-SUITE check — `<lab>.suite` by the convention
+// every rubric in the corpus follows ("the whole suite is green", authored with a
+// has_all that names the other checks' subjects).
+//
+// It fails whenever any narrower check does, and it sorts early in every rubric, so
+// before 2026-08-23 a bare `sboot hint` picked it essentially every time (dogfood
+// F01-5). Its authored hint can only be about the SUITE — are the tests named right,
+// did they all run — which is almost never what the learner got wrong, while the
+// specific check's hint is about the actual failure and was one command away.
+const umbrellaSuffix = ".suite"
+
+// defaultHintTarget picks which failing check a bare `sboot hint` answers: the first
+// SPECIFIC one, falling back to verdict order when every failing check is an
+// umbrella (a suite that did not run at all, which is then the honest answer).
+func defaultHintTarget(failing []string) string {
+	for _, id := range failing {
+		if !strings.HasSuffix(id, umbrellaSuffix) {
+			return id
+		}
+	}
+	return failing[0]
+}
+
+// renderBlockedHint answers a `sboot hint` whose last run produced no verdict: the
+// build failed, or the toolchain could not start it. There is no authored ladder for
+// either (a hint is per check, and no check ran), so this points at the only evidence
+// that exists — the compiler's own output, or the missing tool.
+func renderBlockedHint(r repo, stage, reason, stuckURL string) string {
+	out := []string{"[hint — nothing was graded]", ""}
+	once := "once it builds"
+	if reason == "toolchain" || strings.HasPrefix(reason, "toolchain:") {
+		once = "once that is installed"
+		// "" when the launch error did not name an executable — installHint has an
+		// honest answer for that case too, so it is passed through unchanged.
+		tool := strings.TrimPrefix(strings.TrimPrefix(reason, "toolchain"), ":")
+		what := "the build could not be started"
+		if tool != "" {
+			what = "`" + tool + "` could not be started"
+		}
+		out = append(out,
+			"Your last `sboot test "+stage+"` never reached a check: "+what+", so nothing",
+			"in this lab has been scored yet — this is your machine, not your code.")
+		for _, l := range installHint(tool, rustChannel(r.dir)) {
+			out = append(out, "  "+l)
+		}
+	} else {
+		out = append(out,
+			"Your last `sboot test "+stage+"` stopped at the build, so no check ran and there is",
+			"no failing check to hint at yet.",
+			"",
+			"The compiler's own output is the hint here, and it is above that failed run: fix the",
+			"FIRST error and re-run — the ones after it are often its consequences.")
+	}
+	out = append(out, "",
+		once+", `sboot test "+stage+"` scores the checks and `sboot hint "+stage+"` picks up",
+		"whichever one is red.",
+		"more help — the explain chat, on this lab's page:",
+		"  "+stuckURL)
+	return strings.Join(out, "\n")
 }
 
 func containsString(list []string, s string) bool {

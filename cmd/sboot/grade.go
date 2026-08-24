@@ -32,8 +32,11 @@
 // The build stays here rather than moving into the engine because the CLI is the only
 // place that can tell a build which never STARTED (no cargo on PATH — a broken
 // install) from one that ran and failed (the learner's own compile error). That
-// distinction is what keeps a toolchain problem out of the practice record as a 0/0
-// (ledger L2a), and it is why `launchFailed` exists.
+// distinction is why `launchFailed` and `buildFailed` are separate facts on the run:
+// neither is a verdict, and since 2026-08-23 neither is written to the practice
+// record at all (ledger L2a/L2b — a build failure was reported to the learner as
+// "practice run recorded (0/0)" and stored as one), but they are different things to
+// say, and on the submit path `--force` may proceed past the second, never the first.
 package main
 
 import (
@@ -154,7 +157,13 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 			run.launchErr = err
 			return run
 		}
+		// The build RAN and failed — the learner's own compile error, or a tool it
+		// could not launch, either way already printed above by the build itself.
+		// Recorded as a fact on the run rather than left for a caller to infer from
+		// its shape: nothing was scored, so this is not a 0/0 practice result
+		// (ledger L2a/L2b) and `sboot hint` answers it as a build (L28).
 		fmt.Fprintln(os.Stderr, "\nBUILD FAILED — fix the errors above and try again.")
+		run.buildFailed = true
 		run.exitCode = 1
 		return run
 	}
@@ -230,7 +239,15 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 		return run
 	}
 	_ = os.Remove(protocolPath)
-	run.checks, run.score, run.max = parseVerdict(string(protocol))
+	run.checks, run.score, run.max, run.verdict = parseVerdict(string(protocol))
+	if !run.verdict {
+		// A protocol file with no LBX_SCORE record in it: the engine was killed
+		// mid-write, or wrote something this binary cannot read. Same answer as an
+		// unreadable file — no verdict, so nothing is recorded (ledger L2a).
+		run.launchFailed = true
+		run.launchErr = fmt.Errorf("the grading engine produced an unreadable verdict")
+		return run
+	}
 	run.passed = run.exitCode == 0 && run.max > 0 && run.score == run.max
 
 	// Keep just the verdict lines as the recorded detail. Guidance is deliberately

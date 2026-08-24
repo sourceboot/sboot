@@ -159,12 +159,21 @@ func TestParseVerdictAcceptsOldAndNewRecords(t *testing.T) {
 		"LBX_CHECK\tFAIL\t1\tseven fields, from the future\t\tserial:future\tsomething-new",
 		"LBX_SCORE\t1\t8",
 	}, "\n")
-	checks, score, max := parseVerdict(out)
+	checks, score, max, ok := parseVerdict(out)
 	if len(checks) != 5 {
 		t.Fatalf("want 5 checks, got %d: %+v", len(checks), checks)
 	}
 	if score != 1 || max != 8 {
 		t.Fatalf("want score 1/8, got %d/%d", score, max)
+	}
+	if !ok {
+		t.Error("a protocol with an LBX_SCORE record must report a verdict")
+	}
+	// The other direction, which is what `verdict` is set from: checks but no score
+	// line is a HALF-WRITTEN protocol, and reading it as 0/0 would put a wrong number
+	// in the practice record where an error belongs (ledger L2a).
+	if _, _, _, ok := parseVerdict("LBX_CHECK\tPASS\t1\tkernel boots\t\tserial:one\n"); ok {
+		t.Error("a protocol with no LBX_SCORE record must not count as a verdict")
 	}
 	if !checks[0].pass || checks[0].id != "serial:reached_kernel_entry" {
 		t.Errorf("first record parsed wrong: %+v", checks[0])

@@ -61,6 +61,13 @@ type guidanceState struct {
 	// once a stage has ids to say something about, so the e2e stub grader (no
 	// check ids) still creates no state file.
 	LastFailed map[string][]string `json:"last_failed,omitempty"`
+	// "course/stage" -> why the most recent LOCAL run produced no verdict at all:
+	// "build" (the course's build command ran and failed) or "toolchain:<tool>"
+	// (it never started). NOT a score and never rendered as one — the L2a rule
+	// stands — it exists so `sboot hint` can answer a learner whose build is
+	// broken instead of telling them to run the test they just ran (dogfood
+	// F00-5). Cleared by the next run that actually grades something.
+	RunError map[string]string `json:"last_run_error,omitempty"`
 	// course id -> what the SERVER said about this course the last time we could
 	// ask it (ux-plan §5/§7.5, the v0.4 orientation release). This is the offline
 	// half of "server truth when online, cache offline": bare `sboot` and the
@@ -142,6 +149,7 @@ func loadState() *guidanceState {
 		Fails:      map[string]int{},
 		Rungs:      map[string]int{},
 		LastFailed: map[string][]string{},
+		RunError:   map[string]string{},
 		Sync:       map[string]*courseSync{},
 		LastScore:  map[string]string{},
 	}
@@ -166,6 +174,9 @@ func loadState() *guidanceState {
 	}
 	if loaded.LastFailed != nil {
 		s.LastFailed = loaded.LastFailed
+	}
+	if loaded.RunError != nil {
+		s.RunError = loaded.RunError
 	}
 	if loaded.Sync != nil {
 		s.Sync = loaded.Sync
@@ -280,9 +291,56 @@ func (s *guidanceState) lastFailed(course, stage string) ([]string, bool) {
 	return f, ok
 }
 
+// noteRunError folds a run that produced NO verdict into the state, and clears the
+// note the moment one does. Called by both local paths (`sboot test` and submit's
+// gate), because either can be the last thing the learner ran.
+//
+// It writes no score and touches no ladder counter: a run that never graded is not
+// evidence of being stuck, only of being blocked.
+func (s *guidanceState) noteRunError(course, stage string, res graderRun) {
+	switch {
+	case res.launchFailed:
+		reason := "toolchain"
+		if tool := missingTool(res.launchErr); tool != "" {
+			reason += ":" + tool
+		}
+		s.setRunError(course, stage, reason)
+	case res.buildFailed:
+		s.setRunError(course, stage, "build")
+	case res.graded():
+		s.clearRunError(course, stage)
+	}
+}
+
+func (s *guidanceState) setRunError(course, stage, reason string) {
+	k := course + "/" + stage
+	if s.RunError[k] == reason {
+		return
+	}
+	s.RunError[k] = reason
+	s.dirty = true
+}
+
+// clearRunError marks the state dirty only when it actually deleted something, so
+// a learner whose every run grades cleanly still gets no state file written.
+func (s *guidanceState) clearRunError(course, stage string) {
+	k := course + "/" + stage
+	if _, had := s.RunError[k]; !had {
+		return
+	}
+	delete(s.RunError, k)
+	s.dirty = true
+}
+
+// lastRunError is the reason the most recent local run produced no verdict, or "".
+func (s *guidanceState) lastRunError(course, stage string) string {
+	return s.RunError[course+"/"+stage]
+}
+
 // recordScore keeps the last local practice score for the status screen's
-// "last practice 3/5". Never recorded as 0/0 — a run with no verdict is a launch
-// failure, not a score (the L2a rule).
+// "last practice 3/5". Never recorded as 0/0 — a run with no verdict produced no
+// score to keep (the L2a rule, which `sboot test` now applies to the practice
+// record and the terminal as well: graderRun.graded).
 func (s *guidanceState) recordScore(course, stage string, score, max int) {
 	if max <= 0 {
 		return

@@ -82,11 +82,99 @@ const defaultTree = "os"
 func (r repo) osDir() string { return filepath.Join(r.dir, r.treeName()) }
 
 // treeName is the directory name alone, for messages that have to say it out loud.
-func (r repo) treeName() string {
-	if r.tree == "" {
+func (r repo) treeName() string { return treeOr(r.tree) }
+
+// treeOr resolves a possibly-empty tree name, for the callers that have the raw
+// spec value rather than a repo (`sboot start`, which writes the repo before one
+// exists).
+func treeOr(tree string) string {
+	if tree == "" {
 		return defaultTree
 	}
-	return r.tree
+	return tree
+}
+
+// stagedTree is the name the learner's tree ALWAYS has inside the grader's staging
+// root: cache.go's linkOSTree points `<run>/os` at `<repo>/<tree>` whatever the
+// course calls it. Course build commands are written against that root, which is
+// why a command shown to the LEARNER has to be translated back to their own
+// directory name before it can be run from their repo (repoBuildCmd).
+const stagedTree = "os"
+
+// repoBuildCmd rewrites a course's build command from the staging root's spelling
+// into the learner's own, so the README's "Build it" section names a path that
+// exists in a fresh clone. `cargo build --tests --manifest-path os/Cargo.toml`
+// becomes `--manifest-path db/Cargo.toml` for a course whose tree is `db`.
+//
+// A NO-OP for every course that keeps the default tree, by the first line — which
+// is what makes it impossible for this to change what os-rust, os-c or os2-rust
+// print. The rewrite is per argv token (`-C os`, `--manifest-path os/…`,
+// `--manifest-path=os/…`) rather than a substring replace, so a word that merely
+// contains "os" is left alone.
+func repoBuildCmd(build, tree string) string {
+	tree = treeOr(tree)
+	if tree == stagedTree {
+		return build
+	}
+	fields := strings.Fields(build)
+	for i, f := range fields {
+		if flag, val, ok := strings.Cut(f, "="); ok {
+			fields[i] = flag + "=" + retree(val, tree)
+			continue
+		}
+		fields[i] = retree(f, tree)
+	}
+	return strings.Join(fields, " ")
+}
+
+func retree(token, tree string) string {
+	switch {
+	case token == stagedTree:
+		return tree
+	case strings.HasPrefix(token, stagedTree+"/"):
+		return tree + strings.TrimPrefix(token, stagedTree)
+	}
+	return token
+}
+
+// courseBoots reports whether this course runs a machine, as opposed to running
+// commands on the learner's own host.
+//
+// `capture: cmd` in course.yaml's `grader:` block is exactly that declaration —
+// "the evidence is a command's output, nothing boots" — and it is what tells a
+// Rust-course learner from an OS-course one. Everything else, including the empty
+// default, boots: an unknown course is described as an OS course because that is
+// what every course with no `capture` key is.
+//
+// It decides two learner-facing claims that used to be unconditional: whether the
+// generated README tells them to install an emulator, and whether what their tree
+// holds may be called a kernel (dogfood F00-2/3, 2026-08-19 — `rust-core` was told
+// to install `qemu-system-x86_64` for a course whose own lesson says "no assembler,
+// no emulator, no C compiler").
+func courseBoots(course string) bool { return courseGrader(course).Capture != "cmd" }
+
+// treeSubject names what the learner's tree holds, in the register the course has
+// earned. A course that never boots has no kernel in it and must not be told it has.
+func treeSubject(course string) string {
+	if courseBoots(course) {
+		return "your kernel"
+	}
+	return "your own code"
+}
+
+// rustChannel reads the toolchain channel a repo pins, or "" when it pins none.
+// Hand-rolled for the same reason courseRe is: this is one line of a file we ship.
+var channelRe = regexp.MustCompile(`(?m)^\s*channel\s*=\s*"([^"]+)"`)
+
+func rustChannel(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, "rust-toolchain.toml"))
+	if err != nil {
+		return ""
+	}
+	if m := channelRe.FindSubmatch(b); m != nil {
+		return string(m[1])
+	}
+	return ""
 }
 
 // findRepo locates the learner's repo by walking up from the cwd looking for
@@ -207,7 +295,7 @@ func writeRepoFiles(dir, course, title, firstStage, tree string) error {
 		{manifestName, sbootToml(course, tree)},
 		{"LICENSE", mitLicense()},
 		{".gitignore", gitignore()},
-		{"README.md", readme(course, title, firstStage, buildHint(course))},
+		{"README.md", readme(course, title, firstStage, tree, buildHint(course, tree))},
 	} {
 		p := filepath.Join(dir, f.name)
 		// Never clobber: a learner re-running `sboot start` in a repo they have
@@ -310,7 +398,15 @@ build/
 // a known pair gets an honest section built around its actual command. A blank
 // command cannot happen (the default fills it), but an unrecognisable one
 // still names itself rather than guessing at a toolchain lecture.
-func buildHint(course string) string {
+//
+// TWO THINGS THE GENERIC BRANCH GOT WRONG until 2026-08-23 (dogfood F00-3), both
+// because it took the command from the manifest and nothing else from anywhere:
+// the command is written against the GRADER'S STAGING ROOT, where the learner's
+// tree is always `os`, so `--manifest-path os/Cargo.toml` was presented as working
+// "on a fresh clone" of a repo whose tree is `db/` — and it was in fact
+// `error: manifest path 'os/Cargo.toml' does not exist`. And the emulator was
+// named unconditionally, in a course that says twice that it needs none.
+func buildHint(course, tree string) string {
 	build := strings.TrimSpace(courseGrader(course).Build)
 	if build == "" {
 		build = defaultBuildCmd
@@ -344,30 +440,41 @@ and checks the markers.
 		toolchain = "You need Rust (rustup installs it; if the repo carries a " +
 			"`rust-toolchain.toml`, that pins the exact toolchain)"
 	}
+	emulator := ""
+	if courseBoots(course) {
+		emulator = ", plus " + "`qemu-system-x86_64`" + " to run what it builds"
+	}
 	return `## Build it
 
 The course builds with one command — the same one ` + "`sboot test`" + ` runs for you:
 
-    ` + build + `
+    ` + repoBuildCmd(build, tree) + `
 
-` + toolchain + `, plus ` + "`qemu-system-x86_64`" + ` to run what it builds.
+` + toolchain + emulator + `.
 `
 }
 
-func readme(course, title, firstStage, build string) string {
+func readme(course, title, firstStage, tree, build string) string {
 	if title == "" {
 		title = course
 	}
 	if firstStage == "" {
 		firstStage = "01-boot"
 	}
+	tree = treeOr(tree)
+	// What the tree holds, in the course's own terms. An OS course keeps the
+	// sentence it has always had; a course that boots nothing gets one that is
+	// true of it, rather than a kernel it will never write (dogfood F00-2).
+	mine := "the boot code, the kernel, and the code that\nmakes them run"
+	if !courseBoots(course) {
+		mine = "every line of it written by me,\nlab by lab"
+	}
 	return fmt.Sprintf(`# %[1]s
 
 My work on **%[1]s**, a %[2]s path — you build the real system instead of watching
 someone build it.
 
-Everything under `+"`os/`"+` is mine: the boot code, the kernel, and the code that
-makes them run.
+Everything under `+"`%[7]s/`"+` is mine: %[8]s.
 
 %[6]s
 ## Grade it
@@ -386,7 +493,7 @@ my code and nothing else:
 
 ---
 
-The `+"`os/`"+` scaffold this started from is MIT-licensed (see LICENSE); the course
+The `+"`%[7]s/`"+` scaffold this started from is MIT-licensed (see LICENSE); the course
 prose, tests and grader are %[2]s's and are not redistributable.
-`, title, brandName, firstStage, siteURL(), course, build)
+`, title, brandName, firstStage, siteURL(), course, build, tree, mine)
 }

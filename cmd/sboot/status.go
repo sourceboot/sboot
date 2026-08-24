@@ -549,7 +549,18 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 	if st.Catalog == nil {
 		catalog(st)
 	}
-	arcTotal := len(labs)
+	// MARKETED, like every other number on this screen (§14): the spec manifest
+	// lists `00-welcome` and the catalog's total does not, so counting the manifest
+	// rows printed "0 of 11 live labs verified" two lines above "(12-lab arc)" for
+	// the first course with every lab published (dogfood F00-7). 11 is the count
+	// the course is sold with, and the welcome lab keeps its row without joining it.
+	listed := 0
+	for _, l := range labs {
+		if !isWelcomeLab(l.Stage) {
+			listed++
+		}
+	}
+	arcTotal := listed
 	if st.Catalog != nil {
 		for _, c := range st.Catalog.Courses {
 			if c.ID == r.course && c.Total > arcTotal {
@@ -677,7 +688,7 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 			fmt.Printf("  %s\n", p(ansiDim, padTo(label, width)+"not published yet"))
 		}
 	}
-	if hidden > 0 || arcTotal > len(labs) {
+	if hidden > 0 || arcTotal > listed {
 		fmt.Printf("  %s\n", p(ansiDim, fmt.Sprintf("⋮  (%d-lab arc — labs open in order)", arcTotal)))
 	}
 	fmt.Println()
