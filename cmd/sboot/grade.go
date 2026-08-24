@@ -78,7 +78,12 @@ var jsonMode bool
 // `captureOut` (possibly "") asks for the machine state of the boot to be written
 // there as well, which is how `sboot submit` gets its evidence without a second
 // build and a second boot (D3).
-func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
+//
+// `tree` is the learner's own name for their source tree (repo.tree; "" means
+// the default `os`). Display-only: the judge's streams are rewritten from the
+// staging spelling into the learner's (retree.go, F00-1), and nothing else
+// reads it.
+func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderRun {
 	run := graderRun{}
 
 	// ── The engine ─────────────────────────────────────────────────────────────
@@ -142,6 +147,20 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 	// happen, and they must keep whatever colour and interleaving cargo gave them.
 	// (Under --json, stdout belongs to the verdict object, so the build's stdout
 	// joins the messaging on stderr.)
+	//
+	// (F00-1) For a course whose tree is not `os`, the staging spelling can leak
+	// here too — cargo's "Compiling lantern v0.1.0 (<run>/os/lantern)" status
+	// line names the staged path when this warm-up build recompiles. It is left
+	// unfiltered DELIBERATELY: filtering means a Go writer, a Go writer means a
+	// pipe, and a pipe means cargo sees no TTY — the colour and live progress
+	// this comment exists to protect would be gone from the course's every
+	// build (forcing CARGO_TERM_COLOR=always restores colour but not the
+	// progress line, and is cargo-specific in a course-agnostic code path).
+	// rustc's own diagnostics print workspace-relative paths
+	// (`lantern/src/banner.rs`), so compile errors — the text that matters —
+	// never carry the staging spelling; only cargo's status parenthetical does.
+	// The judge's streams below ARE filtered (retreeStreams): they were already
+	// pipes, so the rewrite there costs nothing.
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
 	if jsonMode {
 		cmd.Stdout = os.Stderr
@@ -204,15 +223,22 @@ func runGrader(runDir, course, labID, tierSpec, captureOut string) graderRun {
 		args = append(args, "--capture-out", captureOut)
 	}
 
+	// The judge's streams go through the F00-1 display filter (retree.go): what
+	// the engine prints — its `── running` banners and the [[run]] output teed
+	// through it — spells the tree by its STAGED name, and the terminal is the
+	// learner's. The `captured` copy stays RAW on purpose: it feeds parseVerdict
+	// and the practice record, which must keep what actually ran.
+	judgeOut, judgeErr, flushRetree := retreeStreams(runDir, tree)
 	var captured bytes.Buffer
 	judge := exec.Command(engine, args...)
 	judge.Dir = runDir
-	judge.Stdout = io.MultiWriter(os.Stdout, &captured)
+	judge.Stdout = io.MultiWriter(judgeOut, &captured)
 	if jsonMode {
 		judge.Stdout = &captured // stdout is reserved for the JSON verdict
 	}
-	judge.Stderr = os.Stderr
+	judge.Stderr = judgeErr
 	err = judge.Run()
+	flushRetree()
 	if err != nil {
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) {

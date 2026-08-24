@@ -123,6 +123,14 @@ func runReveal(r repo, stage string, yes bool) int {
 		served = step
 	}
 	fmt.Println(renderRevealFiles(stage, served, resp.Files))
+	if served == stepSkeleton && revealFilesContain(resp.Files, "todo!(") {
+		// F04-1 (rust-start dogfood 2026-08-24): `todo!()` is a construct no
+		// course teaches before a learner meets it HERE, in their first skeleton
+		// — and this course's audience will wonder whether they were supposed to
+		// know it. One line, printed only when the served files actually use it,
+		// so a course whose skeletons are shaped differently never sees it.
+		fmt.Println("(`todo!()` marks a body you haven't written yet — the file compiles, and panics if that function is ever called.)")
+	}
 
 	if dir, err := saveReveal(r, stage, served, resp.Files); err == nil {
 		fmt.Printf("saved to %s\n", dir)
@@ -208,6 +216,17 @@ func renderRevealFiles(stage, step string, files []revealFile) string {
 			strings.TrimRight(f.Text, "\n"))
 	}
 	return strings.Join(out, "\n")
+}
+
+// revealFilesContain reports whether any served file's text carries the needle
+// — what gates the `todo!()` gloss above on the skeleton actually using it.
+func revealFilesContain(files []revealFile, needle string) bool {
+	for _, f := range files {
+		if strings.Contains(f.Text, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // saveReveal writes the served files under the run directory — the same scratch

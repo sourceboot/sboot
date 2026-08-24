@@ -495,7 +495,7 @@ func runTest(r repo, stage string, ga gradedArgs) {
 	// ladder (the failure-guidance spec). The grader itself stays historyless.
 	st := loadState()
 	jsonMode = ga.jsonOut
-	res := runGrader(run, r.course, stage, st.tierSpec(r.course, stage), "")
+	res := runGrader(run, r.course, stage, st.tierSpec(r.course, stage), "", r.tree)
 	// Recorded BEFORE the launch-failure exit, because a run that never reached a
 	// check is exactly the run `sboot hint` had nothing to say about (F00-5).
 	st.noteRunError(r.course, stage, res)
@@ -1283,7 +1283,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	// Progress narration goes to stderr (§12.2 rule 3): stdout is for the verdict.
 	fmt.Fprintf(os.Stderr, "── checking %s locally first (one build, one run)\n", stage)
 	st := loadState()
-	res := runGrader(run, course, stage, st.tierSpec(course, stage), capturePath)
+	res := runGrader(run, course, stage, st.tierSpec(course, stage), capturePath, r.tree)
 
 	// THE LADDER COUNTER (the failure-guidance spec), and the decision behind it.
 	//
@@ -1421,7 +1421,11 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	}
 	if created.Detail != "" {
 		fmt.Fprintln(vw)
-		fmt.Fprintln(vw, indent(created.Detail, "  "))
+		// The server's verdict detail quotes the learner's own run back —
+		// including command lines and paths in the STAGING spelling (`os/…`).
+		// Same display rule as the local run (retree.go, F00-1): rewrite at the
+		// terminal, a no-op for every course whose tree is `os`.
+		fmt.Fprintln(vw, indent(retreeText(created.Detail, run, r.tree), "  "))
 	}
 	switch created.Status {
 	case "passed":
@@ -1465,6 +1469,22 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		return 0
 	case "failed":
 		fmt.Fprintf(vw, "\n  ❌ official grade: %d/%d\n", deref(created.Score), deref(created.MaxScore))
+		// F06-2 (rust-start dogfood 2026-08-24): the failing verdict gets the
+		// same pointer a passing one gets. The learner who just recorded a
+		// failure on purpose — possibly because they suspect the grader — is the
+		// one who most needs the web review/Stuck? surface, and was the one who
+		// got no link. The row exists (a failed submission is deep-linkable on
+		// the stage page's stepper by id); the server only sends `review_url` on
+		// a pass, so when it sent none the same page's URL is built from what
+		// this side already knows.
+		if link := created.ReviewURL; link != "" || created.ID != "" {
+			if link == "" {
+				link = fmt.Sprintf("%s/courses/%s/stages/%s?submission=%s#review",
+					siteURL(), course, stage, created.ID)
+			}
+			fmt.Fprintf(vw, "  Recorded → %s\n", link)
+			fmt.Fprintln(vw, "  this run and its evidence are on that page — its Stuck? panel picks up from here")
+		}
 		// This line used to read "the server rubric includes hidden checks; make it
 		// work, not just print". D1 removed the hidden checks, so blaming a stricter
 		// rubric would now be false — and D3 makes the honest reading exact. If the
