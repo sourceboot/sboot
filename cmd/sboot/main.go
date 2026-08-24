@@ -111,11 +111,13 @@ var stageRe = regexp.MustCompile(`^\d+`)
 // gradedArgs is one graded command's parsed invocation.
 type gradedArgs struct {
 	stage     string // "" until defaulted
-	check     string // hint only
+	check     string // hint, explain
 	defaulted bool   // the stage came from the current-lab rule, not the learner
 	force     bool
 	jsonOut   bool
 	yes       bool
+	here      bool   // explain: answer in this terminal instead of opening the chat
+	message   string // explain: the learner's own question
 }
 
 // parseCommon walks a command's arguments: positionals in order, the flags the
@@ -124,7 +126,11 @@ type gradedArgs struct {
 func parseCommon(cmd string, args []string, maxPos int, opts *gradedArgs) []string {
 	var pos []string
 	terminated := false
-	for _, a := range args {
+	// Indexed rather than ranged since 2026-08-23: `--message <text>` is the one
+	// flag here that takes a value, and a learner's question is the one thing that
+	// must be spellable the way every other CLI spells it.
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch {
 		case !terminated && a == "--":
 			terminated = true
@@ -139,10 +145,28 @@ func parseCommon(cmd string, args []string, maxPos int, opts *gradedArgs) []stri
 			}
 			opts.jsonOut = true
 		case !terminated && (a == "--yes" || a == "-y"):
-			if cmd != "start" && cmd != "repo" {
-				usageError("--yes only means something for `sboot start` and `sboot repo`")
+			if cmd != "start" && cmd != "repo" && cmd != "reveal" {
+				usageError("--yes only means something for `sboot start`, `sboot repo` and `sboot reveal`")
 			}
 			opts.yes = true
+		case !terminated && a == "--here":
+			if cmd != "explain" {
+				usageError("--here only means something for `sboot explain`")
+			}
+			opts.here = true
+		case !terminated && (a == "--message" || a == "-m" || strings.HasPrefix(a, "--message=")):
+			if cmd != "explain" {
+				usageError("--message only means something for `sboot explain`")
+			}
+			if v, found := strings.CutPrefix(a, "--message="); found {
+				opts.message = v
+				break
+			}
+			if i+1 >= len(args) {
+				usageError("%s needs your question after it: `sboot explain --here -m \"why is this failing?\"`", a)
+			}
+			i++
+			opts.message = args[i]
 		case !terminated && a == "--no-color":
 			noColorFlag = true
 		case !terminated && (a == "--help" || a == "-h"):
@@ -344,6 +368,41 @@ func main() {
 			return 0
 		})
 		exitWith(runHint(r, stage, ga.check, ga.defaulted))
+
+	case "explain":
+		// Same [stage] [check] shape as `hint` — the two verbs are rungs of one
+		// ladder and a learner should not have to re-learn the arguments to climb.
+		pos := parseCommon(cmd, rest, 2, &ga)
+		switch len(pos) {
+		case 1:
+			if stageRe.FindString(pos[0]) != "" {
+				ga.stage = pos[0]
+			} else {
+				ga.check = pos[0]
+			}
+		case 2:
+			ga.stage, ga.check = pos[0], pos[1]
+		}
+		r := requireRepo("explain")
+		stage := resolveGradedStage(r, &ga, "explain", func(fr *frontierInfo) int {
+			fmt.Println("all live labs are verified — nothing to explain. Nice work.")
+			return 0
+		})
+		exitWith(runExplain(r, stage, ga))
+
+	case "reveal":
+		// One positional only: reveal is per LAB (the server serves that lab's
+		// module skeleton, then its reference), not per check.
+		pos := parseCommon(cmd, rest, 1, &ga)
+		if len(pos) == 1 {
+			ga.stage = pos[0]
+		}
+		r := requireRepo("reveal")
+		stage := resolveGradedStage(r, &ga, "reveal", func(fr *frontierInfo) int {
+			fmt.Println("all live labs are verified — nothing to reveal. Nice work.")
+			return 0
+		})
+		exitWith(runReveal(r, stage, ga.yes))
 
 	case "test":
 		pos := parseCommon(cmd, rest, 1, &ga)
@@ -795,6 +854,19 @@ type localCheck struct {
 	pass   bool
 	points int
 	desc   string
+	// LAYER 0 for this check, verbatim as the engine generated it: what the
+	// learner's own run did, never a criterion of ours (grader/guidance.go
+	// Observe). Empty for a check that passed, and for a verdict from an engine
+	// older than the sixth protocol field.
+	//
+	// It is carried here for ONE consumer — `sboot hint`'s evidence-selected rung
+	// (the failure-guidance spec "EVIDENCE-SELECTED"). state.go stores it per
+	// failing check and hint.go matches an authored rung's selectors against it,
+	// which is how the ladder's last line can name the cause this learner's run
+	// points at rather than listing all four. It is NEVER re-rendered: the engine
+	// already printed it, and printing it twice would be a second place for the
+	// never-echo-the-rubric rule to be got wrong.
+	evidence string
 }
 
 type graderRun struct {
@@ -853,9 +925,12 @@ func (r graderRun) graded() bool { return r.verdict }
 // rule (and the same reason) as the server-side parser: a record from a grader
 // newer than this binary must still parse, or every check silently vanishes.
 //
-// The guidance field is ignored here. The grader has already rendered it, capped at
-// the tier we asked for; re-rendering it in the CLI would be a second place for the
-// "never echo the rubric" rule to be got wrong.
+// The guidance field is not RENDERED here. The grader has already rendered it,
+// capped at the tier we asked for; re-rendering it in the CLI would be a second
+// place for the "never echo the rubric" rule to be got wrong. Since 2026-08-23 its
+// LAYER 0 tier is nonetheless read out of it and kept on the check — not to print,
+// but so `sboot hint` can match an authored rung's evidence selectors against what
+// this learner's run actually did (the evidence bridge; see localCheck.evidence).
 //
 // `ok` is whether an LBX_SCORE record was there at all, and it is what `verdict` is
 // set from: a protocol the engine only half wrote (killed mid-write, out of disk)
@@ -868,6 +943,9 @@ func parseVerdict(out string) (checks []localCheck, score, max int, ok bool) {
 		case len(f) >= 4 && f[0] == "LBX_CHECK":
 			c := localCheck{pass: f[1] == "PASS", desc: f[3]}
 			c.points, _ = strconv.Atoi(f[2])
+			if len(f) >= 5 {
+				c.evidence = layer0(f[4])
+			}
 			if len(f) >= 6 {
 				c.id = f[5]
 			}
@@ -883,6 +961,38 @@ func parseVerdict(out string) (checks []localCheck, score, max int, ok bool) {
 		}
 	}
 	return
+}
+
+// The three control bytes grader/protocol.go packs a check's guidance ladder
+// with: US after the `L<n>` tag, RS between tiers, VT standing in for a newline
+// inside one tier's text. Spelled out here rather than imported because the CLI
+// links NOTHING of the engine — harness/go.mod has no requires at all, and that
+// emptiness is what keeps the grading engine out of the public MIT repo
+// (the grading-engine distribution decision). Three bytes copied is the price; they are part
+// of an append-only wire format, so they do not move.
+const (
+	guidanceUS = "\x1f"
+	guidanceRS = "\x1e"
+	guidanceVT = "\x0b"
+)
+
+// layer0 unpacks the LAYER 0 tier — the learner's own observation — out of a
+// packed guidance field, or "" when the record carries none (a check that
+// passed, or an engine that predates the field).
+//
+// Deliberately tolerant of everything else in there: tiers are append-only and a
+// newer engine may pack tags this binary has never heard of, so anything that is
+// not `L0` is skipped rather than mis-read. Nothing here is printed — see
+// localCheck.evidence for the single consumer.
+func layer0(guidance string) string {
+	for _, part := range strings.Split(guidance, guidanceRS) {
+		tag, text, ok := strings.Cut(part, guidanceUS)
+		if !ok || tag != "L0" {
+			continue
+		}
+		return strings.ReplaceAll(text, guidanceVT, "\n")
+	}
+	return ""
 }
 
 func apiURL() string {

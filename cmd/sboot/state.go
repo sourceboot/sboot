@@ -61,6 +61,21 @@ type guidanceState struct {
 	// once a stage has ids to say something about, so the e2e stub grader (no
 	// check ids) still creates no state file.
 	LastFailed map[string][]string `json:"last_failed,omitempty"`
+	// "course/stage/check-id" -> the LAYER 0 observation the most recent graded
+	// run produced for a check that FAILED — the learner's own evidence, verbatim
+	// as the engine generated it (grader/guidance.go Observe).
+	//
+	// THE EVIDENCE BRIDGE (the failure-guidance spec "EVIDENCE-SELECTED"). `sboot
+	// test` writes, `sboot hint` reads — the same one-way channel as LastFailed,
+	// and for the same reason: hint runs long after the capture is gone, and
+	// re-deriving what happened would be a second opinion about it. hint matches
+	// an authored rung's selectors against this text so the ladder's last line can
+	// name the cause THIS run points at instead of listing all four.
+	//
+	// Never rendered raw: only authored text is ever printed from a match, so a
+	// course that authors no selectors is unaffected by anything stored here.
+	// Cleared the moment the check passes, exactly like Fails.
+	Evidence map[string]string `json:"last_evidence,omitempty"`
 	// "course/stage" -> why the most recent LOCAL run produced no verdict at all:
 	// "build" (the course's build command ran and failed) or "toolchain:<tool>"
 	// (it never started). NOT a score and never rendered as one — the L2a rule
@@ -148,6 +163,7 @@ func loadState() *guidanceState {
 		Version:    stateVersion,
 		Fails:      map[string]int{},
 		Rungs:      map[string]int{},
+		Evidence:   map[string]string{},
 		LastFailed: map[string][]string{},
 		RunError:   map[string]string{},
 		Sync:       map[string]*courseSync{},
@@ -171,6 +187,9 @@ func loadState() *guidanceState {
 	}
 	if loaded.Rungs != nil {
 		s.Rungs = loaded.Rungs
+	}
+	if loaded.Evidence != nil {
+		s.Evidence = loaded.Evidence
 	}
 	if loaded.LastFailed != nil {
 		s.LastFailed = loaded.LastFailed
@@ -259,10 +278,15 @@ func (s *guidanceState) record(course, stage string, checks []localCheck) {
 				delete(s.Fails, k)
 				s.dirty = true
 			}
+			if _, had := s.Evidence[k]; had {
+				delete(s.Evidence, k)
+				s.dirty = true
+			}
 		} else {
 			failing = append(failing, c.id)
 			s.Fails[k]++
 			s.dirty = true
+			s.setEvidence(k, c.evidence)
 		}
 	}
 	if !haveIDs {
@@ -281,6 +305,40 @@ func (s *guidanceState) record(course, stage string, checks []localCheck) {
 	}
 	s.LastFailed[lk] = failing
 	s.dirty = true
+}
+
+// maxEvidenceBytes bounds one check's stored observation. The engine already
+// bounds a quoted failure block (grader/cmdrun.go evidenceMaxBytes), so this is
+// the belt to that braces: a course whose Layer 0 is generated some other way
+// still cannot grow this file without limit. Cutting it can only cost a selector
+// match, which falls back to the static rung.
+const maxEvidenceBytes = 2048
+
+// setEvidence records one failing check's observation, or drops the row when the
+// run produced none (an engine older than the guidance field — the ladder then
+// renders exactly as it did before this existed).
+func (s *guidanceState) setEvidence(key, text string) {
+	if len(text) > maxEvidenceBytes {
+		text = text[:maxEvidenceBytes]
+	}
+	if text == "" {
+		if _, had := s.Evidence[key]; had {
+			delete(s.Evidence, key)
+			s.dirty = true
+		}
+		return
+	}
+	if s.Evidence[key] == text {
+		return
+	}
+	s.Evidence[key] = text
+	s.dirty = true
+}
+
+// evidence is what the most recent graded run observed about this check, or ""
+// when there is nothing recorded — never graded, passing, or an old engine.
+func (s *guidanceState) evidence(course, stage, checkID string) string {
+	return s.Evidence[stateKey(course, stage, checkID)]
 }
 
 // lastFailed answers `sboot hint`'s two questions at once: which checks failed

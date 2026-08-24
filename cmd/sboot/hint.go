@@ -22,12 +22,19 @@
 // divergences: (1) the failing set comes from the recorded verdict rather than
 // a KTAP transcript — the CLI already has the engine's per-check results, so
 // re-parsing serial output would be a second opinion about what failed; (2) the
-// ladder's last rung and its past-the-ladder copy hand off to the lab page's
-// `#stuck` anchor (ux-plan §11.i: the AI tier is web-only — there is no
-// terminal `sboot explain`, by design, ever); (3) the prototype's `--observed`
-// evidence line is not wired — the render supports it, but the capture is not
-// retained between runs, so the command passes "" (the evidence-selected L2
-// line arrives with the evidence bridge, not before).
+// ladder's last rung and its past-the-ladder copy hand off to the NEXT RUNG —
+// `sboot explain`, then `sboot reveal` — and to the same chat on the lab page's
+// `#stuck` anchor. (This copy named only the web surface between 2026-08-13 and
+// 2026-08-23, while the terminal verbs were unbuilt: "a hint must never name a
+// command that doesn't exist". They exist now — explain.go, reveal.go — so the
+// spec's own hand-off wording is restored; the web surface stays named beside
+// them, because the chat there keeps context across turns.); (3) the prototype's
+// `--observed` evidence line is not a FLAG — it is wired (2026-08-23), and the
+// CLI supplies it rather than the learner. `sboot test` records each failing
+// check's Layer 0 into state.json, and the deepest authored rung matches its
+// `evidence` selectors against that to name the cause THIS run points at
+// (the failure-guidance spec "EVIDENCE-SELECTED"). A rung with no selectors, and
+// a selector that matches nothing, render exactly as they did before.
 package main
 
 import (
@@ -46,6 +53,60 @@ const hintsFileName = "hints.json"
 type hintEntry struct {
 	L1 string `json:"l1"`
 	L2 string `json:"l2"`
+	// The EVIDENCE-SELECTED last line, optional and per check
+	// (the failure-guidance spec: "the last line names the cause the learner's own
+	// capture points at"). Rules are tried in order and the FIRST match wins, so
+	// they are authored specific-before-general. A check with none — every check
+	// in every course until 2026-08-23 — renders exactly as it always did.
+	Evidence []evidenceRule `json:"evidence,omitempty"`
+}
+
+// evidenceRule is one authored selector: a pattern to look for in what the
+// learner's own run did, and the line to add when it is there.
+//
+// The pattern side deliberately matches only the LEARNER'S evidence, never their
+// source or the rubric — the whole point is to say which of the ladder's causes
+// this run points at, and the ladder is already written.
+type evidenceRule struct {
+	// Substring, case-insensitive. Case folding is not a nicety: the strings
+	// worth keying on are compiler and libtest output ("attempt to subtract with
+	// overflow", "range end index"), and an author who capitalises one has
+	// written a rule that silently never fires.
+	Match string `json:"match,omitempty"`
+	// Any-of, for one cause with several spellings ("index out of bounds" and
+	// "range end index" are the same bug reported by two different panics).
+	MatchAny []string `json:"match_any,omitempty"`
+	// The authored line, appended to the deepest rung. Prose, like every other
+	// string in this file, and under the same rule: name the cause, never the fix.
+	Then string `json:"then"`
+}
+
+// selectEvidence picks the authored line this run's evidence points at, or ""
+// when nothing matches.
+//
+// "" IS THE DESIGNED OUTCOME, not a failure: a selector that matches nothing
+// falls back to the static rung, which is the whole ladder and is already
+// complete on its own. So a rule may be added for a cause that is merely likely,
+// and an author is never tempted to write a catch-all that would guess.
+func selectEvidence(rules []evidenceRule, observed string) string {
+	if observed == "" {
+		return ""
+	}
+	hay := strings.ToLower(observed)
+	for _, r := range rules {
+		if r.Then == "" {
+			continue
+		}
+		if r.Match != "" && strings.Contains(hay, strings.ToLower(r.Match)) {
+			return r.Then
+		}
+		for _, m := range r.MatchAny {
+			if m != "" && strings.Contains(hay, strings.ToLower(m)) {
+				return r.Then
+			}
+		}
+	}
+	return ""
 }
 
 // hintsFile is hints.json: authored, shipped with the spec, never generated.
@@ -149,7 +210,13 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 		debugf("could not save hint state: %v", err)
 	}
 
-	fmt.Println(renderHint(stage, target, entry, rung, "", stageStuckURL(r.course, stage)))
+	// The evidence bridge: what the last graded run OBSERVED about this check
+	// (state.go Evidence — `sboot test` writes it, this reads it), reduced to the
+	// one authored line its selectors point at. "" whenever there is nothing
+	// recorded or nothing matches, which renders the rung unchanged.
+	observed := selectEvidence(entry.Evidence, st.evidence(r.course, stage, target))
+
+	fmt.Println(renderHint(stage, target, entry, rung, observed, stageStuckURL(r.course, stage)))
 	return 0
 }
 
@@ -167,11 +234,10 @@ func hintTiers(e hintEntry) []string {
 // renderHint renders the rung-th ask (1-based) for a check — the faithful port
 // of proto/hint.py's render(): a position header with a dynamic denominator, the
 // authored body, an optional evidence line on the deepest rung, and a footer
-// that always points somewhere: the next rung while one exists, then the lab
-// page's `#stuck` anchor (`stuckURL`), where the ladder's web mirror and the
-// metered explain chat live. The ladder never dead-ends on "no more hints",
-// and it NEVER names a terminal AI command — the AI tier is web-only by design
-// (ux-plan §11.i; `sboot explain`/`reveal` are retired, not pending).
+// that always points somewhere: the next rung while one exists, then the next
+// TOOL — `sboot explain`, and past the ladder `sboot reveal` — plus the lab
+// page's `#stuck` anchor (`stuckURL`), where the same chat lives with its
+// context kept across turns. The ladder never dead-ends on "no more hints".
 func renderHint(stage, checkID string, e hintEntry, rung int, observed, stuckURL string) string {
 	tiers := hintTiers(e)
 	n := len(tiers)
@@ -181,9 +247,11 @@ func renderHint(stage, checkID string, e hintEntry, rung int, observed, stuckURL
 			"",
 			strings.TrimRight(tiers[rung-1], " \t\r\n"),
 		}
-		// The evidence-selected line, from the learner's own capture — the one
-		// part of L2 that is not authored ahead of time. Unused until the
-		// evidence bridge lands; see the package comment.
+		// The evidence-selected line: the one part of the deepest rung that is
+		// chosen per run rather than fixed. The TEXT is still authored — what the
+		// learner's evidence decides is WHICH authored line, never the words —
+		// so the never-echo-the-rubric rule is enforced at authoring time here,
+		// exactly as it is for the rung above it. See selectEvidence.
 		if rung == n && observed != "" {
 			out = append(out, "  → Your evidence: "+observed)
 		}
@@ -197,7 +265,9 @@ func renderHint(stage, checkID string, e hintEntry, rung int, observed, stuckURL
 				"run it again for the next rung (%d of %d%s).", rung+1, n, suffix))
 		} else {
 			out = append(out,
-				"that's the last authored rung. more help — the explain chat, on this lab's page:",
+				"that's the last authored rung. next: `sboot explain "+checkID+"` — the AI tutor,",
+				"with this run's evidence attached (`--here` answers in this terminal).",
+				"or the same chat on this lab's page:",
 				"  "+stuckURL)
 		}
 		return strings.Join(out, "\n")
@@ -213,8 +283,11 @@ func renderHint(stage, checkID string, e hintEntry, rung int, observed, stuckURL
 		"[%s] You've seen every written hint for this check.\n"+
 			"── Re-run `sboot test %s` and read the failure evidence closely — "+
 			"it names what the check looked for and what it found instead.\n"+
-			"── more help — the explain chat, on this lab's page: %s",
-		checkID, stage, stuckURL)
+			"── `sboot explain %s` takes it to the AI tutor with that evidence attached "+
+			"(or the same chat on this lab's page: %s).\n"+
+			"── Still stuck? `sboot reveal %s` shows the course's own solution for this lab "+
+			"and marks it solution-assisted — it never blocks completing it.",
+		checkID, stage, checkID, stuckURL, stage)
 }
 
 // umbrellaSuffix marks a lab's WHOLE-SUITE check — `<lab>.suite` by the convention
@@ -273,7 +346,8 @@ func renderBlockedHint(r repo, stage, reason, stuckURL string) string {
 	out = append(out, "",
 		once+", `sboot test "+stage+"` scores the checks and `sboot hint "+stage+"` picks up",
 		"whichever one is red.",
-		"more help — the explain chat, on this lab's page:",
+		"more help — `sboot explain "+stage+"` (the AI tutor; `--here` answers in this terminal),",
+		"or the same chat on this lab's page:",
 		"  "+stuckURL)
 	return strings.Join(out, "\n")
 }

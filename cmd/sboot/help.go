@@ -21,6 +21,7 @@ usage: sboot [command] [args]      bare ` + "`sboot`" + ` shows where you are an
   start [course]        create a course workspace in ./<course>/ (no-arg lists the catalog)
   test [stage]          practice: grade the current lab locally (fast loop, offline-friendly)
   hint [stage] [check]  a hint for a failing check — one rung deeper per run
+  explain [check]       the AI tutor on that check, fed your last run (--here: in this terminal)
   submit [stage]        official: check locally first, then upload for the server grade
   courses               the catalog + your progress
   login                 connect this machine to your account
@@ -38,12 +39,14 @@ the learner verbs:
   start [course]        create a course workspace in ./<course>/ (no-arg lists the catalog)
   test [stage]          practice: grade the current lab locally (fast loop, offline-friendly)
   hint [stage] [check]  a hint for a failing check — one rung deeper per run
+  explain [check]       the AI tutor on that check, fed your last run (--here: in this terminal)
   submit [stage]        official: check locally first, then upload for the server grade
   courses               the catalog + your progress
   login                 connect this machine to your account (device connect)
   repo                  create your GitHub repo for this course and push (via gh)
 
 everything else:
+  reveal [stage]        the course's own solution for a lab — marks it solution-assisted
   logout                remove the stored login from this machine
   whoami                who the current credential resolves to
   debug [stage]         boot this stage under QEMU frozen for a debugger on :1234
@@ -54,8 +57,10 @@ everything else:
 
 flags:
   --force, -f           submit even if the local check fails (submit only)
+  --here                answer in this terminal instead of opening the chat (explain)
+  --message, -m TEXT    your question, instead of the one explain composes (explain)
   --json                machine-readable output on `+"`sboot`"+`, test and submit
-  --yes, -y             answer yes to every prompt (start, repo)
+  --yes, -y             answer yes to every prompt (start, repo, reveal)
   --no-color            no ANSI color (NO_COLOR is honored too)
   --                    end of options; everything after is positional
 
