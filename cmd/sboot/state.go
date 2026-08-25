@@ -349,6 +349,39 @@ func (s *guidanceState) lastFailed(course, stage string) ([]string, bool) {
 	return f, ok
 }
 
+// hasLocalWork reports whether ANY local trace of working this stage exists on
+// this machine: a graded run (LastFailed/LastScore), a run that failed to grade
+// (RunError), or ladder history (Fails/Rungs). The R1-7 signal (round-1
+// dogfood, 2026-08-25): a defaulted `sboot submit` that lands on a stage with
+// NO local work is very likely a learner who meant the lab they just finished —
+// bare submit moved to the next lab the moment the previous one completed — so
+// the gate refusal names both interpretations instead of suggesting `--force`
+// on untouched starter code.
+func (s *guidanceState) hasLocalWork(course, stage string) bool {
+	lk := course + "/" + stage
+	if _, ok := s.LastFailed[lk]; ok {
+		return true
+	}
+	if _, ok := s.LastScore[lk]; ok {
+		return true
+	}
+	if _, ok := s.RunError[lk]; ok {
+		return true
+	}
+	prefix := stateKey(course, stage, "")
+	for k := range s.Fails {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	for k := range s.Rungs {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // noteRunError folds a run that produced NO verdict into the state, and clears the
 // note the moment one does. Called by both local paths (`sboot test` and submit's
 // gate), because either can be the last thing the learner ran.

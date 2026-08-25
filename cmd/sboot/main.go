@@ -1283,6 +1283,21 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	// Progress narration goes to stderr (§12.2 rule 3): stdout is for the verdict.
 	fmt.Fprintf(os.Stderr, "── checking %s locally first (one build, one run)\n", stage)
 	st := loadState()
+
+	// R1-7 (round-1 dogfood 2026-08-25): a bare `sboot submit` right after a
+	// completion targets the NEXT lab — the current-lab default moved forward
+	// the moment the previous one was verified — so a learner acting on
+	// "revise and resubmit" advice grades an untouched workspace and would be
+	// handed a `--force` suggestion for a lab they never started. Detect that
+	// shape NOW, before this very run writes lab state and erases the
+	// "untouched" evidence: stage defaulted + no local trace of it + the lab
+	// before it verified. The refusal below then names both interpretations
+	// instead of suggesting `--force` on starter code.
+	freshDefault := ""
+	if ga.defaulted && !st.hasLocalWork(course, stage) {
+		freshDefault = previousVerifiedLab(st, course, stage)
+	}
+
 	res := runGrader(run, course, stage, st.tierSpec(course, stage), capturePath, r.tree)
 
 	// THE LADDER COUNTER (the failure-guidance spec), and the decision behind it.
@@ -1331,7 +1346,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		reportSubmitGraderMissing(r, stage, res.launchErr)
 		return 2
 	case res.exitCode != 0 && !force:
-		reportGateFailure(stage, res)
+		reportGateFailure(stage, freshDefault, res)
 		return 1
 	case res.exitCode != 0:
 		fmt.Fprintf(os.Stderr, "\n── local check FAILED (%s) — submitting anyway (--force)\n", scoreText(res))
@@ -1532,8 +1547,23 @@ func scoreText(res graderRun) string {
 // failing check and its guidance to this terminal, and repeating that would be a
 // second place for the never-echo-the-rubric rule to be got wrong. The only facts
 // the grader cannot know are that nothing was submitted, and how to override.
-func reportGateFailure(stage string, res graderRun) {
+//
+// freshDefault is non-empty when this run graded a DEFAULTED stage the learner
+// has never touched on this machine, right after completing the lab before it
+// (R1-7 — main.go's submit gate computes it before the run writes state). In
+// that shape the failing checks are the starter stubs, "fix these first" is
+// wrong, and a `--force` suggestion would invite recording a forced 0/N on an
+// unstarted lab — so the copy names both interpretations, explicitly, instead.
+func reportGateFailure(stage, freshDefault string, res graderRun) {
 	fmt.Fprintf(os.Stderr, "\n── not submitted: the local check did not pass (%s)\n", scoreText(res))
+	if freshDefault != "" {
+		fmt.Fprintf(os.Stderr, "   This graded %s — your current lab, which has no work on this machine\n", stage)
+		fmt.Fprintf(os.Stderr, "   yet: a bare `sboot submit` moved on when %s completed.\n", freshDefault)
+		fmt.Fprintln(os.Stderr, "   No submission was created and nothing was sent. Say which you meant:")
+		fmt.Fprintf(os.Stderr, "     resubmit lab %s:  sboot submit %s\n", labNumber(freshDefault), freshDefault)
+		fmt.Fprintf(os.Stderr, "     start lab %s:     work through its brief, then sboot test %s\n", labNumber(stage), stage)
+		return
+	}
 	fmt.Fprintln(os.Stderr, "   `sboot submit` grades the same checks you just ran, so fix these first —")
 	fmt.Fprintln(os.Stderr, "   no submission was created and nothing was sent.")
 	fmt.Fprintf(os.Stderr, "   Think the local grader is wrong, or want this failure on the record?\n")

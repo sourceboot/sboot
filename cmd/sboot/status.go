@@ -470,6 +470,40 @@ func currentLab(st *guidanceState, course string) (lab labInfo, fr *frontierInfo
 	return labInfo{}, f, src, nil
 }
 
+// previousVerifiedLab names the LIVE lab immediately before `stage` in the
+// course's lab order, when the learner holds a VERIFIED completion on it — or
+// "" otherwise. The other half of the R1-7 signal (state.go hasLocalWork): a
+// defaulted submit on an untouched stage whose predecessor just completed is
+// the resubmit-after-Complete footgun, and this is the lab the learner
+// probably meant.
+//
+// Reads only what this process already has — the manifest memo/spec cache and
+// the state.json sync the defaulting path itself refreshed — so it costs no
+// network call and degrades to "" (no special copy) when either is absent.
+func previousVerifiedLab(st *guidanceState, course, stage string) string {
+	labs, _ := cachedLabsInfo(course)
+	cs := st.Sync[course]
+	if cs == nil || len(labs) == 0 {
+		return ""
+	}
+	prev := ""
+	for _, l := range labs {
+		if l.Stage == stage {
+			if prev == "" {
+				return ""
+			}
+			if _, done := cs.Verified[prev]; done {
+				return prev
+			}
+			return ""
+		}
+		if l.Live {
+			prev = l.Stage
+		}
+	}
+	return ""
+}
+
 // ── bare `sboot` ────────────────────────────────────────────────────────────────
 
 func runStatus(jsonOut bool) int {
