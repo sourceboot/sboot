@@ -15,10 +15,18 @@
 // EVIDENCE IS REUSED, NEVER RE-DERIVED. Everything attached to the question
 // comes from the same place `sboot hint` reads — state.json's record of the last
 // LOCAL run (state.go: "test writes, hint reads"): which checks failed, in
-// verdict order, the score, and — when a run never reached a check at all — why.
-// There is deliberately no second opinion here: re-parsing serial output or
-// re-running the grader would let `explain` describe a failure `test` never
-// reported.
+// verdict order, the score, the VERBATIM failure block the target check printed
+// (state.go Evidence — the same bytes the hint ladder's selectors read), and —
+// when a run never reached a check at all — why. There is deliberately no second
+// opinion here: re-parsing serial output or re-running the grader would let
+// `explain` describe a failure `test` never reported.
+//
+// R2-1 (round-2 dogfood 2026-08-25): the failure block itself was NOT attached —
+// only the check ids and the score were — so 2/2 live `--here` sessions opened by
+// asking the learner to paste the very output this comment claimed was carried.
+// The evidence now travels in the context block, and the endpoint's system prompt
+// (platform/ai/bundle.ts EXPLAIN_INSTRUCTIONS) tells the tutor it is there and
+// that asking for it again is wrong.
 //
 // WHAT IS NOT SENT: no source, no capture, no rubric. The CLI has no rubric to
 // leak (the private one never ships) and the chat already knows the lab from the
@@ -291,6 +299,7 @@ type explainEv struct {
 	graded         bool     // a run has produced a verdict for this stage
 	score          string   // "3/6", when the last local run recorded one
 	runError       string   // "build" / "toolchain:<tool>" — a run that graded nothing
+	observed       string   // the target check's verbatim failure block from the last run
 }
 
 func explainEvidence(st *guidanceState, course, stage, check string) explainEv {
@@ -302,6 +311,13 @@ func explainEvidence(st *guidanceState, course, stage, check string) explainEv {
 		// the umbrella suite does not swallow every question (dogfood F01-5).
 		ev.check = defaultHintTarget(ev.failing)
 		ev.checkDefaulted = true
+	}
+	if ev.check != "" {
+		// The failure block itself, verbatim — what the check printed on the last
+		// graded run (state.go Evidence, ≤2 KB by construction). This is the R2-1
+		// fix: without these bytes the tutor's only correct first move was to ask
+		// for them, which is exactly what both live round-2 sessions did.
+		ev.observed = st.evidence(course, stage, ev.check)
 	}
 	return ev
 }
@@ -330,6 +346,15 @@ func explainMessage(stage string, ev explainEv, question string) string {
 			out = append(out, "- failing checks, in order: "+strings.Join(ev.failing, ", "))
 		} else {
 			out = append(out, "- every check passed on my last run")
+		}
+		if ev.observed != "" {
+			// Fenced so multi-line assert output survives as one block. The tutor's
+			// system prompt names this section verbatim ("what the failing check
+			// printed"), so the wording here is part of the CLI↔platform contract —
+			// change both together or the model stops being told it has evidence.
+			out = append(out,
+				"- what the failing check printed on my last run (verbatim):",
+				"", "```", strings.TrimRight(ev.observed, "\n"), "```")
 		}
 	}
 	return strings.Join(out, "\n")

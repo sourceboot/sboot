@@ -1014,6 +1014,25 @@ func siteURL() string {
 	return u
 }
 
+// submissionLink is the ONE way a submit verdict points at its own row's page:
+// the server's review_url when it sent one, else the stage page's ?submission=
+// deep link built on the API origin. R2R-7 (round-2 dogfood 2026-08-25) — the
+// pass and fail paths built this two different ways, and the fail path used
+// siteURL(), whose loopback→public-site fallback is right for a README a
+// stranger reads and exactly wrong here: against a local platform it printed a
+// production URL for a submission that exists only in the local DB. The row
+// lives on the deployment this binary just talked to, so the fallback derives
+// from apiURL(), the same origin the row was created on.
+func submissionLink(reviewURL, course, stage, id string) string {
+	if reviewURL != "" {
+		return reviewURL
+	}
+	if id == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/courses/%s/stages/%s?submission=%s#review", apiURL(), course, stage, id)
+}
+
 func authedRequest(method, url string, body io.Reader) (*http.Request, error) {
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
@@ -1453,7 +1472,9 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		// runs unchanged — the fallback the append-only rule requires.
 		if created.ReviewURL != "" {
 			fmt.Fprintf(vw, "\n  ✅ official grade: %d/%d — recorded\n", deref(created.Score), deref(created.MaxScore))
-			fmt.Fprintf(vw, "  Submitted → %s\n", created.ReviewURL)
+			// Through the same submissionLink the fail path uses (R2R-7): with a
+			// ReviewURL present it IS the server's URL — one mechanism, both verdicts.
+			fmt.Fprintf(vw, "  Submitted → %s\n", submissionLink(created.ReviewURL, course, stage, created.ID))
 			fmt.Fprintln(vw, "  read your review, then press Complete there — that's what finishes the lab")
 			return 0
 		}
@@ -1490,13 +1511,11 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		// one who most needs the web review/Stuck? surface, and was the one who
 		// got no link. The row exists (a failed submission is deep-linkable on
 		// the stage page's stepper by id); the server only sends `review_url` on
-		// a pass, so when it sent none the same page's URL is built from what
-		// this side already knows.
-		if link := created.ReviewURL; link != "" || created.ID != "" {
-			if link == "" {
-				link = fmt.Sprintf("%s/courses/%s/stages/%s?submission=%s#review",
-					siteURL(), course, stage, created.ID)
-			}
+		// a pass, so when it sent none submissionLink builds the same page's URL
+		// from what this side already knows — on the API origin, the deployment
+		// that holds the row (R2R-7: this used to be siteURL(), which pointed a
+		// local dev's failure at a production page that could not exist).
+		if link := submissionLink(created.ReviewURL, course, stage, created.ID); link != "" {
 			fmt.Fprintf(vw, "  Recorded → %s\n", link)
 			fmt.Fprintln(vw, "  this run and its evidence are on that page — its Stuck? panel picks up from here")
 		}

@@ -681,8 +681,16 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 		switch {
 		case done && isWelcomeLab(l.Stage):
 			// The welcome lab's ✓ row is quiet (the mock's dim register): done,
-			// permanent, outside the numerators — never the headline.
-			fmt.Printf("  %s\n", p(ansiDim, padTo(label, width)+"✓ verified"))
+			// permanent, outside the numerators — never the headline. Quiet, not
+			// scoreless (R2-4, round-2 dogfood; same family as rust-core R1-9):
+			// this row alone dropped its n/n while every row under it showed one,
+			// which reads as a difference in KIND that does not exist — the server
+			// records the welcome lab's official score like any other's.
+			v := "✓ verified"
+			if score := cs.Verified[l.Stage]; score != "" {
+				v += " " + score
+			}
+			fmt.Printf("  %s\n", p(ansiDim, padTo(label, width)+v))
 		case done:
 			score := cs.Verified[l.Stage]
 			v := "✓ verified"

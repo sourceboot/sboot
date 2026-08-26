@@ -165,6 +165,17 @@ func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderR
 	if jsonMode {
 		cmd.Stdout = os.Stderr
 	}
+	// R2-4 (round-2 dogfood 2026-08-25): OUR OWN banner opens the build, so the
+	// stream's first line is never cargo's. The paragraph above stands — the
+	// inherited stream is deliberately unfiltered, and cargo's "Compiling …
+	// (<staged path>)" status was therefore the FIRST output a brand-new learner
+	// ever read (lab 00, first `sboot test`), staged `os/` spelling and all. A
+	// preface costs no pipe and no TTY: one line, printed before the child owns
+	// the terminal, naming what is happening in the course's own tree spelling
+	// (retreeText — a no-op for os-tree courses, so their bytes are unchanged
+	// beyond this line's addition).
+	fmt.Fprintf(os.Stderr, "── build: `%s` — your toolchain's own output follows\n",
+		retreeText(strings.Join(build, " "), runDir, tree))
 	if err := cmd.Run(); err != nil {
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) {
