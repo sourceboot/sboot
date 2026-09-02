@@ -1,4 +1,4 @@
-// The display-side answer to the staged tree name (rust-start dogfood F00-1,
+// The display-side answer to the staged tree name (rust-for-beginners dogfood F00-1,
 // 2026-08-24; ledger G54).
 //
 // Inside the grader's staging root the learner's tree is ALWAYS spelled `os`

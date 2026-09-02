@@ -91,7 +91,7 @@ func TestStateKeyedByCourseAndStage(t *testing.T) {
 	if got := st.tierSpec("os-rust", "00-env-setup"); got != "" {
 		t.Errorf("a different stage must not inherit the escalation, got %q", got)
 	}
-	if got := st.tierSpec("kv-store", "02-boot"); got != "" {
+	if got := st.tierSpec("key-value-store", "02-boot"); got != "" {
 		t.Errorf("a different course must not inherit the escalation, got %q", got)
 	}
 }

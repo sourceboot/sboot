@@ -102,7 +102,7 @@ func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderR
 	// on stderr; exit 2 is a usage error, not a grade.
 	//
 	// `--grader` (2026-08-13) additionally asks for the lab's OWN build/artifact
-	// (os2-rust builds a different image per lab). An older cached engine rejects
+	// (kernel-in-rust builds a different image per lab). An older cached engine rejects
 	// the flag with exit 2, so on any exit failure the resolve is retried without
 	// it: a real refusal (unknown lab, unreadable rubric) fails identically both
 	// times and its message reaches the learner once, from the retry, while an

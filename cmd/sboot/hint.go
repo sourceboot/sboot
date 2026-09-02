@@ -7,7 +7,7 @@
 // needed here — what remains is one monotonic per-check marker ("highest rung
 // revealed"), which doubles as the `[hint N of M]` display. The live os-rust
 // course keeps its v1 mechanism untouched; this verb is the v2 surface every
-// new course (os2-rust first) uses.
+// new course (kernel-in-rust first) uses.
 //
 //	sboot hint <stage>              the first currently-failing check's next rung
 //	sboot hint <stage> <check-id>   a specific check's next rung
@@ -18,7 +18,7 @@
 // (state.go LastFailed — "test writes, hint reads"); the rung marker is
 // state.json's hint_rungs. Fully offline: nothing here talks to any server.
 //
-// Ported from content/courses/os2-rust/proto/hint.py, with three deliberate
+// Ported from content/courses/kernel-in-rust/proto/hint.py, with three deliberate
 // divergences: (1) the failing set comes from the recorded verdict rather than
 // a KTAP transcript — the CLI already has the engine's per-check results, so
 // re-parsing serial output would be a second opinion about what failed; (2) the
@@ -275,8 +275,8 @@ func renderHint(stage, checkID string, e hintEntry, rung int, observed, stuckURL
 	// Past the authored ladder: keep pointing at real next moves — the learner's
 	// own evidence, then the same #stuck page.
 	// COURSE-NEUTRAL, deliberately: "the first byte or pixel that diverged" was
-	// os2-rust's framebuffer talking, printed to every course by a message that
-	// belongs to none of them (dogfood F01-6 — `rust-core` has no pixels, and its
+	// kernel-in-rust's framebuffer talking, printed to every course by a message that
+	// belongs to none of them (dogfood F01-6 — `rust-for-systems` has no pixels, and its
 	// evidence is an assert_eq! diff). What every check's evidence does have is a
 	// thing it looked for and a thing it found.
 	return fmt.Sprintf(

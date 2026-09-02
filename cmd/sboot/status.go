@@ -682,7 +682,7 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 		case done && isWelcomeLab(l.Stage):
 			// The welcome lab's ✓ row is quiet (the mock's dim register): done,
 			// permanent, outside the numerators — never the headline. Quiet, not
-			// scoreless (R2-4, round-2 dogfood; same family as rust-core R1-9):
+			// scoreless (R2-4, round-2 dogfood; same family as rust-for-systems R1-9):
 			// this row alone dropped its n/n while every row under it showed one,
 			// which reads as a difference in KIND that does not exist — the server
 			// records the welcome lab's official score like any other's.

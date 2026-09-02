@@ -112,6 +112,11 @@ type specManifest struct {
 	Grader specGrader `json:"grader"`
 	Labs   []specLab  `json:"labs"`
 	Err    string     `json:"error"`
+	// Set only on a 410: this course id was RETIRED, and this is what it became
+	// (platform lib/api-gate.ts renamedResponse). Append-only like every other
+	// field here — an older platform never sends it, and "" means "not a rename",
+	// which is exactly the behaviour this binary had before the field existed.
+	RenamedTo string `json:"renamed_to"`
 }
 
 // specGrader mirrors the platform's `Grader` interface (platform/lib/content.ts).
@@ -186,7 +191,7 @@ const judgeName = "sboot-judge"
 // here. Keys on the LICENCE, which is the one file every such bundle carries
 // whatever the course: scripts/build-workspace-template.sh always writes it.
 //
-// It used to key on `xtask/`, which stopped being universal on 2026-08-02 — os-c
+// It used to key on `xtask/`, which stopped being universal on 2026-08-02 — kernel-in-c
 // builds with a Makefile in the learner's own `os/`, so its tooling bundle is the
 // LICENCE and nothing else. Keying on xtask/ would have made that course
 // permanently "not cached": every command would refetch, every fetch would succeed,
@@ -443,7 +448,7 @@ func fetchManifest(course string) (*specManifest, error) {
 		if msg == "" {
 			msg = "unexpected response"
 		}
-		return nil, &apiError{status: resp.StatusCode, msg: msg}
+		return nil, &apiError{status: resp.StatusCode, msg: msg, renamedTo: m.RenamedTo}
 	}
 	return &m, nil
 }
@@ -597,6 +602,23 @@ func ensureSpec(course, stage string) (spec, error) {
 
 	m, err := fetchManifest(course)
 	if err != nil {
+		// THE SECOND BRANCH THAT DOES NOT FAIL OPEN (2026-09-01), and it has to sit
+		// ABOVE the fail-open rather than beside it. The rule below is "a cached
+		// spec beats a network problem", and a rename is not a network problem: the
+		// platform answered, and the answer was that this workspace is pointed at an
+		// id that no longer exists. Falling back to the cache there is the WORST
+		// available outcome — the learner keeps grading against frozen tests, forever,
+		// with the reason on a debugf line nobody reads, while `sboot submit` files
+		// rows the judge refuses. So a rename is reported by name, once, and the fix
+		// is one line of sboot.toml.
+		//
+		// Structural, not textual: the platform says `renamed_to`, so this never has
+		// to match on an error string. An older platform sends nothing and this
+		// branch cannot fire.
+		var re *apiError
+		if errors.As(err, &re) && re.renamedTo != "" {
+			return spec{}, fmt.Errorf("%s", re.msg)
+		}
 		// FAIL OPEN. Losing the freshness check costs a warning; refusing to grade
 		// because a laptop is on a plane costs the product's offline promise.
 		if haveLab {
@@ -866,7 +888,7 @@ func prefetchLab(course, stage string) {
 //	├── os -> <repo>/os                            ← symlink to their live tree
 //	└── build/                                     ← disk.img and friends
 //
-// Each staged item is optional, and for os-c all of them but `labs/` are absent: its
+// Each staged item is optional, and for kernel-in-c all of them but `labs/` are absent: its
 // build is `make -C os`, whose artifact lands in `os/build/` inside the learner's own
 // tree. Same root, same symlink, no Rust.
 //

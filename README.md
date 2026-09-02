@@ -1,6 +1,8 @@
 # sboot
 
-The command-line tool for a learning Rust and Python.
+The command-line tool for [SourceBoot](https://sourceboot.com) — a learn-by-building
+platform where you write real systems (an operating system, a database, a distributed
+messenger) rather than watching someone else write them.
 
 `sboot` is how you work: it sets up a lab, runs the tests **on your machine**, and
 submits a run for an official grade.

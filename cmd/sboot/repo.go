@@ -68,7 +68,7 @@ type repo struct {
 // a repo. A course names its own with `tree:` in course.yaml, which reaches the client
 // on the spec manifest and is written into sboot.toml by `sboot start`.
 //
-// Added 2026-08-18 for `rust-core`, which reads SQLite files: shipping a learner a
+// Added 2026-08-18 for `rust-for-systems`, which reads SQLite files: shipping a learner a
 // top-level `os/` holding a database reader — and an error message naming `os/` in a
 // course with no operating system in it — was the kind of detail that reads as
 // carelessness. It is now-or-never by nature: once a learner has pushed the repo, the
@@ -107,7 +107,7 @@ const stagedTree = "os"
 // becomes `--manifest-path db/Cargo.toml` for a course whose tree is `db`.
 //
 // A NO-OP for every course that keeps the default tree, by the first line — which
-// is what makes it impossible for this to change what os-rust, os-c or os2-rust
+// is what makes it impossible for this to change what os-rust, kernel-in-c or kernel-in-rust
 // print. The rewrite is per argv token (`-C os`, `--manifest-path os/…`,
 // `--manifest-path=os/…`) rather than a substring replace, so a word that merely
 // contains "os" is left alone.
@@ -148,7 +148,7 @@ func retree(token, tree string) string {
 //
 // It decides two learner-facing claims that used to be unconditional: whether the
 // generated README tells them to install an emulator, and whether what their tree
-// holds may be called a kernel (dogfood F00-2/3, 2026-08-19 — `rust-core` was told
+// holds may be called a kernel (dogfood F00-2/3, 2026-08-19 — `rust-for-systems` was told
 // to install `qemu-system-x86_64` for a course whose own lesson says "no assembler,
 // no emulator, no C compiler").
 func courseBoots(course string) bool { return courseGrader(course).Capture != "cmd" }
@@ -383,15 +383,15 @@ build/
 //
 // It used to sniff the scaffold's files: any repo with a rust-toolchain.toml got
 // "cd os/kernel && cargo build --release … you need a nightly Rust toolchain".
-// For os2-rust every word of that is false — stable Rust, built by `cargo xtask`
+// For kernel-in-rust every word of that is false — stable Rust, built by `cargo xtask`
 // as one workspace — and the README is the most visible file the learner has:
 // the whole point of the learner-owned repo is that it reads like their work,
 // not like a template nobody looked at. The build command cannot lie the way a
 // file sniff can, because it is literally what grades the repo.
 //
 // The two known course shapes keep their existing text VERBATIM, keyed on the
-// course id AND its exact resolved command (os-rust's default and os-c's
-// `make -C os`). The command alone is not enough: os2-rust's course-level
+// course id AND its exact resolved command (os-rust's default and kernel-in-c's
+// `make -C os`). The command alone is not enough: kernel-in-rust's course-level
 // fallback is ALSO `cargo xtask build`, and its repo is stable Rust with the
 // workspace at `os/`, so the os-rust text ("nightly", `cd os/kernel && cargo
 // build --release`) would be false in every particular. Anything not matching
@@ -423,7 +423,7 @@ fresh clone:
 You need a nightly Rust toolchain (rustup installs the pinned one from that file),
 plus ` + "`nasm`" + ` and ` + "`qemu-system-x86_64`" + `.
 `
-	case course == "os-c" && build == "make -C os": // text unchanged
+	case course == "kernel-in-c" && build == "make -C os": // text unchanged
 		return `## Build it
 
 A plain build works on a fresh clone, with no course tooling installed:

@@ -124,7 +124,7 @@ func runReveal(r repo, stage string, yes bool) int {
 	}
 	fmt.Println(renderRevealFiles(stage, served, resp.Files))
 	if served == stepSkeleton && revealFilesContain(resp.Files, "todo!(") {
-		// F04-1 (rust-start dogfood 2026-08-24): `todo!()` is a construct no
+		// F04-1 (rust-for-beginners dogfood 2026-08-24): `todo!()` is a construct no
 		// course teaches before a learner meets it HERE, in their first skeleton
 		// — and this course's audience will wonder whether they were supposed to
 		// know it. One line, printed only when the served files actually use it,

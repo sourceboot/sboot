@@ -740,6 +740,12 @@ func pkgInstall(pkg string) string {
 type apiError struct {
 	status int
 	msg    string
+	// The course id this one was RENAMED to, from the platform's `renamed_to`
+	// field (410 Gone; lib/api-gate.ts renamedResponse, 2026-09-01). Empty on
+	// every other refusal, and empty against any platform that predates the
+	// field — which is what makes it safe to branch on: an absent value reads as
+	// "not a rename", the behaviour this binary had before.
+	renamedTo string
 }
 
 func (e *apiError) Error() string { return fmt.Sprintf("%s (HTTP %d)", e.msg, e.status) }
@@ -1297,7 +1303,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	}
 
 	// "one run", not "one boot": since the command capture (2026-08-13) a course
-	// may have nothing to boot — rust-primer's evidence is `cargo test` — and this
+	// may have nothing to boot — rust-for-kernels's evidence is `cargo test` — and this
 	// line is printed for every course. The boot IS the run for the OS courses.
 	// Progress narration goes to stderr (§12.2 rule 3): stdout is for the verdict.
 	fmt.Fprintf(os.Stderr, "── checking %s locally first (one build, one run)\n", stage)
@@ -1505,7 +1511,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		return 0
 	case "failed":
 		fmt.Fprintf(vw, "\n  ❌ official grade: %d/%d\n", deref(created.Score), deref(created.MaxScore))
-		// F06-2 (rust-start dogfood 2026-08-24): the failing verdict gets the
+		// F06-2 (rust-for-beginners dogfood 2026-08-24): the failing verdict gets the
 		// same pointer a passing one gets. The learner who just recorded a
 		// failure on purpose — possibly because they suspect the grader — is the
 		// one who most needs the web review/Stuck? surface, and was the one who
@@ -1617,7 +1623,8 @@ func submitPreflight(course, stage string) *apiError {
 	}
 	defer resp.Body.Close()
 	var r struct {
-		Err string `json:"error"`
+		Err       string `json:"error"`
+		RenamedTo string `json:"renamed_to"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&r)
 	switch resp.StatusCode {
@@ -1626,6 +1633,24 @@ func submitPreflight(course, stage string) *apiError {
 			r.Err = "refused"
 		}
 		return &apiError{status: resp.StatusCode, msg: r.Err}
+	case http.StatusGone:
+		// A RENAMED COURSE (410 Gone, lib/api-gate.ts renamedResponse). On this route
+		// it can mean nothing else: the workspace's `course = "…"` names an id that
+		// was retired, and the platform has named its successor. Refusing here is the
+		// whole value of the preflight — the POST says the same sentence, but only
+		// after the gate has spent a build and a boot on tests that are frozen.
+		//
+		// Structural like harness/cache.go's branch: `renamed_to` is what decides, so
+		// the two ends are never coupled through prose. An older platform sends no
+		// such body on this route and cannot reach this case with either field set,
+		// which keeps the "deliberately permissive" promise above intact.
+		if r.RenamedTo != "" || r.Err != "" {
+			msg := r.Err
+			if msg == "" {
+				msg = fmt.Sprintf("this course was renamed to %q — edit course = %q in your workspace's sboot.toml", r.RenamedTo, r.RenamedTo)
+			}
+			return &apiError{status: resp.StatusCode, msg: msg, renamedTo: r.RenamedTo}
+		}
 	case http.StatusNotFound:
 		// 404 is ambiguous in a way the others are not: it is our "unknown course or
 		// stage", but it is also what some deployments answer for a route that has no
@@ -1783,7 +1808,7 @@ func runStart(course string, yes bool) {
 	abs, _ := filepath.Abs(dest)
 	fmt.Printf("\n── your workspace is ready: %s\n", abs)
 	// The tree name and what it holds both come from the course (dogfood F00-1):
-	// `rust-core` unpacks a `db/` holding a SQLite reader, and was told `os/ is
+	// `rust-for-systems` unpacks a `db/` holding a SQLite reader, and was told `os/ is
 	// yours` and that publishing it publishes a kernel it does not have.
 	fmt.Printf("   %s/ is yours. sboot.toml says which course this is.\n", treeOr(specTree))
 	fmt.Printf("   Our tests and grader are NOT in here — they live in the %s data dir,\n", brandName)
