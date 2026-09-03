@@ -883,7 +883,11 @@ func runWhere() int {
 	}
 	fmt.Printf("course   %s\n", r.course)
 	fmt.Printf("repo     %s\n", r.dir)
-	fmt.Printf("         └─ your code. This is the git repo — nothing of ours is in it.\n")
+	state := repoStateLines(r.dir)
+	fmt.Printf("         └─ %s\n", state[0])
+	for _, line := range state[1:] {
+		fmt.Printf("            %s\n", line)
+	}
 
 	s, ok := cachedSpec(r.course)
 	if !ok {
@@ -937,6 +941,31 @@ func runWhere() int {
 		fmt.Printf("state    %s\n", filepath.Join(dir, "state.json"))
 	}
 	return 0
+}
+
+// repoStateLines describes what the directory above actually IS, in the three
+// states it can be in — a second line only where one earns its place.
+//
+// It said "This is the git repo" unconditionally until 2026-09-03, including on
+// the macOS lap's workspace where `git init` had failed and there was no repo at
+// all (G163). `where` exists to answer honestly — it is the command someone runs
+// when they are already confused about which directory holds what — so a line
+// that asserts a repo it never checked for is the one thing it cannot afford.
+//
+// The half that never changes is the half the split is about: nothing of ours is
+// in this directory, repo or not.
+func repoStateLines(dir string) []string {
+	const ours = "nothing of ours is in it"
+	if !isDir(filepath.Join(dir, ".git")) {
+		return []string{
+			"your code — no git repo here yet, and " + ours + " either way.",
+			"`sboot repo` makes one when you want it.",
+		}
+	}
+	if !gitHasHead(dir) {
+		return []string{"your code, in a git repo with no commit yet — " + ours + "."}
+	}
+	return []string{"your code. This is the git repo — " + ours + "."}
 }
 
 // ── fetch: download tests deliberately, rather than as a side effect ─────────────
@@ -1989,14 +2018,10 @@ func runStart(course, dirFlag string, yes bool) {
 	saveQuietly(st)
 
 	// The LOCAL repo — git init, identity, first commit. Nothing here can reach
-	// GitHub, and the one line below is the only thing that names it.
+	// GitHub, and the one line localRepoStep ends on is the only thing that names it.
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "── your history starts here")
-	if err := ensureLocalRepo(os.Stderr, abs, course, yes); err != nil {
-		fmt.Fprintf(os.Stderr, "   %v\n", err)
-		fmt.Fprintln(os.Stderr, "   nothing here blocks the course — the files are on disk either way.")
-	}
-	fmt.Fprintf(os.Stderr, "   when you want it on GitHub: %s\n", painter(os.Stderr)(ansiGreen, "sboot repo"))
+	localRepoStep(os.Stderr, abs, course, yes)
 
 	printFirstLab(course, dest, firstStage, firstTitle)
 }
@@ -2057,12 +2082,7 @@ func repairStart(course, dest, title, firstStage, firstTitle, specTree string, y
 		}
 		fmt.Println("   your own files were not touched — only what was absent came back.")
 	}
-	if err := ensureLocalRepo(os.Stderr, abs, course, yes); err != nil {
-		fmt.Fprintf(os.Stderr, "   %v\n", err)
-	}
-	if _, ok := existingRemote(abs); !ok {
-		fmt.Fprintf(os.Stderr, "   when you want it on GitHub: %s\n", painter(os.Stderr)(ansiGreen, "sboot repo"))
-	}
+	localRepoStep(os.Stderr, abs, course, yes)
 	printFirstLab(course, dest, firstStage, firstTitle)
 }
 

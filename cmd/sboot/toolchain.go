@@ -98,6 +98,42 @@ func missingLinker(goos, buildOut string) bool {
 	return false
 }
 
+// missingDevTools reports whether a command's OWN output is macOS saying the
+// Command Line Tools are not installed.
+//
+// SAME SIGNATURES AS THE BUILD CASE, deliberately (2026-09-03 macOS lap): on a
+// Mac with no developer tools, `git`, `cc`, `clang` and `make` are all the same
+// install-on-demand shim, so the note that means "no linker" inside a cargo
+// build is the note that means "no git" inside `sboot start` — one package, one
+// remedy, one signature list to keep current.
+//
+// Non-darwin is always false, and that is the rule rather than an omission: a
+// missing git on Linux or Windows is orthogonal to the compiler, so nothing
+// there may be answered with a toolchain install.
+func missingDevTools(goos, out string) bool {
+	return goos == "darwin" && missingLinker(goos, out)
+}
+
+// devToolsAbsent answers the same question BEFORE a doomed command is run, which
+// on macOS is the only way to know: `exec.LookPath("git")` succeeds against the
+// shim, so the PATH proves nothing. `xcode-select -p` exits non-zero with
+// "Unable to get active developer directory" when the Tools are absent
+// (MEASURED — the 2026-09-02 lap's baseline, exit 2) and prints the developer
+// directory when they are there.
+//
+// FAILS OPEN in the one case it cannot read: /usr/bin/xcode-select is part of
+// macOS, so its absence from PATH is not evidence about the Tools — we say
+// nothing and let missingDevTools classify what the command itself prints.
+func devToolsAbsent(goos string) bool {
+	if goos != "darwin" {
+		return false
+	}
+	if _, err := exec.LookPath("xcode-select"); err != nil {
+		return false
+	}
+	return exec.Command("xcode-select", "-p").Run() != nil
+}
+
 // linkerHint is what to say and what to type, per OS. Two lines of explanation
 // (why a Rust install is not enough) and then the command — the shape
 // `pkgInstall("gh")` already has, and the sizes are the ones the laps measured on

@@ -149,6 +149,12 @@ func runRepo(yes bool, name string) int {
 
 	url, err := createAndPush(out, r.dir, r.course, repo, yes)
 	if err != nil {
+		// The Command Line Tools remedy is already printed, and it is the whole
+		// answer — "fix the above and re-run" would be a second instruction over
+		// an install that has to finish first.
+		if errors.Is(err, errDevTools) {
+			return 2
+		}
 		fmt.Fprintf(out, "sboot: %v\n", err)
 		fmt.Fprintln(out, "sboot: fix the above and re-run `sboot repo` — nothing here blocks the course.")
 		return 1
@@ -215,7 +221,7 @@ func printManualRail(out *os.File, dir, repo string) {
 // local repo with a commit in it, then let gh create the private repo and push.
 // The summary line names exactly the steps that will run.
 func createAndPush(out *os.File, dir, course, repo string, yes bool) (string, error) {
-	if err := ensureLocalRepo(out, dir, course, yes); err != nil {
+	if err := ensureLocalRepo(out, dir, course, yes, "sboot repo"); err != nil {
 		return "", err
 	}
 	// ensureLocalRepo leaves the commit UNDONE when git has no identity to make it
@@ -246,6 +252,72 @@ func createAndPush(out *os.File, dir, course, repo string, yes bool) (string, er
 
 // ── the LOCAL repo: what `sboot start` makes, before GitHub is a question ───────
 
+// errDevTools is an ANSWER, not a failure to report: by the time it is returned
+// the Command Line Tools remedy has already been printed, and the caller's whole
+// job is to not talk over it. Compared with errors.Is, never rendered.
+var errDevTools = errors.New("this Mac has no Command Line Tools, so git cannot run")
+
+// localRepoStep is the whole `── your history starts here` step — the local repo,
+// and then the ONE true thing about what happened. Both `start` paths call it, so
+// the fresh run and the repair cannot drift.
+//
+// THE TWO SENTENCES ARE CONDITIONAL, and that is the 2026-09-03 macOS lap's
+// finding (G161): "nothing here blocks the course" is FALSE on a Mac whose git is
+// missing, because the missing git and the missing linker are the same package —
+// the first build stops at the same place. And `sboot repo` is a nudge toward a
+// command that would refuse for exactly the same reason. On Linux and Windows a
+// missing git stays orthogonal to the toolchain and both lines are true, so both
+// still print.
+func localRepoStep(out *os.File, dir, course string, yes bool) {
+	err := ensureLocalRepo(out, dir, course, yes, "sboot start "+course)
+	if errors.Is(err, errDevTools) {
+		return
+	}
+	if err != nil {
+		fmt.Fprintf(out, "   %v\n", err)
+		fmt.Fprintln(out, "   nothing here blocks the course — the files are on disk either way.")
+	}
+	if _, ok := existingRemote(dir); !ok {
+		fmt.Fprintf(out, "   when you want it on GitHub: %s\n", painter(out)(ansiGreen, "sboot repo"))
+	}
+}
+
+// printDevToolsTodo is what a Mac with no Command Line Tools gets instead of a
+// note it cannot act on.
+//
+// WHAT SHIPPED BEFORE THIS (macos lap, sboot-v0.12.0): `/usr/bin/git` is Apple's
+// install-on-demand SHIM, so the `exec.LookPath("git")` gate passed on a machine
+// with no git at all, and `git init` then failed with
+// `xcode-select: note: No developer tools were found, requesting install.` —
+// which `sboot start` printed verbatim as "git init failed: <that>". A learner
+// three minutes into their first course was handed the operating system's own
+// half-sentence, with no command to run.
+//
+// `retry` is the command that brought them here, so the sentence names the thing
+// they already typed rather than a second one to learn.
+func printDevToolsTodo(out *os.File, retry string) {
+	fmt.Fprintln(out, "   git here is Apple's, and this Mac has no Command Line Tools yet — so it cannot run:")
+	// The same line, and the same measured size, as the missing-linker rung in
+	// toolchain.go: it is one install, so it must read as one install.
+	fmt.Fprintf(out, "     %s     # ~900 MB, once per machine; click through the dialog\n", pkgInstall("build-essential"))
+	// Wrapped by hand at ~85 columns, like the rest of this command's narration.
+	fmt.Fprintf(out, "   when it finishes, run `%s` again here — it keeps your\n", retry)
+	fmt.Fprintln(out, "   files and only adds the repository.")
+	fmt.Fprintln(out, "   your files are already on disk, but the course does need that install too: Rust")
+	fmt.Fprintln(out, "   hands your code to the same tools to link it, so the first build stops here too.")
+}
+
+// gitFailed turns a git command that failed into the answer the reader can act
+// on: on a Mac with no developer tools EVERY git command fails with the same
+// note, and the remedy is the install — not the note.
+func gitFailed(out *os.File, what string, b []byte, err error, retry string) error {
+	if missingDevTools(hostOS, string(b)) {
+		printDevToolsTodo(out, retry)
+		return errDevTools
+	}
+	return fmt.Errorf("%s failed: %s", what, firstLine(b, err))
+}
+
 // ensureLocalRepo makes `dir` a git repository with at least one commit in it.
 //
 // Called by `sboot start` (where it is the whole GitHub-free half of P-21) and by
@@ -258,18 +330,25 @@ func createAndPush(out *os.File, dir, course, repo string, yes bool) (string, er
 // commit undone, because the alternative — committing under git's guess — is what
 // stamped `you@<hostname>.local` on the founder's own first commit (P-13), in a
 // repo built to be shown to people.
-func ensureLocalRepo(out *os.File, dir, course string, yes bool) error {
+func ensureLocalRepo(out *os.File, dir, course string, yes bool, retry string) error {
 	if _, err := exec.LookPath("git"); err != nil {
 		fmt.Fprintf(out, "   git is not installed — %s\n", pkgInstall("git"))
 		fmt.Fprintln(out, "   install it, then `sboot repo` makes the repo and pushes it.")
 		return nil
+	}
+	// The shim, caught before a doomed command runs: on macOS the check above
+	// passes whether or not there is a git behind /usr/bin/git, and `xcode-select
+	// -p` is the cheap question that actually answers it.
+	if devToolsAbsent(hostOS) {
+		printDevToolsTodo(out, retry)
+		return errDevTools
 	}
 	if !isDir(filepath.Join(dir, ".git")) {
 		if b, err := gitRun(dir, "init", "-q", "-b", "main"); err != nil {
 			// `-b main` needs git ≥ 2.28; retry without it rather than refuse on an
 			// older git, which is the whole reason this is not one call.
 			if b2, err2 := gitRun(dir, "init", "-q"); err2 != nil {
-				return fmt.Errorf("git init failed: %s", firstLine(append(b, b2...), err))
+				return gitFailed(out, "git init", append(b, b2...), err, retry)
 			}
 		}
 		fmt.Fprintf(out, "   git repo created in %s\n", filepath.Base(dir))
@@ -286,10 +365,10 @@ func ensureLocalRepo(out *os.File, dir, course string, yes bool) error {
 		return nil
 	}
 	if b, err := gitRun(dir, "add", "-A"); err != nil {
-		return fmt.Errorf("git add failed: %s", firstLine(b, err))
+		return gitFailed(out, "git add", b, err, retry)
 	}
 	if b, err := gitRun(dir, "commit", "-q", "-m", "start "+course); err != nil {
-		return fmt.Errorf("git commit failed: %s", firstLine(b, err))
+		return gitFailed(out, "git commit", b, err, retry)
 	}
 	fmt.Fprintf(out, "   first commit made as %s <%s>\n", name, email)
 	return nil
@@ -388,6 +467,15 @@ func nudgeKey(course string) string { return "repo/" + course }
 //
 // It says nothing at all when git is missing, when there is no repo yet, or when a
 // remote exists: a nudge toward a command that would refuse is noise.
+//
+// AND IT NEVER CLAIMS A COMMIT THAT DOES NOT EXIST (G162, the 2026-09-03 macOS
+// lap). `sboot start` leaves the first commit UNDONE when git has no identity to
+// make it under (P-13) — a real state, reached on that lap and on any machine
+// whose owner has never configured git — and this line was telling that learner
+// "your work is committed here" on every `sboot test`. It was wrong twice over:
+// the commit is the thing that has not happened, and `sboot repo` would refuse
+// with "nothing is committed yet" if they followed it. With a repo and no HEAD
+// the truthful line is the one that finishes the commit.
 func repoNudge(r repo, daily bool) {
 	if _, err := exec.LookPath("git"); err != nil {
 		return
@@ -407,6 +495,17 @@ func repoNudge(r repo, daily bool) {
 		saveQuietly(st)
 	}
 	p := painter(os.Stderr)
+	if !gitHasHead(r.dir) {
+		// Which of the two reasons it is decides which commands close it, and the
+		// identity one is the common case: it is the branch `start` takes.
+		if name, email := gitIdentity(r.dir); name == "" || email == "" {
+			printIdentityTodo(os.Stderr, r.dir, r.course)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "nothing is committed here yet — %s, then %s\n",
+			p(ansiGreen, "git add -A && git commit"), p(ansiGreen, "sboot repo"))
+		return
+	}
 	fmt.Fprintf(os.Stderr, "your work is committed here but has no home on GitHub yet — %s\n",
 		p(ansiGreen, "sboot repo"))
 }
