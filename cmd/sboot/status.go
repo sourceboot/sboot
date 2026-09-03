@@ -815,7 +815,10 @@ func outOfRepoStatus(st *guidanceState, jsonOut bool) int {
 	fmt.Println()
 	if len(cat) == 0 {
 		fmt.Printf("the catalog could not be reached — browse it at %s/courses\n\n", siteURL())
-		fmt.Printf("next:  %s        %s\n", p(ansiGreen, "sboot start <id>"), p(ansiDim, "# unpacks a course into ./<id>"))
+		// No folder is named here: since 2026-09-02 it is `<artifact>-sb` from the
+		// course's manifest, which this line has not fetched — and a folder name
+		// that is wrong for the front-door course is worse than none.
+		fmt.Printf("next:  %s        %s\n", p(ansiGreen, "sboot start <id>"), p(ansiDim, "# unpacks a course into its own folder"))
 		fmt.Printf("read:  %s/courses\n", siteURL())
 		return 0
 	}
@@ -828,7 +831,7 @@ func outOfRepoStatus(st *guidanceState, jsonOut bool) int {
 	}
 	fmt.Println()
 	first := firstLive(cat)
-	fmt.Printf("next:  %s        %s\n", p(ansiGreen, "sboot start "+first), p(ansiDim, "# unpacks the course into ./"+first))
+	fmt.Printf("next:  %s        %s\n", p(ansiGreen, "sboot start "+first), p(ansiDim, "# unpacks the course into its own folder"))
 	fmt.Printf("read:  %s/courses\n", siteURL())
 	return 0
 }
@@ -870,6 +873,36 @@ func courseColumns(cat []catalogCourse, started []string) (idW, titleW int) {
 	return idW + 3, titleW + 4
 }
 
+// freeLabel is what a course row says about its price, and it has THREE answers,
+// not one: *free course* when every live lab is free, *first N free* when some
+// are, and nothing at all when none are.
+//
+// The CLI printed `first 7 free` unconditionally on a course whose seven live labs
+// are all free (D-MACOS-8, macOS lap) — the "first N free" template implemented
+// without the branch the web has had since the free-course epoch (lib/catalog.ts
+// isFreeCourse / freeMarketedCount, 2026-09-01). It undersells the offer on the
+// one surface a learner is looking at while they work.
+//
+// Derived from the two numbers `/api/v1/courses` already sends, so no field was
+// added to an append-only API and a second free course needs no CLI release. `live`
+// is the MARKETED count on that route (a `00-*` setup lab sits outside it), which
+// is the same numerator the web's own derivation uses — the two cannot drift while
+// they read the same field.
+//
+// N is clamped to what is live, for the same reason the web clamps it: a manifest
+// whose free floor is wider than its published labs must never print a number a
+// learner cannot find labs for. A course with nothing live says nothing at all —
+// "free course" over an empty syllabus is a promise about nothing.
+func freeLabel(c catalogCourse) string {
+	if c.Live <= 0 || c.FreeStages <= 0 {
+		return ""
+	}
+	if c.FreeStages >= c.Live {
+		return "free course"
+	}
+	return fmt.Sprintf("first %d free", c.FreeStages)
+}
+
 // catalogRows renders catalog lines (minus `skip`), live ones bright, the rest
 // dim with their status — and reports whether any dim rows were left out of the
 // bright list's world (for the "(more in development …)" note). Widths come from
@@ -889,8 +922,8 @@ func catalogRows(p func(string, string) string, cat []catalogCourse, skip map[st
 			if c.Total > c.Live {
 				meta = fmt.Sprintf("%d of %d live", c.Live, c.Total)
 			}
-			if c.FreeStages > 0 {
-				meta += fmt.Sprintf(" · first %d free", c.FreeStages)
+			if label := freeLabel(c); label != "" {
+				meta += " · " + label
 			}
 			lines = append(lines, "  "+p(ansiAmber, padTo(c.ID, idW))+padTo(title, titleW)+meta)
 		} else {

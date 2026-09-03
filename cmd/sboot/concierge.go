@@ -1,20 +1,33 @@
-// The repo concierge — `sboot repo`, and the same offer inside `sboot start`
-// (ux-plan §11.j, ratified; the ux-v2 repo/start tiles are the copy of record).
+// Git and GitHub — the local repo `sboot start` makes, and the remote `sboot
+// repo` offers.
 //
-// The posture this extends and NEVER reverses is code-hosting Option D: we hold
-// zero credentials. Everything here runs on the learner's machine with gh's own
-// credential — `git init`, the first commit, `gh repo create --private --source
-// . --push`. The concierge's whole job is to CONVINCE while staying optional:
+// ── THE SPLIT (ratified 2026-09-02, P-21; the workspace-split design) ─────────
 //
-//	gh authed     → ONE confirm, then create + push, then the trust note
-//	gh unauthed   → offer `gh auth login` first, then the same one confirm
-//	no gh         → the two-minute path: a PREFILLED github.com/new link (every
-//	                learner has a GitHub account — it is the only sign-in), the
-//	                two git commands, and the gh install named as the smooth rail
-//	remote exists → a no-op that says so; it never touches an existing remote
+// Until now ONE command did both: `sboot start` unpacked the workspace and then,
+// if `gh` happened to be installed, offered to create and push a GitHub repo in
+// the same breath — and printed a manual rail when it was not. Three fresh-VM laps
+// and one founder's own run found every failure in the GitHub half, bolted onto
+// the one command a learner must run before anything works: the printed rail had
+// no `cd`, so the PARENT folder became the repo; it pushed over HTTPS without
+// saying GitHub rejects passwords; and the first commit carried whatever identity
+// git guessed (`you@hostname.local`).
 //
-// Prompts appear ONLY on a TTY and every one is bypassable with --yes (§12.2
-// rule 7). Declining costs nothing: `sboot repo` re-runs the offer any time.
+// So the boundary moved, not the posture:
+//
+//	sboot start   unpack · git init INSIDE the folder · identity · first commit
+//	              · one line naming `sboot repo`.  It cannot fail on GitHub,
+//	              because it never speaks to GitHub.
+//	sboot repo    the remote, and only the remote. gh drives it; the manual path
+//	              is a link to GitHub's own doc, not a tutorial of ours.
+//
+// THE POSTURE THIS NEVER REVERSES is code-hosting Option D: we hold zero
+// credentials. Everything here runs on the learner's machine with gh's own
+// credential — `git init`, the commits, `gh repo create --private --source .
+// --push`. Nothing in the course depends on any of it: grading reads the local
+// tree, so a learner who never runs `sboot repo` loses nothing but the portfolio.
+//
+// Prompts appear ONLY on a TTY and every one is bypassable with --yes (ux-plan
+// §12.2 rule 7). Declining costs nothing: `sboot repo` re-runs the offer any time.
 package main
 
 import (
@@ -26,11 +39,33 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 )
 
-// runRepo is the standalone verb: detect the machine's state, offer once.
-func runRepo(yes bool) int {
+// ghTokenDoc is the ONE link the manual path offers: GitHub's own page about the
+// credential a `git push` over HTTPS actually wants.
+//
+// Deliberately theirs and deliberately singular (P-9). We used to print
+// `git push -u origin main` with no word about auth, into an audience with no
+// token and no SSH key — GitHub rejects the password they will type, with a
+// message about "support for password authentication" they have no way to read.
+// Writing our own token walkthrough would date the moment GitHub moves a button,
+// and an SSH tutorial is a second credential system to teach; gh is the path we
+// explain, and this is the escape hatch for someone who declines it.
+//
+// FETCHED BEFORE IT SHIPPED, and it needed to be: the first spelling of this
+// constant — `keeping-your-account-secure` — 404s. GitHub renamed that path
+// segment to `keeping-your-account-and-data-secure`, and a 404 handed to someone
+// who has just been told "GitHub will ask for a token" is worse than saying
+// nothing, because it reads as the tool being wrong about the whole thing.
+// Verified 200 on 2026-09-03; re-check it whenever this line is edited.
+const ghTokenDoc = "https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens"
+
+// runRepo owns the remote: detect the machine's state, explain, offer once.
+//
+// `name` is the repo to create ("" = the course's own default, `<artifact>-sb`).
+func runRepo(yes bool, name string) int {
 	r, err := findRepo()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "sboot: no course workspace here — nothing to push.")
@@ -38,6 +73,10 @@ func runRepo(yes bool) int {
 		return 2
 	}
 	out := os.Stderr
+	repo := name
+	if repo == "" {
+		repo = repoName(r.course, courseArtifact(r.course))
+	}
 
 	if url, ok := existingRemote(r.dir); ok {
 		fmt.Fprintf(out, "remote already set → %s — nothing to create.\n", url)
@@ -51,22 +90,38 @@ func runRepo(yes bool) int {
 		return 2
 	}
 
+	// gh missing: the two offers, (a) install it or (b) do it by hand. The install
+	// itself is PRINTED, never run — every one of these needs sudo or an admin
+	// shell, and a CLI that shells out to a password prompt it does not own is a
+	// support case, not a convenience (P-8/P-15).
 	if _, err := exec.LookPath("gh"); err != nil {
-		printManualRail(out, r.dir, r.course)
+		fmt.Fprintf(out, "to put this on GitHub, %s uses GitHub's own CLI (`gh`) — it holds the login, we never do.\n", brandName)
+		fmt.Fprintln(out, "it is not installed here. two ways forward:")
+		fmt.Fprintln(out)
+		fmt.Fprintf(out, "  a) install it:  %s\n", ghInstallLine())
+		fmt.Fprintln(out, "     run that, then `sboot repo` again — it does the rest in one confirm.")
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "  b) do it by hand:")
+		printManualRail(out, r.dir, repo)
 		return 0
 	}
 
 	user, authed := ghAccount()
 	if !authed {
-		fmt.Fprintln(out, "gh detected — but it is not signed in yet.")
-		if yes || !interactiveTTY() {
-			fmt.Fprintln(out, "sign in first:  gh auth login   · then `sboot repo` finishes in one confirm.")
+		fmt.Fprintln(out, "gh is installed but not signed in — that is the one step only you can do.")
+		fmt.Fprintln(out, "`gh auth login` opens your browser and stores the credential on this machine.")
+		if !yes && !interactiveTTY() {
+			fmt.Fprintln(out, "run it from a terminal:  gh auth login   · then `sboot repo` finishes in one confirm.")
 			return 0
 		}
-		if !confirm(out, "run `gh auth login` now? [Y/n] ") {
+		if !yes && !confirm(out, "run `gh auth login` now? [Y/n] ") {
 			fmt.Fprintln(out, "── skipped. any time: gh auth login · then sboot repo")
 			return 0
 		}
+		// EXEC'd as a child with THIS terminal attached (P-15, ratified over
+		// printing it): gh is interactive, opens the browser itself and writes its
+		// own credential store, and telling this audience to "open another terminal"
+		// is where the flow was being lost.
 		login := exec.Command("gh", "auth", "login")
 		login.Stdin, login.Stdout, login.Stderr = os.Stdin, os.Stdout, os.Stderr
 		if err := login.Run(); err != nil {
@@ -81,17 +136,18 @@ func runRepo(yes bool) int {
 	}
 
 	fmt.Fprintf(out, "gh detected — authed as %s · no remote on this workspace yet\n", atUser(user))
+	fmt.Fprintf(out, "this creates ONE private repo in your account and pushes what you have — your code, your repo, our credential never involved.\n")
 	if !yes && !interactiveTTY() {
 		fmt.Fprintf(out, "re-run from a terminal (or with --yes) to confirm:\n")
-		fmt.Fprintf(out, "  create github.com/%s/%s (private) and push\n", userOrYou(user), r.course)
+		fmt.Fprintf(out, "  create github.com/%s/%s (private) and push\n", userOrYou(user), repo)
 		return 0
 	}
-	if !yes && !confirm(out, fmt.Sprintf("create github.com/%s/%s (private) and push? [Y/n] ", userOrYou(user), r.course)) {
-		fmt.Fprintf(out, "── skipped. any time: sboot repo · or DIY: https://github.com/new?name=%s\n", r.course)
+	if !yes && !confirm(out, fmt.Sprintf("create github.com/%s/%s (private) and push? [Y/n] ", userOrYou(user), repo)) {
+		fmt.Fprintf(out, "── skipped. any time: sboot repo · or DIY: https://github.com/new?name=%s\n", repo)
 		return 0
 	}
 
-	url, err := createAndPush(out, r.dir, r.course)
+	url, err := createAndPush(out, r.dir, r.course, repo, yes)
 	if err != nil {
 		fmt.Fprintf(out, "sboot: %v\n", err)
 		fmt.Fprintln(out, "sboot: fix the above and re-run `sboot repo` — nothing here blocks the course.")
@@ -104,82 +160,74 @@ func runRepo(yes bool) int {
 	return 0
 }
 
-// startConcierge is the same offer inside `sboot start`, right after the
-// workspace block. Skippable, never a blocker, and in a non-interactive run
-// (no TTY, no --yes) it spawns NOTHING — it prints the offer and moves on, so
-// CI and scripts see one extra line, not a subprocess.
-func startConcierge(course, dir string, yes bool) {
-	out := os.Stderr
-	fmt.Fprintln(out)
-	fmt.Fprintf(out, "── your repo %s\n", painter(out)(ansiDim, "(recommended, never required — worth it: your own commit history)"))
-	if !yes && !interactiveTTY() {
-		fmt.Fprintf(out, "   `sboot repo` creates github.com/<you>/%s (private) and pushes — one confirm, on your machine.\n", course)
-		return
+// ghInstallLine is the install command for THIS machine, and it is checked rather
+// than assumed.
+//
+// The old `pkgInstall("gh")` printed `brew install gh` on every Mac whether or not
+// brew existed (D-MACOS-6) and `sudo apt install gh` on Windows (D-WIN-2) — a line
+// that cannot work is worse than no line, because the reader cannot tell our
+// mistake from theirs. So: brew if it is actually here, else brew's own installer
+// first; apt or dnf by which one exists; winget on Windows.
+func ghInstallLine() string {
+	switch runtime.GOOS {
+	case "darwin":
+		if _, err := exec.LookPath("brew"); err == nil {
+			return "brew install gh"
+		}
+		// Homebrew first, gh second — two commands, in the order they must run.
+		return `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` +
+			"   then:  brew install gh"
+	case "windows":
+		return "winget install --id GitHub.cli"
+	default:
+		if _, err := exec.LookPath("dnf"); err == nil {
+			return "sudo dnf install gh"
+		}
+		if _, err := exec.LookPath("apt-get"); err == nil {
+			return "sudo apt-get install gh"
+		}
+		if _, err := exec.LookPath("apt"); err == nil {
+			return "sudo apt install gh"
+		}
+		// Neither package manager found: name the project's own page rather than
+		// guessing a distro.
+		return "see https://github.com/cli/cli#installation"
 	}
-	if _, err := exec.LookPath("gh"); err != nil {
-		printManualRail(out, dir, course)
-		return
-	}
-	if _, err := exec.LookPath("git"); err != nil {
-		fmt.Fprintf(out, "   git is not installed — %s · then: sboot repo\n", pkgInstall("git"))
-		return
-	}
-	user, authed := ghAccount()
-	if !authed {
-		fmt.Fprintln(out, "   gh detected — not signed in yet.")
-		fmt.Fprintln(out, "   sign in:  gh auth login   · then `sboot repo` finishes in one confirm.")
-		return
-	}
-	fmt.Fprintf(out, "   gh detected — authed as %s\n", atUser(user))
-	if !yes && !confirm(out, fmt.Sprintf("   create github.com/%s/%s (private) and push? [Y/n] ", userOrYou(user), course)) {
-		fmt.Fprintf(out, "   ── skipped. any time: sboot repo · or DIY: https://github.com/new?name=%s\n", course)
-		return
-	}
-	url, err := createAndPush(out, dir, course)
-	if err != nil {
-		fmt.Fprintf(out, "   sboot: %v\n", err)
-		fmt.Fprintln(out, "   ── nothing here blocks the course — `sboot repo` retries any time.")
-		return
-	}
-	fmt.Fprintf(out, "   %s   %s\n", painter(out)(ansiGreen, "✓ pushed → "+url),
-		painter(out)(ansiDim, "# gh's credential, on your machine — never ours"))
 }
 
-// createAndPush runs the machine's side of the one confirm: git init if needed,
-// a first commit if there is none, then gh creates the private repo and pushes.
-// The summary line names exactly the steps that will run (the tile's register).
-func createAndPush(out *os.File, dir, course string) (string, error) {
-	var steps []string
-	needInit := !isDir(filepath.Join(dir, ".git"))
-	if needInit {
-		steps = append(steps, "git init")
-	}
-	needCommit := needInit || !gitHasHead(dir)
-	if needCommit {
-		steps = append(steps, fmt.Sprintf("commit %q", "start "+course))
-	}
-	steps = append(steps, "gh repo create --private --source . --push")
-	fmt.Fprintf(out, "── %s\n", strings.Join(steps, " · "))
+// printManualRail is offer (b): the commands, from the right directory, with the
+// one sentence that decides whether the last of them works.
+func printManualRail(out *os.File, dir, repo string) {
+	fmt.Fprintf(out, "     open   https://github.com/new?name=%s        # prefilled; create it private, no README\n", repo)
+	// THE `cd` IS THE BUG THIS EXISTS TO NOT REPEAT (P-12): without it the learner
+	// runs these in the PARENT folder, and the repo they push is their home
+	// directory. `start` has already run `git init` in here, so the rail is two
+	// commands, not five.
+	fmt.Fprintf(out, "     then   cd %s\n", quoteIfSpaced(dir))
+	fmt.Fprintf(out, "            git remote add origin https://github.com/<you>/%s.git\n", repo)
+	fmt.Fprintln(out, "            git push -u origin main")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "     GitHub will ask for a token, not your password — make one here:")
+	fmt.Fprintf(out, "     %s\n", ghTokenDoc)
+}
 
-	if needInit {
-		if b, err := gitRun(dir, "init", "-q"); err != nil {
-			return "", fmt.Errorf("git init failed: %s", firstLine(b, err))
-		}
+// createAndPush runs the machine's side of the one confirm: make sure there is a
+// local repo with a commit in it, then let gh create the private repo and push.
+// The summary line names exactly the steps that will run.
+func createAndPush(out *os.File, dir, course, repo string, yes bool) (string, error) {
+	if err := ensureLocalRepo(out, dir, course, yes); err != nil {
+		return "", err
 	}
-	if needCommit {
-		if b, err := gitRun(dir, "add", "-A"); err != nil {
-			return "", fmt.Errorf("git add failed: %s", firstLine(b, err))
-		}
-		if b, err := gitRun(dir, "commit", "-q", "-m", "start "+course); err != nil {
-			msg := firstLine(b, err)
-			if strings.Contains(string(b), "user.name") || strings.Contains(string(b), "user.email") {
-				msg += ` — set your git identity first: git config --global user.name "You" && git config --global user.email you@example.com`
-			}
-			return "", fmt.Errorf("git commit failed: %s", msg)
-		}
+	// ensureLocalRepo leaves the commit UNDONE when git has no identity to make it
+	// under (P-13), and says so. Stop here rather than let `gh repo create --push`
+	// fail on a repo with no commits — that error is gh's, arrives after the
+	// identity to-do above, and reads as a second problem when it is the same one.
+	if !gitHasHead(dir) {
+		return "", errors.New("nothing is committed yet — finish the steps above, then `sboot repo`")
 	}
+	fmt.Fprintf(out, "── gh repo create %s --private --source . --push\n", repo)
 
-	create := exec.Command("gh", "repo", "create", course, "--private", "--source", ".", "--push")
+	create := exec.Command("gh", "repo", "create", repo, "--private", "--source", ".", "--push")
 	create.Dir = dir
 	var stdout bytes.Buffer
 	create.Stdout = &stdout
@@ -191,32 +239,190 @@ func createAndPush(out *os.File, dir, course string) (string, error) {
 		return url, nil
 	}
 	if user, ok := ghAccount(); ok {
-		return "github.com/" + user + "/" + course, nil
+		return "github.com/" + user + "/" + repo, nil
 	}
-	return "github.com/<you>/" + course, nil
+	return "github.com/<you>/" + repo, nil
 }
 
-// printManualRail is the no-gh path: the prefilled new-repo link (opened when a
-// human is present), the git commands, and the smoother rail by name.
-func printManualRail(out *os.File, dir, course string) {
-	newURL := "https://github.com/new?name=" + course
-	fmt.Fprintln(out, "no gh here — the two-minute path:")
-	fmt.Fprintf(out, "  open   %s        # prefilled; create it private\n", newURL)
-	tryOpen(newURL)
-	if !gitHasHead(dir) {
-		fmt.Fprintf(out, "  then   git init && git add . && git commit -m %q\n", "start "+course)
-		fmt.Fprintf(out, "         git remote add origin https://github.com/<you>/%s.git\n", course)
-	} else {
-		fmt.Fprintf(out, "  then   git remote add origin https://github.com/<you>/%s.git\n", course)
+// ── the LOCAL repo: what `sboot start` makes, before GitHub is a question ───────
+
+// ensureLocalRepo makes `dir` a git repository with at least one commit in it.
+//
+// Called by `sboot start` (where it is the whole GitHub-free half of P-21) and by
+// `sboot repo` (where it is the precondition `gh repo create --source .` needs).
+// Idempotent by construction: an existing .git is left alone, and an existing HEAD
+// means there is nothing to commit.
+//
+// It returns an error only for a git failure the learner has to act on. A MISSING
+// IDENTITY IS NOT ONE: it is answered by printing what to run and leaving the
+// commit undone, because the alternative — committing under git's guess — is what
+// stamped `you@<hostname>.local` on the founder's own first commit (P-13), in a
+// repo built to be shown to people.
+func ensureLocalRepo(out *os.File, dir, course string, yes bool) error {
+	if _, err := exec.LookPath("git"); err != nil {
+		fmt.Fprintf(out, "   git is not installed — %s\n", pkgInstall("git"))
+		fmt.Fprintln(out, "   install it, then `sboot repo` makes the repo and pushes it.")
+		return nil
 	}
-	fmt.Fprintln(out, "         git push -u origin main")
-	fmt.Fprintf(out, "smoother: install GitHub's CLI (%s) and `sboot repo` does it in one confirm.\n",
-		pkgInstall("gh"))
+	if !isDir(filepath.Join(dir, ".git")) {
+		if b, err := gitRun(dir, "init", "-q", "-b", "main"); err != nil {
+			// `-b main` needs git ≥ 2.28; retry without it rather than refuse on an
+			// older git, which is the whole reason this is not one call.
+			if b2, err2 := gitRun(dir, "init", "-q"); err2 != nil {
+				return fmt.Errorf("git init failed: %s", firstLine(append(b, b2...), err))
+			}
+		}
+		fmt.Fprintf(out, "   git repo created in %s\n", filepath.Base(dir))
+	}
+	if gitHasHead(dir) {
+		return nil
+	}
+	name, email := gitIdentity(dir)
+	if name == "" || email == "" {
+		name, email = askIdentity(out, dir, name, email, yes)
+	}
+	if name == "" || email == "" {
+		printIdentityTodo(out, dir, course)
+		return nil
+	}
+	if b, err := gitRun(dir, "add", "-A"); err != nil {
+		return fmt.Errorf("git add failed: %s", firstLine(b, err))
+	}
+	if b, err := gitRun(dir, "commit", "-q", "-m", "start "+course); err != nil {
+		return fmt.Errorf("git commit failed: %s", firstLine(b, err))
+	}
+	fmt.Fprintf(out, "   first commit made as %s <%s>\n", name, email)
+	return nil
+}
+
+// gitIdentity reads the identity git WOULD use here, the way git itself resolves
+// it: the environment first (`GIT_AUTHOR_*` / `GIT_COMMITTER_*`, then `EMAIL`),
+// and only then the local → global → system config, asked of git rather than
+// reimplemented — so a learner who set it any of the ways git supports is never
+// asked again.
+//
+// THE ENVIRONMENT HALF IS NOT OPTIONAL (skeptic, 2026-09-03): the first cut read
+// only `git config`, and a machine with an identity exported but nothing in
+// ~/.gitconfig — every CI runner, and anyone who keeps their identity in a shell
+// profile — was told "git has no name and email yet" and left uncommitted. The
+// tests in this package supply their identity exactly that way, and two of them
+// failed on a HOME with no gitconfig, which is what GitHub's runners are.
+func gitIdentity(dir string) (name, email string) {
+	name = strings.TrimSpace(firstNonEmpty(os.Getenv("GIT_AUTHOR_NAME"),
+		os.Getenv("GIT_COMMITTER_NAME"), gitConfigGet(dir, "user.name")))
+	email = strings.TrimSpace(firstNonEmpty(os.Getenv("GIT_AUTHOR_EMAIL"),
+		os.Getenv("GIT_COMMITTER_EMAIL"), os.Getenv("EMAIL"), gitConfigGet(dir, "user.email")))
+	return name, email
+}
+
+func gitConfigGet(dir, key string) string {
+	b, err := gitRun(dir, "config", "--get", key)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// askIdentity asks for the two values git needs and writes them --global.
+//
+// GLOBAL, not local: this is the identity on every commit they will ever make on
+// this machine, and asking again in the next course would read as a bug. The name
+// defaults to the GitHub handle this machine is logged in as, because that is the
+// name the repo will live under anyway.
+//
+// Silent and non-committal without a terminal — and with --yes too, which is the
+// one place --yes cannot mean "yes": an email cannot be invented, and a wrong one
+// is permanent in the history of a repo built to be shown to people.
+func askIdentity(out *os.File, dir, name, email string, yes bool) (string, string) {
+	if !interactiveTTY() || yes {
+		return name, email
+	}
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "   git stamps a name and an email on every commit, and has neither yet.")
+	fmt.Fprintln(out, "   set once, used for every commit you ever make on this machine:")
+	if name == "" {
+		name = ask(out, "   name  ", defaultGitName())
+	}
+	if email == "" {
+		email = ask(out, "   email ", "")
+	}
+	if name == "" || email == "" {
+		return "", ""
+	}
+	for _, kv := range [][2]string{{"user.name", name}, {"user.email", email}} {
+		if b, err := gitRun(dir, "config", "--global", kv[0], kv[1]); err != nil {
+			fmt.Fprintf(out, "   could not save %s: %s\n", kv[0], firstLine(b, err))
+			return "", ""
+		}
+	}
+	return name, email
+}
+
+// defaultGitName is the GitHub handle this machine is logged in as, or "".
+func defaultGitName() string {
+	if c := loadCredentials(); c != nil {
+		return c.Handle
+	}
+	return ""
+}
+
+// printIdentityTodo is what an unanswerable identity question leaves behind: the
+// exact commands, in order, including the commit that did not happen.
+func printIdentityTodo(out *os.File, dir, course string) {
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "   your work is saved, but not committed — git has no name and email yet:")
+	fmt.Fprintln(out, `     git config --global user.name "Your Name"`)
+	fmt.Fprintln(out, "     git config --global user.email you@example.com")
+	fmt.Fprintf(out, "     cd %s && git add -A && git commit -m %q\n", quoteIfSpaced(dir), "start "+course)
+}
+
+// ── the nudge: your repo has no remote yet ──────────────────────────────────────
+
+// nudgeKey is one course's repo nudge, in state.json's per-day map.
+func nudgeKey(course string) string { return "repo/" + course }
+
+// repoNudge is the one line that names `sboot repo` to a learner whose workspace
+// has no remote. Cadence (ratified 2026-09-02, P-21): after a PASSING submit,
+// every time — the moment there is something worth showing — and on `test` at most
+// once a day, which is what keeps the practice loop free of it.
+//
+// It says nothing at all when git is missing, when there is no repo yet, or when a
+// remote exists: a nudge toward a command that would refuse is noise.
+func repoNudge(r repo, daily bool) {
+	if _, err := exec.LookPath("git"); err != nil {
+		return
+	}
+	if !isDir(filepath.Join(r.dir, ".git")) {
+		return
+	}
+	if _, ok := existingRemote(r.dir); ok {
+		return
+	}
+	if daily {
+		st := loadState()
+		if !st.nudgeDue(nudgeKey(r.course)) {
+			return
+		}
+		st.markNudged(nudgeKey(r.course))
+		saveQuietly(st)
+	}
+	p := painter(os.Stderr)
+	fmt.Fprintf(os.Stderr, "your work is committed here but has no home on GitHub yet — %s\n",
+		p(ansiGreen, "sboot repo"))
 }
 
 // ── plumbing ────────────────────────────────────────────────────────────────────
 
+// existingRemote is the origin of the repo AT `dir` — and only of that one. Without
+// the `.git` check, `git -C dir remote get-url` walks UP and answers for an
+// enclosing repository (a home directory under version control, a `~/dev` that is
+// itself a repo), so a workspace with no repo of its own would be reported as
+// "remote already set" and never offered one — the parent-becomes-the-repo bug
+// (P-12) in a second costume.
 func existingRemote(dir string) (string, bool) {
+	if !isDir(filepath.Join(dir, ".git")) {
+		return "", false
+	}
 	b, err := gitRun(dir, "remote", "get-url", "origin")
 	if err != nil {
 		return "", false
@@ -265,6 +471,16 @@ func userOrYou(user string) string {
 	return user
 }
 
+// quoteIfSpaced makes a path safe to paste into a shell. A learner's home
+// directory really can be `/Users/Anna Smith/…`, and an unquoted `cd` there
+// fails with an error about a directory half its name.
+func quoteIfSpaced(p string) string {
+	if strings.ContainsAny(p, " \t") {
+		return `"` + p + `"`
+	}
+	return p
+}
+
 // confirm asks one [Y/n] question on the prompt's stream and reads one line
 // from stdin. Empty means yes (the tile's default); a closed stdin declines.
 // Callers gate on TTY, so a pipe never blocks here.
@@ -279,6 +495,24 @@ func confirm(out *os.File, prompt string) bool {
 		return true
 	}
 	return false
+}
+
+// ask reads one free-text line, offering `def` as the bracketed default. Callers
+// gate on TTY, exactly as confirm's do.
+func ask(out *os.File, label, def string) string {
+	if def != "" {
+		fmt.Fprintf(out, "%s[%s]: ", label, def)
+	} else {
+		fmt.Fprintf(out, "%s: ", label)
+	}
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && line == "" {
+		return def
+	}
+	if v := strings.TrimSpace(line); v != "" {
+		return v
+	}
+	return def
 }
 
 func firstLine(b []byte, fallback error) string {

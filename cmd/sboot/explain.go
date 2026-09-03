@@ -4,7 +4,7 @@
 // The spec gives this verb a shape that is half CLI and half web, and both
 // halves are built here because each covers what the other cannot:
 //
-//	default   PRINT + OPEN the lab page's `#stuck` deep link, carrying the
+//	default   PRINT + OPEN the lab page's `#chat` deep link, carrying the
 //	          target check. The chat lives there: it keeps context across
 //	          turns, renders code, and is where the metering UI already is.
 //	--here    the one-shot fallback. One question, the last run's evidence, one
@@ -104,15 +104,25 @@ func explainOpenChat(course, stage string, ev explainEv) int {
 	return 0
 }
 
-// explainURL extends the `#stuck` deep link every failing run already prints
-// (main.go stageStuckURL) with the one thing the page cannot know: which check
-// the learner is stuck on. Query params, not a richer fragment, because the page
-// is a server component and a fragment never reaches it.
+// explainURL extends the deep link every failing run already prints (main.go
+// stageStuckURL) with the one thing the page cannot know: which check the learner
+// is stuck on. Query params, not a richer fragment, because the page is a server
+// component and a fragment never reaches it.
 //
-// ADDITIVE BY CONSTRUCTION: the page ignores parameters it does not know, so a
-// CLI ahead of the deployment degrades to the plain Stuck? section rather than a
-// 404. `from=cli` is there for the same reason it is on every other hand-off —
-// so "how did people get here?" is answerable without guessing.
+// THE FRAGMENT IS `#chat`, NOT `#stuck`, from v0.12.0 (DECISIONS.md §C, the
+// four-tab mock's answer 5). The lab page is four tabs now — Reading · Lab ·
+// Chat with Guru · Code Review — and the chat this verb hands off to is a TAB,
+// not a section of the Lab tab. `#stuck` still resolves, on the Lab tab's Grading
+// heading, which is what keeps every already-released binary's printed link
+// landing on the ladder: the two anchors are different destinations for two
+// different verbs, and only this one moved. `sboot test`/`sboot hint` keep
+// printing `#stuck` (stageStuckURL) because the ladder is where they belong.
+//
+// ADDITIVE BY CONSTRUCTION: the page ignores parameters it does not know and a
+// browser ignores a fragment it cannot find, so a CLI ahead of the deployment
+// degrades to the top of the lab page rather than a 404. `from=cli` is there for
+// the same reason it is on every other hand-off — so "how did people get here?"
+// is answerable without guessing.
 func explainURL(course, stage, check string) string {
 	base := fmt.Sprintf("%s/courses/%s/stages/%s", siteURL(), course, stage)
 	q := url.Values{}
@@ -120,7 +130,7 @@ func explainURL(course, stage, check string) string {
 		q.Set("check", check)
 	}
 	q.Set("from", "cli")
-	return base + "?" + q.Encode() + "#stuck"
+	return base + "?" + q.Encode() + "#chat"
 }
 
 // ── --here: the one-shot ────────────────────────────────────────────────────────

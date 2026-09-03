@@ -88,6 +88,16 @@ type specManifest struct {
 	// is why the empty value has to mean "os" rather than being an error, and why
 	// `sboot start` only writes the sboot.toml line when it differs from the default.
 	Tree string `json:"tree"`
+	// The slug of the thing this course builds — `word-game`, `kernel`,
+	// `sqlite-reader` (course.yaml `artifact`, 2026-09-02). It names two things a
+	// learner lives with: the folder `sboot start` unpacks into and the private
+	// GitHub repo `sboot repo` creates, both `<artifact>-sb`.
+	//
+	// Absent from an older platform's manifest and from every course that has not
+	// been named, so the empty value has to MEAN the course id rather than being
+	// an error — the same append-only rule as Tree above, and the same fallback
+	// shape: what a workspace is already called cannot become wrong.
+	Artifact string `json:"artifact"`
 	// The course's BUILD TOOLING bundle (`xtask/` and cargo config for a Rust
 	// course; nothing but the LICENCE for a Makefile one). Named `engine` for the
 	// oldest of reasons — it used to hold the Rust grader — and kept because
@@ -406,20 +416,72 @@ func cachedSpec(course string) (spec, bool) {
 // the zero value, and grade.go falls back to the Rust/QEMU defaults — so an older
 // cache keeps building exactly as it did.
 func courseGrader(course string) specGrader {
-	s, ok := cachedSpec(course)
+	m, ok := cachedManifest(course)
 	if !ok {
 		return specGrader{}
 	}
+	return m.Grader
+}
+
+// cachedManifest is the last manifest we stored for a course, or false.
+//
+// Split out of courseGrader (2026-09-02) when `sboot repo` grew a second reader:
+// it needs the ARTIFACT name to propose a repo, and it runs inside a workspace
+// where the network may be off. Everything the two callers share is the reason
+// this reads a file instead of asking: a cached course must keep working
+// offline, and a manifest field nobody sent yields the zero value, which every
+// reader here treats as "fall back to what this course was already called".
+func cachedManifest(course string) (specManifest, bool) {
+	s, ok := cachedSpec(course)
+	if !ok {
+		return specManifest{}, false
+	}
 	b, err := os.ReadFile(filepath.Join(s.dir, "spec.json"))
 	if err != nil {
-		return specGrader{}
+		return specManifest{}, false
 	}
 	var m specManifest
 	if err := json.Unmarshal(b, &m); err != nil {
-		debugf("cached spec.json for %s is unreadable (%v); using the default grader manifest", course, err)
-		return specGrader{}
+		debugf("cached spec.json for %s is unreadable (%v); using the defaults", course, err)
+		return specManifest{}, false
 	}
-	return m.Grader
+	return m, true
+}
+
+// workspaceName is the folder `sboot start` unpacks into and the base of the repo
+// name `sboot repo` proposes: `<artifact>-sb` when the course names an artifact,
+// else the course id — which is what every workspace created before 2026-09-02 is
+// already called, so nothing on anyone's disk changes name.
+//
+// The `-sb` suffix is the signature (P-11, ratified 2026-09-02): `word-game-sb`
+// is unique enough on a personal GitHub account and identifiable as ours when a
+// reader finds three of them, where `word-game` collides with everything.
+func workspaceName(course, artifact string) string {
+	if artifact == "" {
+		return course
+	}
+	return artifact + "-sb"
+}
+
+// repoName is workspaceName's sibling for the REMOTE, and it differs in exactly
+// one case: a course with no artifact still gets the `-sb` signature on GitHub
+// (`os-rust-sb`), because a repo called `os-rust` in someone's account says
+// nothing about whose course it was, while a FOLDER called `os-rust` is what
+// their disk already holds and must not be renamed under them.
+func repoName(course, artifact string) string {
+	if artifact == "" {
+		return course + "-sb"
+	}
+	return artifact + "-sb"
+}
+
+// courseArtifact is the cached artifact slug, or "" — see workspaceName.
+func courseArtifact(course string) string {
+	m, ok := cachedManifest(course)
+	if !ok {
+		return ""
+	}
+	return m.Artifact
 }
 
 // ── fetching ────────────────────────────────────────────────────────────────────

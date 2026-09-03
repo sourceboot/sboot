@@ -142,28 +142,53 @@ func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderR
 	build := argv(buildCmd, defaultBuildCmd)
 	cmd := exec.Command(build[0], build[1:]...)
 	cmd.Dir = runDir
-	// INHERITED, not captured. The build is the slow part of a practice run and its
-	// output is the learner's own compiler errors: they have to arrive as they
-	// happen, and they must keep whatever colour and interleaving cargo gave them.
+	// TEED, since 2026-09-02 — and this reverses the paragraph that stood here.
+	//
+	// It used to be INHERITED, with the reasoning kept below because it is still
+	// true about what it costs: filtering or recording means a Go writer, a Go
+	// writer means a pipe, and a pipe means cargo sees no TTY, so the animated
+	// progress line goes (colour is bought back a few lines down, for cargo, when
+	// our own stderr is a terminal). What changed is the other side of the trade.
+	// Three fresh machines in the 2026-09-02 review round met a build that died in
+	// LINKER output — the machine's failure, not the learner's — and every rung of
+	// the ladder was blind to it, because the only copy of that text was on a
+	// screen nobody had recorded. A progress animation is worth less than an answer
+	// to the first failure a learner ever hits (ledger G140/G141).
+	//
+	// Two things the tee buys at once: the text reaches state.json (bounded, head
+	// and tail — buildlog.go) so `sboot hint` can classify it, and the stream now
+	// goes through the F00-1 display filter, so cargo's "Compiling lantern v0.1.0
+	// (<run>/os/lantern)" status line finally spells the learner's own tree like
+	// every other line they read. (rustc's own diagnostics were always
+	// workspace-relative, so compile errors never carried the staging spelling;
+	// only cargo's status parenthetical did.)
+	//
+	// The capture sits BEFORE the filter: display is rewritten, the record keeps
+	// the raw bytes, which is retree.go's rule for every non-display channel.
 	// (Under --json, stdout belongs to the verdict object, so the build's stdout
 	// joins the messaging on stderr.)
-	//
-	// (F00-1) For a course whose tree is not `os`, the staging spelling can leak
-	// here too — cargo's "Compiling lantern v0.1.0 (<run>/os/lantern)" status
-	// line names the staged path when this warm-up build recompiles. It is left
-	// unfiltered DELIBERATELY: filtering means a Go writer, a Go writer means a
-	// pipe, and a pipe means cargo sees no TTY — the colour and live progress
-	// this comment exists to protect would be gone from the course's every
-	// build (forcing CARGO_TERM_COLOR=always restores colour but not the
-	// progress line, and is cargo-specific in a course-agnostic code path).
-	// rustc's own diagnostics print workspace-relative paths
-	// (`lantern/src/banner.rs`), so compile errors — the text that matters —
-	// never carry the staging spelling; only cargo's status parenthetical does.
-	// The judge's streams below ARE filtered (retreeStreams): they were already
-	// pipes, so the rewrite there costs nothing.
-	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+	buildLog := newHeadTailCapture()
+	bOut, bErr, flushBuild := retreeStreams(runDir, tree)
+	// BOTH streams are teed, not stderr alone. cargo puts its diagnostics on
+	// stderr, but this code path is course-agnostic — a `make`-based course
+	// (kernel-in-c) or any wrapper script may report on stdout, and a classifier
+	// that cannot see the failure text is worth nothing on exactly the course we
+	// could not test it on. One capture, so the record interleaves the way the
+	// terminal did.
+	cmd.Stdout = io.MultiWriter(bOut, buildLog)
+	cmd.Stderr = io.MultiWriter(bErr, buildLog)
+	cmd.Stdin = os.Stdin
 	if jsonMode {
-		cmd.Stdout = os.Stderr
+		cmd.Stdout = io.MultiWriter(bErr, buildLog)
+	}
+	// Colour, given back where it was lost. cargo decides by looking at the stream
+	// it was handed, and it has just been handed a pipe — so when OUR stderr is a
+	// terminal and the learner has not opted out (--no-color, NO_COLOR, TERM=dumb),
+	// we say so on its behalf. Only for cargo, only when the learner set nothing
+	// themselves, and never in a way that reaches the record: stripANSI runs before
+	// anything is stored.
+	if colorEnabled(os.Stderr) && isCargo(build[0]) && os.Getenv("CARGO_TERM_COLOR") == "" {
+		cmd.Env = append(os.Environ(), "CARGO_TERM_COLOR=always")
 	}
 	// R2-4 (round-2 dogfood 2026-08-25): OUR OWN banner opens the build, so the
 	// stream's first line is never cargo's. The paragraph above stands — the
@@ -176,7 +201,13 @@ func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderR
 	// beyond this line's addition).
 	fmt.Fprintf(os.Stderr, "── build: `%s` — your toolchain's own output follows\n",
 		retreeText(strings.Join(build, " "), runDir, tree))
-	if err := cmd.Run(); err != nil {
+	err = cmd.Run()
+	flushBuild()
+	// What the build said, bounded and colour-stripped, on EVERY path: a build that
+	// failed is why it exists, and one that succeeded overwrites the note from the
+	// last one that did not.
+	run.buildOut = stripANSI(buildLog.text())
+	if err != nil {
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) {
 			// The build command could not be STARTED (no cargo on PATH). Different
@@ -365,6 +396,13 @@ func resolveLab(engine, runDir, course, labID string) (labDir string, lg labGrad
 		// output (the same rule as parseVerdict).
 	}
 	return labDir, lg, nil
+}
+
+// isCargo reports whether a build command is cargo — the one place this file
+// knows about a specific toolchain, and it decides nothing but colour.
+func isCargo(cmd string) bool {
+	base := filepath.Base(cmd)
+	return base == "cargo" || base == "cargo.exe"
 }
 
 // argv splits a command string into argv — whitespace, no shell, no quoting — falling

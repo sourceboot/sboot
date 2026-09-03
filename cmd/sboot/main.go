@@ -118,6 +118,8 @@ type gradedArgs struct {
 	yes       bool
 	here      bool   // explain: answer in this terminal instead of opening the chat
 	message   string // explain: the learner's own question
+	dir       string // start: unpack here instead of the course's own default name
+	name      string // repo: create this repo instead of the course's own default
 }
 
 // parseCommon walks a command's arguments: positionals in order, the flags the
@@ -167,6 +169,35 @@ func parseCommon(cmd string, args []string, maxPos int, opts *gradedArgs) []stri
 			}
 			i++
 			opts.message = args[i]
+		case !terminated && (a == "--dir" || strings.HasPrefix(a, "--dir=")):
+			// `sboot start` names the folder after the ARTIFACT since 2026-09-02
+			// (`word-game-sb`), so the override that was implicit — the folder was
+			// always the course id — has to become explicit.
+			if cmd != "start" {
+				usageError("--dir only means something for `sboot start`")
+			}
+			if v, found := strings.CutPrefix(a, "--dir="); found {
+				opts.dir = v
+				break
+			}
+			if i+1 >= len(args) {
+				usageError("--dir needs a folder name after it: `sboot start <course> --dir my-game`")
+			}
+			i++
+			opts.dir = args[i]
+		case !terminated && (a == "--name" || strings.HasPrefix(a, "--name=")):
+			if cmd != "repo" {
+				usageError("--name only means something for `sboot repo`")
+			}
+			if v, found := strings.CutPrefix(a, "--name="); found {
+				opts.name = v
+				break
+			}
+			if i+1 >= len(args) {
+				usageError("--name needs a repo name after it: `sboot repo --name my-word-game`")
+			}
+			i++
+			opts.name = args[i]
 		case !terminated && a == "--no-color":
 			noColorFlag = true
 		case !terminated && (a == "--help" || a == "-h"):
@@ -227,6 +258,34 @@ func resolveGradedStage(r repo, ga *gradedArgs, verb string, onFrontier func(*fr
 	return lab.Stage
 }
 
+// hintStage is which lab a `sboot hint` is about — the learner's word if they gave
+// one, else the current-lab rule, with ONE exception that comes before it:
+//
+// THE LAST FAILED RUN OUTRANKS THE FRONTIER (2026-09-02 review round, D-WIN-4).
+// Bare `sboot hint` otherwise asks the ACCOUNT which lab is next, and on an account
+// with every live lab verified the honest answer is "all live labs are verified —
+// nothing to hint. Nice work" — printed, on a Windows machine that had just told
+// the learner `stuck? sboot hint`, seconds after a build that could not link. Lab
+// 00's own promise ("a new machine, months from now proves itself by running the
+// same test") creates exactly that learner. A local run that produced no verdict at
+// all is fresher than any server frontier and is cleared the moment anything
+// grades, so preferring it cannot strand a working learner on a stale lab.
+//
+// A function rather than inline in main() so the preference is pinned against the
+// frontier it beats (onboarding_test.go, G142): the frontier path exits the
+// process, which is exactly what a regression would do inside a test.
+func hintStage(r repo, ga *gradedArgs) string {
+	if ga.stage == "" {
+		if blocked := loadState().blockedStage(r.course); blocked != "" {
+			ga.stage, ga.defaulted = blocked, true
+		}
+	}
+	return resolveGradedStage(r, ga, "hint", func(fr *frontierInfo) int {
+		fmt.Println("all live labs are verified — nothing to hint. Nice work.")
+		return 0
+	})
+}
+
 // frontierMessage is the S5 tile: every live lab verified, said plainly, exit 0.
 func frontierMessage(course string, fr *frontierInfo) int {
 	fmt.Printf("all live labs in %s are verified — nothing new to grade.\n", course)
@@ -258,6 +317,12 @@ func gradedHeader(verbing, course, stage, verb string, defaulted bool) {
 }
 
 func main() {
+	// FIRST, before a single byte is written: on Windows the console renders this
+	// binary's UTF-8 as cp437 mojibake unless it is told otherwise, and the runes
+	// affected (`·`, `▸`) are on the very first screen (console_windows.go, D-WIN-3).
+	// A no-op everywhere else.
+	enableUTF8Console()
+
 	args := os.Args[1:]
 	if next, found := stripFlag(args, "--no-color"); found {
 		noColorFlag = true
@@ -307,7 +372,7 @@ func main() {
 
 	case "repo":
 		parseCommon(cmd, rest, 0, &ga)
-		exitWith(runRepo(ga.yes))
+		exitWith(runRepo(ga.yes, ga.name))
 
 	case "start":
 		pos := parseCommon(cmd, rest, 1, &ga)
@@ -318,8 +383,18 @@ func main() {
 		if course == "" {
 			exitWith(startNoArg())
 		}
-		runStart(course, ga.yes)
+		runStart(course, ga.dir, ga.yes)
 		exitWith(0)
+
+	case "resume":
+		// One positional, and it is required: resume is about a workspace that
+		// already exists somewhere, and guessing which one is exactly the kind of
+		// help that picks the wrong repo.
+		pos := parseCommon(cmd, rest, 1, &ga)
+		if len(pos) != 1 {
+			usageError("`sboot resume` needs a folder or a git URL: `sboot resume ~/word-game-sb`")
+		}
+		exitWith(runResume(pos[0]))
 
 	case "where":
 		parseCommon(cmd, rest, 0, &ga)
@@ -363,10 +438,7 @@ func main() {
 			ga.stage, ga.check = pos[0], pos[1]
 		}
 		r := requireRepo("hint")
-		stage := resolveGradedStage(r, &ga, "hint", func(fr *frontierInfo) int {
-			fmt.Println("all live labs are verified — nothing to hint. Nice work.")
-			return 0
-		})
+		stage := hintStage(r, &ga)
 		exitWith(runHint(r, stage, ga.check, ga.defaulted))
 
 	case "explain":
@@ -487,6 +559,20 @@ func prepare(r repo, stage string) string {
 }
 
 func runTest(r repo, stage string, ga gradedArgs) {
+	code := runTestCode(r, stage, ga)
+	// The repo nudge (P-21), on the practice loop's own terms: at most once a day,
+	// and only when there is a local repo with no remote. `test` runs dozens of
+	// times an hour, so anything more often is noise in the one loop that must
+	// stay quiet.
+	repoNudge(r, true)
+	exitWith(code)
+}
+
+// runTestCode is `sboot test`, returning its exit code instead of taking it.
+// Split out 2026-09-02 so `sboot resume` can end on the first lab's checks — the
+// proof that a rebuilt machine really can grade — without a second copy of the
+// run, the ladder bookkeeping and the L2a "graded nothing" rule.
+func runTestCode(r repo, stage string, ga gradedArgs) int {
 	gradedHeader("grading", r.course, stage, "test", ga.defaulted)
 	run := prepare(r, stage)
 
@@ -502,7 +588,7 @@ func runTest(r repo, stage string, ga gradedArgs) {
 	if res.launchFailed {
 		saveQuietly(st)
 		reportGraderMissing(r, res.launchErr)
-		exitWith(2)
+		return 2
 	}
 	st.record(r.course, stage, res.checks)
 	st.recordScore(r.course, stage, res.score, res.max)
@@ -537,7 +623,7 @@ func runTest(r repo, stage string, ga gradedArgs) {
 		fmt.Fprintf(os.Stderr, "stuck?  %s · %s\n", p(ansiGreen, "sboot hint"),
 			stageStuckURL(r.course, stage))
 	}
-	exitWith(res.exitCode)
+	return res.exitCode
 }
 
 // stageStuckURL is the lab page's Stuck? anchor — where the ladder's web mirror
@@ -647,6 +733,12 @@ func reportGraderMissing(r repo, err error) {
 	for _, line := range installHint(tool, rustChannel(r.dir)) {
 		fmt.Fprintf(os.Stderr, "sboot:   %s\n", line)
 	}
+	if tool != "" {
+		// The diagnosis this message does NOT make, and it is the common one on
+		// Windows: the tool IS installed and this shell's PATH predates it
+		// (D-WIN-2 — the lab page says "open a new terminal"; the tool never did).
+		fmt.Fprintf(os.Stderr, "sboot:   %s\n", newTerminalNote())
+	}
 }
 
 // reportSubmitGraderMissing is the submit half, and it teaches the relationship
@@ -703,6 +795,18 @@ func installHint(tool, channel string) []string {
 		if channel != "" {
 			pin = "this course pins " + channel + " in rust-toolchain.toml"
 		}
+		if hostOS == "windows" {
+			// The Unix one-liner is not merely the wrong spelling here: typed into
+			// PowerShell it produces a red error block about `sh` not being a cmdlet
+			// (D-WIN-2). rustup's Windows route is a downloaded .exe, and the
+			// prerequisites question it asks is the SAME missing linker toolchain.go
+			// answers — so it is named here, before the learner picks blind.
+			return []string{
+				"install Rust (rustup; " + pin + "):",
+				"download and run https://win.rustup.rs/x86_64  (rustup-init.exe, from rustup.rs)",
+				"it will ask about Visual C++ prerequisites — take option 1 unless you have them",
+			}
+		}
 		return []string{
 			"install Rust (rustup; " + pin + "):",
 			"curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
@@ -712,7 +816,10 @@ func installHint(tool, channel string) []string {
 	case "qemu-system-x86_64", "qemu":
 		return []string{pkgInstall("qemu-system-x86")}
 	case "make", "gcc", "cc", "ld":
-		return []string{pkgInstall("build-essential")}
+		// The C toolchain has a per-OS explanation, not just a per-OS package name
+		// (a Mac's is Apple's installer, a Windows box's is Microsoft's), so this
+		// case hands over to the file that owns that copy.
+		return linkerHint(hostOS)
 	case "":
 		return []string{"the course's build needs a working toolchain — check `sboot where`."}
 	default:
@@ -720,18 +827,27 @@ func installHint(tool, channel string) []string {
 	}
 }
 
-// pkgInstall renders the package-manager line for this OS. macOS gets Homebrew and
-// Linux gets apt: both are the overwhelmingly common case, and a learner on neither
-// still reads a line that names the package they need.
+// pkgInstall renders the package-manager line for this OS.
+//
+// macOS gets Homebrew; Linux asks which package manager is actually on the PATH
+// (toolchain.go) rather than assuming apt, because the PACKAGE NAME differs and
+// not only the command; Windows gets winget.
+//
+// The `default` branch used to serve every non-macOS machine on the reasoning that
+// a Fedora learner still reads the package's name. On Windows that produced
+// `sudo apt install git` — a package manager, a privilege command and an install
+// path that none of them exist (D-WIN-2, measured on Windows 11).
 func pkgInstall(pkg string) string {
-	switch runtime.GOOS {
+	switch hostOS {
 	case "darwin":
 		if pkg == "build-essential" {
 			return "xcode-select --install"
 		}
 		return "brew install " + strings.TrimSuffix(pkg, "-system-x86")
+	case "windows":
+		return windowsInstallLine(pkg)
 	default:
-		return "sudo apt install " + pkg
+		return linuxInstallLine(pkg)
 	}
 }
 
@@ -909,6 +1025,13 @@ type graderRun struct {
 	// the second but never silently past the first.
 	launchFailed bool
 	launchErr    error
+	// What the build itself PRINTED, bounded to its head and tail and stripped of
+	// colour (buildlog.go). Not a verdict and never rendered back verbatim: it is
+	// the text `sboot hint` classifies, which is how a build that died on a missing
+	// LINKER gets an answer instead of "the compiler's own output is the hint"
+	// (2026-09-02 review round; ledger G140/G141). Empty when the build never
+	// started, because there was nothing to print.
+	buildOut string
 }
 
 // graded reports whether the ENGINE PRODUCED A VERDICT for this run — the `verdict`
@@ -1252,7 +1375,15 @@ type submissionResp struct {
 // runSubmit is a thin wrapper so the body can `return` an exit code and let its
 // defers run — the temp capture file needs cleanup, and `os.Exit` skips defers.
 func runSubmit(r repo, stage string, ga gradedArgs) {
-	exitWith(submit(r, stage, ga))
+	code := submit(r, stage, ga)
+	// The repo nudge (P-21), EVERY passing submit — not once a day. A passing
+	// submit is the moment there is something worth showing, which is the only
+	// moment "put this on GitHub" is an offer rather than an interruption; the
+	// daily throttle belongs on `test`, the loop that runs all day.
+	if code == 0 {
+		repoNudge(r, false)
+	}
+	exitWith(code)
 }
 
 // reportSubmitAuthFailure is the 401 tile: both doors (`sboot login` and the
@@ -1713,97 +1844,127 @@ func readCapture(path string) []byte {
 
 // ── start: create the learner's workspace ───────────────────────────────────────
 //
-// What lands here is ONLY the learner's half — `os/`, the build config, and the four
-// files this command writes itself (sboot.toml, LICENSE, .gitignore, README.md). The
-// tests and the grading engine go to the cache in the same run, so the learner ends
-// up ready to grade without ever having had our harness inside their repo.
+// What lands here is ONLY the learner's half — their source tree, the build config,
+// and the four files this command writes itself (sboot.toml, LICENSE, .gitignore,
+// README.md). The tests and the grading engine go to the cache in the same run, so
+// the learner ends up ready to grade without ever having had our harness inside
+// their repo.
 //
 // Both destinations are printed, because two directories is only a support burden if
-// nobody says where they are. After the workspace block comes the repo concierge
-// (ux-plan §11.j — one confirm, on their machine, skippable), then the handoff to
-// the first live lab with its lesson URL (P6: a URL at the decision moment).
-func runStart(course string, yes bool) {
-	dest := course
-	if entries, err := os.ReadDir(dest); err == nil && len(entries) > 0 {
-		fmt.Fprintf(os.Stderr, "sboot: ./%s already exists and is not empty — refusing to overwrite\n", dest)
-		fmt.Fprintf(os.Stderr, "sboot: resuming on this machine? cd %s && sboot — orientation is free.\n", dest)
+// nobody says where they are.
+//
+// ── LOCAL ONLY, SINCE 2026-09-02 (P-21) ────────────────────────────────────────
+//
+// This command no longer touches GitHub. It unpacks, runs `git init` INSIDE the
+// folder, settles the git identity, makes the first commit, and prints one line
+// naming `sboot repo`. Everything that can fail on a network, a missing gh, a
+// browser login or a password prompt now lives in that command, which nobody has
+// to run — see concierge.go's header for why the boundary moved.
+//
+// ── AND IT REPAIRS RATHER THAN REFUSING (P-16) ─────────────────────────────────
+//
+// A workspace that already has a valid sboot.toml is RE-FETCHED, not rejected: the
+// missing pieces come back, a learner file is never overwritten, and the command
+// says what it repaired. That is the answer to a download that died half way, which
+// used to leave a half-tree the learner could only fix with `rm -rf` — a command
+// nobody should have to type over their own work. A non-empty directory with NO
+// sboot.toml is still refused: it is not ours, and we do not know what is in it.
+func runStart(course, dirFlag string, yes bool) {
+	// The folder's NAME comes from the course's manifest (`artifact:` → the
+	// `<artifact>-sb` a learner shows people), so ask before anything lands on
+	// disk. The cache answers first and offline; the network refreshes it. A
+	// failure here is not fatal — the fallback is the course id, which is what
+	// every workspace made before 2026-09-02 is called.
+	artifact := courseArtifact(course)
+	title, firstStage, firstTitle := course, "", ""
+	specTree := ""
+	if m, err := fetchManifest(course); err == nil {
+		if m.Artifact != "" {
+			artifact = m.Artifact
+		}
+		if m.Title != "" {
+			title = m.Title
+		}
+		specTree = m.Tree
+		for _, l := range m.Labs {
+			if l.Live {
+				firstStage, firstTitle = l.Stage, l.Title
+				break
+			}
+		}
+	} else if e, ok := err.(*apiError); ok && e.status == http.StatusUnauthorized {
+		// `sboot start` is the FIRST command anyone runs, so this is the expected
+		// first failure rather than an edge case, and it is answered here — before a
+		// directory is created — instead of after a failed download.
+		fmt.Fprintf(os.Stderr, "sboot: %s\n", e.msg)
+		reportSignedOut("sboot start " + course)
+		exitWith(2)
+	} else {
+		debugf("manifest not fetched before start: %v", err)
+	}
+
+	dest := dirFlag
+	if dest == "" {
+		dest = workspaceName(course, artifact)
+	}
+	// Standing IN a workspace for this course is the same question as pointing at
+	// one: repair it, rather than nesting a second copy inside it.
+	if dirFlag == "" && courseFromManifest(".") == course {
+		dest = "."
+	}
+
+	switch {
+	case courseFromManifest(dest) != "":
+		if have := courseFromManifest(dest); have != course {
+			fmt.Fprintf(os.Stderr, "sboot: ./%s is a workspace for %q, not %q.\n", dest, have, course)
+			fmt.Fprintf(os.Stderr, "sboot: pick another folder: sboot start %s --dir <name>\n", course)
+			exitWith(2)
+		}
+		repairStart(course, dest, title, firstStage, firstTitle, specTree, yes)
+		return
+	case dirNonEmpty(dest):
+		fmt.Fprintf(os.Stderr, "sboot: ./%s already exists and is not empty — and it is not a %s workspace.\n", dest, brandName)
+		fmt.Fprintf(os.Stderr, "sboot: unpack somewhere else:  sboot start %s --dir <name>\n", course)
+		fmt.Fprintf(os.Stderr, "sboot: already have this course somewhere? cd into it, or `sboot resume <path>`.\n")
 		exitWith(2)
 	}
 
 	fmt.Printf("── fetching the %s starter tree\n", course)
-	req, err := authedRequest("GET", apiURL()+"/api/v1/courses/"+course+"/workspace", nil)
+	// UNPACK BESIDE THE DESTINATION, THEN MOVE IT IN. A download that dies half way
+	// used to leave a partial tree in ./<course> that the NEXT `sboot start` then
+	// refused as "not empty" — ledger C5, i.e. one flaky connection between a
+	// learner and an unrecoverable first five minutes. Staging makes the failure
+	// leave nothing at all behind, which is a better answer than any message.
+	stagedDir, err := os.MkdirTemp(filepath.Dir(absOr(dest)), ".sboot-start-")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
+		fmt.Fprintf(os.Stderr, "sboot: could not create a working directory next to ./%s (%v)\n", dest, err)
 		exitWith(2)
 	}
-	resp, err := send(&http.Client{Timeout: 120 * time.Second}, req)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "sboot: could not reach the platform (%v)\n", err)
+	if err := fetchWorkspace(course, stagedDir); err != nil {
+		os.RemoveAll(stagedDir)
+		reportWorkspaceFailure(course, err)
 		exitWith(2)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		var e struct {
-			Err string `json:"error"`
-		}
-		_ = json.NewDecoder(resp.Body).Decode(&e)
-		if e.Err == "" {
-			e.Err = fmt.Sprintf("HTTP %d", resp.StatusCode)
-		}
-		fmt.Fprintf(os.Stderr, "sboot: %s\n", e.Err)
-		// `sboot start` is the FIRST command anyone runs, so a bare "invalid or missing
-		// token" is a dead end — the reader has no idea a token exists or where to get
-		// one. The default SBOOT_TOKEN is a local dev value that can never work against
-		// a real deployment, so this is the expected first failure, not an edge case.
-		if resp.StatusCode == http.StatusUnauthorized {
-			fmt.Fprintf(os.Stderr, "\n  Get your token at %s/account, then:\n", siteURL())
-			fmt.Fprintf(os.Stderr, "    export SBOOT_TOKEN=<the token>\n")
-			fmt.Fprintf(os.Stderr, "    sboot start %s\n", course)
-		}
+	if err := moveInto(stagedDir, dest); err != nil {
+		os.RemoveAll(stagedDir)
+		fmt.Fprintf(os.Stderr, "sboot: could not put the starter tree in ./%s (%v)\n", dest, err)
 		exitWith(2)
 	}
 
-	if err := extractTarGz(resp.Body, dest); err != nil {
-		fmt.Fprintf(os.Stderr, "sboot: extract: %v\n", err)
+	// The four generated files BEFORE the tests are fetched (skeptic, 2026-09-03):
+	// sboot.toml is what makes this directory a workspace, and a repair (P-16) is
+	// keyed on it. The spec download below is the one network wait left in this
+	// command, so a Ctrl-C there used to leave a full tree with no manifest —
+	// exactly the "not one of ours, refusing" shape P-16 exists to end.
+	if err := writeRepoFiles(dest, course, title, firstStage, specTree); err != nil {
+		fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
 		exitWith(2)
 	}
 
 	// The tests + grader, into the cache. Deliberately AFTER the scaffold: if this
 	// half fails (offline mid-setup) the learner still has their repo and a later
 	// `sboot test` will finish the job, rather than being left with nothing.
-	title, firstStage, firstTitle := course, "", ""
-	specTree := ""
-	if s, err := ensureSpec(course, ""); err == nil {
-		if m, err := fetchManifest(course); err == nil {
-			if m.Title != "" {
-				title = m.Title
-			}
-			specTree = m.Tree
-			for _, l := range m.Labs {
-				if l.Live {
-					firstStage = l.Stage
-					firstTitle = l.Title
-					break
-				}
-			}
-		}
-		// Only the FIRST lab's tests. Per-lab download is the point: tests for labs
-		// this learner has not reached never touch their disk
-		// (the workspace-split design "Per-lab test download, not per-course").
-		if firstStage != "" {
-			if err := fetchLab(course, firstStage, s.dir); err != nil {
-				debugf("first lab not fetched at start: %v", err)
-			}
-		}
-	} else {
-		fmt.Fprintf(os.Stderr, "sboot: note — the tests are not cached yet (%v)\n", err)
-		fmt.Fprintln(os.Stderr, "sboot: run `sboot fetch` when you're back online.")
-	}
-
-	if err := writeRepoFiles(dest, course, title, firstStage, specTree); err != nil {
-		fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
-		exitWith(2)
-	}
+	fetchTests(course, firstStage)
 
 	abs, _ := filepath.Abs(dest)
 	fmt.Printf("\n── your workspace is ready: %s\n", abs)
@@ -1827,10 +1988,87 @@ func runStart(course string, yes bool) {
 	}
 	saveQuietly(st)
 
-	// The repo concierge (§11.j): one confirm, entirely on this machine, never a
-	// blocker. Declining costs nothing — `sboot repo` re-offers any time.
-	startConcierge(course, abs, yes)
+	// The LOCAL repo — git init, identity, first commit. Nothing here can reach
+	// GitHub, and the one line below is the only thing that names it.
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "── your history starts here")
+	if err := ensureLocalRepo(os.Stderr, abs, course, yes); err != nil {
+		fmt.Fprintf(os.Stderr, "   %v\n", err)
+		fmt.Fprintln(os.Stderr, "   nothing here blocks the course — the files are on disk either way.")
+	}
+	fmt.Fprintf(os.Stderr, "   when you want it on GitHub: %s\n", painter(os.Stderr)(ansiGreen, "sboot repo"))
 
+	printFirstLab(course, dest, firstStage, firstTitle)
+}
+
+// repairStart is `sboot start` run against a workspace that already exists: put
+// back what is missing, touch nothing that is there, and say which it was.
+//
+// NEVER OVERWRITES A LEARNER FILE, and that is a property of the mechanism rather
+// than a promise: the starter tree is unpacked to a staging directory and only the
+// paths ABSENT from the workspace are copied across, so a file the learner has
+// edited is not compared, not backed up, and not read. writeRepoFiles has the same
+// rule for the four files it generates.
+func repairStart(course, dest, title, firstStage, firstTitle, specTree string, yes bool) {
+	fmt.Printf("── %s is already here — checking what is missing\n", dest)
+	var repaired []string
+
+	stagedDir, err := os.MkdirTemp(filepath.Dir(absOr(dest)), ".sboot-start-")
+	if err == nil {
+		defer os.RemoveAll(stagedDir)
+		if err := fetchWorkspace(course, stagedDir); err != nil {
+			// A repair that cannot reach the platform still repairs the cache half
+			// below; say so once and carry on.
+			fmt.Fprintf(os.Stderr, "sboot: could not re-fetch the starter tree (%v)\n", err)
+		} else {
+			restored, err := copyMissing(stagedDir, dest)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "sboot: could not restore missing files (%v)\n", err)
+			}
+			repaired = append(repaired, restored...)
+		}
+	}
+
+	before, _ := cachedSpec(course)
+	fetchTests(course, firstStage)
+	if after, ok := cachedSpec(course); ok && after.dir != before.dir {
+		repaired = append(repaired, "the course's tests + grading engine")
+	}
+
+	// The four generated files, restored one by one — writeRepoFiles skips what
+	// exists, so this only has to notice what did not.
+	for _, f := range []string{manifestName, "LICENSE", ".gitignore", "README.md"} {
+		if _, err := os.Stat(filepath.Join(dest, f)); err != nil {
+			repaired = append(repaired, f)
+		}
+	}
+	if err := writeRepoFiles(dest, course, title, firstStage, specTree); err != nil {
+		fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
+		exitWith(2)
+	}
+
+	abs, _ := filepath.Abs(dest)
+	if len(repaired) == 0 {
+		fmt.Printf("\n── nothing was missing: %s is complete.\n", abs)
+	} else {
+		fmt.Printf("\n── repaired %s:\n", abs)
+		for _, r := range repaired {
+			fmt.Printf("   + %s\n", r)
+		}
+		fmt.Println("   your own files were not touched — only what was absent came back.")
+	}
+	if err := ensureLocalRepo(os.Stderr, abs, course, yes); err != nil {
+		fmt.Fprintf(os.Stderr, "   %v\n", err)
+	}
+	if _, ok := existingRemote(abs); !ok {
+		fmt.Fprintf(os.Stderr, "   when you want it on GitHub: %s\n", painter(os.Stderr)(ansiGreen, "sboot repo"))
+	}
+	printFirstLab(course, dest, firstStage, firstTitle)
+}
+
+// printFirstLab is the handoff both paths end on: the first live lab, the command
+// that grades it, and its lesson URL (P6 — a URL at the decision moment).
+func printFirstLab(course, dest, firstStage, firstTitle string) {
 	firstTest := firstStage
 	if firstTest == "" {
 		firstTest = "01-boot"
@@ -1841,9 +2079,180 @@ func runStart(course string, yes bool) {
 	}
 	p := painter(os.Stdout)
 	fmt.Printf("\nbegin at lab %s — %s:\n", labNumber(firstTest), p(ansiAmber, headline))
-	fmt.Printf("  cd %s\n", dest)
+	if dest != "." {
+		fmt.Printf("  cd %s\n", dest)
+	}
 	fmt.Printf("  %s                  %s\n", p(ansiGreen, "sboot test"), p(ansiDim, "# grades "+firstTest))
 	fmt.Printf("  %s/courses/%s/stages/%s\n", siteURL(), course, firstTest)
+}
+
+// fetchWorkspace downloads the course's starter tree into `dest`.
+func fetchWorkspace(course, dest string) error {
+	req, err := authedRequest("GET", apiURL()+"/api/v1/courses/"+course+"/workspace", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := send(&http.Client{Timeout: 120 * time.Second}, req)
+	if err != nil {
+		return fmt.Errorf("could not reach the platform (%w)", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var e struct {
+			Err string `json:"error"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&e)
+		if e.Err == "" {
+			e.Err = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+		return &apiError{status: resp.StatusCode, msg: e.Err}
+	}
+	return extractTarGz(resp.Body, dest)
+}
+
+func reportWorkspaceFailure(course string, err error) {
+	fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
+	if e, ok := err.(*apiError); ok {
+		if e.status == http.StatusUnauthorized {
+			reportSignedOut("sboot start " + course)
+			return
+		}
+		// The platform ANSWERED — a renamed course (410, naming the new id), a
+		// course it does not have, a lab this account cannot open. Nothing is
+		// "coming back"; the message above already says what to do instead.
+		if e.status >= 400 && e.status < 500 {
+			fmt.Fprintln(os.Stderr, "sboot: nothing was left on disk.")
+			return
+		}
+	}
+	fmt.Fprintln(os.Stderr, "sboot: nothing was left on disk — re-run `sboot start` when it is back.")
+}
+
+// reportSignedOut answers a 401 on the first command anyone runs.
+//
+// `sboot login` FIRST, the token second (P-6, 2026-09-02). A bare "invalid or
+// missing token" is a dead end — the reader has no idea a token exists — and the
+// old answer sent them to a web page to copy one into an env var, which is the
+// fallback, not the path the lesson teaches. `sboot login` connects the machine
+// in one command with a browser approval and stores the credential; the export
+// stays for CI and for anyone whose browser cannot be reached.
+//
+// `retry` is the command the reader was running, printed verbatim as the second
+// step — `sboot start <course>` or `sboot resume <what they typed>` — because the
+// point of naming it is that they can paste it.
+func reportSignedOut(retry string) {
+	p := painter(os.Stderr)
+	fmt.Fprintf(os.Stderr, "\n  This machine is not connected to your account yet:\n")
+	fmt.Fprintf(os.Stderr, "    %s\n", p(ansiGreen, "sboot login"))
+	fmt.Fprintf(os.Stderr, "    %s\n", retry)
+	fmt.Fprintf(os.Stderr, "\n  No browser here? Take a token from %s/account instead:\n", siteURL())
+	fmt.Fprintf(os.Stderr, "    export SBOOT_TOKEN=<the token>\n")
+}
+
+// fetchTests puts the course's tests and grading engine in the cache, and the
+// first live lab's checks beside them. Never fatal: the workspace is on disk and
+// the next `sboot test` finishes the job.
+func fetchTests(course, firstStage string) {
+	s, err := ensureSpec(course, "")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sboot: note — the tests are not cached yet (%v)\n", err)
+		fmt.Fprintln(os.Stderr, "sboot: run `sboot fetch` when you're back online.")
+		return
+	}
+	// Only the FIRST lab's tests. Per-lab download is the point: tests for labs
+	// this learner has not reached never touch their disk
+	// (the workspace-split design "Per-lab test download, not per-course").
+	if firstStage != "" {
+		if err := fetchLab(course, firstStage, s.dir); err != nil {
+			debugf("first lab not fetched at start: %v", err)
+		}
+	}
+}
+
+// ── the small filesystem half of start ──────────────────────────────────────────
+
+func absOr(p string) string {
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
+func dirNonEmpty(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	return err == nil && len(entries) > 0
+}
+
+// moveInto puts a staged tree at `dest`, which is either absent or an empty
+// directory somebody made in advance.
+func moveInto(staged, dest string) error {
+	if st, err := os.Stat(dest); err == nil && st.IsDir() {
+		// An empty directory the learner created for us: replace it, so the rename
+		// below works the same way on every OS (Windows refuses to rename onto an
+		// existing directory even when it is empty).
+		if err := os.Remove(dest); err != nil {
+			// Not removable — fall back to copying the contents across.
+			_, cerr := copyMissing(staged, dest)
+			if cerr != nil {
+				return cerr
+			}
+			return os.RemoveAll(staged)
+		}
+	}
+	if err := os.Rename(staged, dest); err == nil {
+		return nil
+	}
+	// Different filesystems (a TMPDIR override, a mounted home): copy instead.
+	if _, err := copyMissing(staged, dest); err != nil {
+		return err
+	}
+	return os.RemoveAll(staged)
+}
+
+// copyMissing copies every file under `src` to `dst` that is NOT already there,
+// and returns the workspace-relative names of the ones it wrote.
+//
+// The never-overwrite rule is the whole function: an existing path is skipped
+// before it is opened, so a file the learner has edited is not read, not compared
+// and not replaced.
+func copyMissing(src, dst string) ([]string, error) {
+	var written []string
+	err := filepath.WalkDir(src, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, relErr := filepath.Rel(src, p)
+		if relErr != nil || rel == "." {
+			return relErr
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		if _, err := os.Stat(target); err == nil {
+			return nil // theirs — leave it alone
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		mode := os.FileMode(0o644)
+		if info, err := d.Info(); err == nil {
+			mode = info.Mode().Perm()
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(target, b, mode); err != nil {
+			return err
+		}
+		written = append(written, filepath.ToSlash(rel))
+		return nil
+	})
+	return written, err
 }
 
 // tarGzDir packages a directory (source only: build artifacts excluded).

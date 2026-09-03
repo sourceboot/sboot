@@ -18,14 +18,15 @@ const shortHelpText = `sboot — learn by building
 
 usage: sboot [command] [args]      bare ` + "`sboot`" + ` shows where you are and what's next
 
-  start [course]        create a course workspace in ./<course>/ (no-arg lists the catalog)
+  start [course]        create a course workspace and its git repo (no-arg lists the catalog)
   test [stage]          practice: grade the current lab locally (fast loop, offline-friendly)
   hint [stage] [check]  a hint for a failing check — one rung deeper per run
   explain [check]       the AI tutor on that check, fed your last run (--here: in this terminal)
   submit [stage]        official: check locally first, then upload for the server grade
   courses               the catalog + your progress
   login                 connect this machine to your account
-  repo                  create your GitHub repo for this course and push (via gh)
+  repo                  put this workspace on GitHub — a private repo, pushed (via gh)
+  resume <path|url>     pick a course back up on this machine (clones a git URL first)
 
 ` + "`sboot help --all`" + ` lists every command, flag and environment variable.
 `
@@ -36,14 +37,15 @@ func fullHelpText() string {
 usage: sboot [command] [args]      bare `+"`sboot`"+` shows where you are and what's next
 
 the learner verbs:
-  start [course]        create a course workspace in ./<course>/ (no-arg lists the catalog)
+  start [course]        create a course workspace and its git repo (no-arg lists the catalog)
   test [stage]          practice: grade the current lab locally (fast loop, offline-friendly)
   hint [stage] [check]  a hint for a failing check — one rung deeper per run
   explain [check]       the AI tutor on that check, fed your last run (--here: in this terminal)
   submit [stage]        official: check locally first, then upload for the server grade
   courses               the catalog + your progress
   login                 connect this machine to your account (device connect)
-  repo                  create your GitHub repo for this course and push (via gh)
+  repo                  put this workspace on GitHub — a private repo, pushed (via gh)
+  resume <path|url>     pick a course back up on this machine (clones a git URL first)
 
 everything else:
   reveal [stage]        the course's own solution for a lab — marks it solution-assisted
@@ -61,6 +63,8 @@ flags:
   --message, -m TEXT    your question, instead of the one explain composes (explain)
   --json                machine-readable output on `+"`sboot`"+`, test and submit
   --yes, -y             answer yes to every prompt (start, repo, reveal)
+  --dir NAME            unpack into this folder instead of the course's own (start)
+  --name NAME           create a repo of this name instead of the default (repo)
   --no-color            no ANSI color (NO_COLOR is honored too)
   --                    end of options; everything after is positional
 

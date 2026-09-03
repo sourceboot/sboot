@@ -128,6 +128,26 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 	// fetched and staged, offline falling back to the cache.
 	run := prepare(r, stage)
 
+	st := loadState()
+
+	// A run that produced no verdict at all is the freshest thing we know —
+	// noteRunError clears it the moment anything grades — and it is the case
+	// `sboot test` sends here with "stuck? sboot hint" only for hint to answer
+	// "run sboot test first" (dogfood F00-4/5). Answer the run they actually had.
+	//
+	// BEFORE hints.json is looked for (2026-09-02, G141). This answer is code, not
+	// an authored hint, and it needs no file: a course that publishes no hints
+	// meets a missing linker on a fresh machine exactly like one that does, and
+	// "no hints published" is the wrong thing to say to someone whose build just
+	// died in the operating system's own output.
+	if checkID == "" {
+		if reason := st.lastRunError(r.course, stage); reason != "" {
+			fmt.Println(renderBlockedHint(r, stage, reason, st.buildOut(r.course, stage),
+				stageStuckURL(r.course, stage)))
+			return 0
+		}
+	}
+
 	b, err := os.ReadFile(filepath.Join(run, hintsFileName))
 	if err != nil {
 		// Not an error: a course simply may not publish hints (os-rust's v1
@@ -148,20 +168,11 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 		return 0
 	}
 
-	st := loadState()
 	failing, graded := st.lastFailed(r.course, stage)
 
 	target := checkID
 	checkDefaulted := false
 	if target == "" {
-		// A run that produced no verdict at all is the freshest thing we know —
-		// noteRunError clears it the moment anything grades — and it is the case
-		// `sboot test` sends here with "stuck? sboot hint" only for hint to answer
-		// "run sboot test first" (dogfood F00-4/5). Answer the run they actually had.
-		if reason := st.lastRunError(r.course, stage); reason != "" {
-			fmt.Println(renderBlockedHint(r, stage, reason, stageStuckURL(r.course, stage)))
-			return 0
-		}
 		if !graded {
 			fmt.Fprintf(os.Stderr, "Run `sboot test %s` first, then `sboot hint` picks up what failed "+
 				"— or name a check: `sboot hint %s <check-id>`.\n", stage, stage)
@@ -262,10 +273,10 @@ func renderHint(stage, checkID string, e hintEntry, rung int, observed, stuckURL
 				suffix = " — the debug ladder"
 			}
 			out = append(out, fmt.Sprintf(
-				"run it again for the next rung (%d of %d%s).", rung+1, n, suffix))
+				"run it again for the next one (%d of %d%s).", rung+1, n, suffix))
 		} else {
 			out = append(out,
-				"that's the last authored rung. next: `sboot explain "+checkID+"` — the AI tutor,",
+				"that's the last written hint. next: `sboot explain "+checkID+"` — the AI tutor,",
 				"with this run's evidence attached (`--here` answers in this terminal).",
 				"or the same chat on this lab's page:",
 				"  "+stuckURL)
@@ -317,10 +328,26 @@ func defaultHintTarget(failing []string) string {
 // build failed, or the toolchain could not start it. There is no authored ladder for
 // either (a hint is per check, and no check ran), so this points at the only evidence
 // that exists — the compiler's own output, or the missing tool.
-func renderBlockedHint(r repo, stage, reason, stuckURL string) string {
+//
+// `buildOut` is what the build itself printed (state.go BuildOut), and it splits the
+// build-failed branch in two. "Fix the FIRST error" is the right answer to a compile
+// error and the WRONG one to `linker cc not found`: the learner of lab 00 has written
+// no code, and the first error is the operating system's. So a build whose output
+// carries a missing-linker signature is answered as the toolchain problem it is
+// (toolchain.go) — the same shape the `toolchain:` reason already used, because it is
+// the same fact discovered one classifier later.
+func renderBlockedHint(r repo, stage, reason, buildOut, stuckURL string) string {
 	out := []string{"[hint — nothing was graded]", ""}
 	once := "once it builds"
-	if reason == "toolchain" || strings.HasPrefix(reason, "toolchain:") {
+	switch {
+	case reason == "build" && missingLinker(hostOS, buildOut):
+		once = "once that is installed"
+		out = append(out,
+			"Your last `sboot test "+stage+"` never reached a check: your machine has no linker,",
+			"so nothing in this lab has been scored yet — this is your machine, not your code.")
+		out = append(out, "")
+		out = append(out, linkerHint(hostOS)...)
+	case reason == "toolchain" || strings.HasPrefix(reason, "toolchain:"):
 		once = "once that is installed"
 		// "" when the launch error did not name an executable — installHint has an
 		// honest answer for that case too, so it is passed through unchanged.
@@ -335,7 +362,8 @@ func renderBlockedHint(r repo, stage, reason, stuckURL string) string {
 		for _, l := range installHint(tool, rustChannel(r.dir)) {
 			out = append(out, "  "+l)
 		}
-	} else {
+		out = append(out, "  "+newTerminalNote())
+	default:
 		out = append(out,
 			"Your last `sboot test "+stage+"` stopped at the build, so no check ran and there is",
 			"no failing check to hint at yet.",

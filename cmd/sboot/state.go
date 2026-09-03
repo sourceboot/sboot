@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 )
 
 // l2Threshold is the number of consecutive failures of one check that earns
@@ -83,6 +84,30 @@ type guidanceState struct {
 	// broken instead of telling them to run the test they just ran (dogfood
 	// F00-5). Cleared by the next run that actually grades something.
 	RunError map[string]string `json:"last_run_error,omitempty"`
+	// "course/stage" -> what the BUILD printed when it produced no verdict: head
+	// and tail, bounded, colour stripped (buildlog.go, maxBuildOutBytes).
+	//
+	// The evidence channel a failed build never had. Until 2026-09-02 the build
+	// streamed to the terminal and nowhere else, so a run that died before any
+	// check ran left the CLI knowing only THAT it failed — and on three fresh
+	// machines the first thing a learner met was linker output the whole ladder
+	// was blind to. Written by the same runs that write RunError and cleared with
+	// it, so it can never outlive the failure it describes.
+	//
+	// Never echoed back verbatim: `sboot hint` matches signatures against it and
+	// prints ITS OWN authored answer (toolchain.go). The learner has already read
+	// the real text — it was on their screen.
+	BuildOut map[string]string `json:"last_build_output,omitempty"`
+	// course -> the stage of the most recent LOCAL run that produced no verdict at
+	// all, cleared by the next run in that course that grades anything.
+	//
+	// It answers ONE question a bare `sboot hint` must ask before the account
+	// frontier: is this learner's last run a build that died? A fully-verified
+	// account whose build had just failed was told "all live labs are verified —
+	// nothing to hint. Nice work" (D-WIN-4), which is the frontier's honest answer
+	// to a question nobody asked; that learner is exactly the one lab 00's "new
+	// machine, months from now" promise creates.
+	Blocked map[string]string `json:"last_blocked_stage,omitempty"`
 	// course id -> what the SERVER said about this course the last time we could
 	// ask it (ux-plan §5/§7.5, the v0.4 orientation release). This is the offline
 	// half of "server truth when online, cache offline": bare `sboot` and the
@@ -98,6 +123,18 @@ type guidanceState struct {
 	// `sboot courses` and the out-of-repo status degrade to cached orientation
 	// rather than a wall (P7).
 	Catalog *catalogCache `json:"catalog,omitempty"`
+	// nudge key ("repo/<course>") -> the UTC day it was last printed, "YYYY-MM-DD".
+	//
+	// The cadence half of P-21 (2026-09-02): a learner whose workspace has no
+	// GitHub remote is told so after every PASSING submit — the moment there is
+	// something worth showing — but at most ONCE A DAY on `sboot test`, which runs
+	// dozens of times an hour and is the loop the nudge must stay out of. A day is
+	// the coarsest unit that still catches someone who only works weekends.
+	//
+	// Append-only like every other field here, so stateVersion stays 1: an older
+	// binary reading this file simply does not see the map, and nudges as it
+	// always did.
+	Nudged map[string]string `json:"nudged_on,omitempty"`
 	// Where this was loaded from. Unexported, so never serialized.
 	path string
 	// Whether record() actually changed anything. Nothing to record means nothing
@@ -166,8 +203,11 @@ func loadState() *guidanceState {
 		Evidence:   map[string]string{},
 		LastFailed: map[string][]string{},
 		RunError:   map[string]string{},
+		BuildOut:   map[string]string{},
+		Blocked:    map[string]string{},
 		Sync:       map[string]*courseSync{},
 		LastScore:  map[string]string{},
+		Nudged:     map[string]string{},
 	}
 	dir, err := stateDir()
 	if err != nil {
@@ -197,15 +237,46 @@ func loadState() *guidanceState {
 	if loaded.RunError != nil {
 		s.RunError = loaded.RunError
 	}
+	if loaded.BuildOut != nil {
+		s.BuildOut = loaded.BuildOut
+	}
+	if loaded.Blocked != nil {
+		s.Blocked = loaded.Blocked
+	}
 	if loaded.Sync != nil {
 		s.Sync = loaded.Sync
 	}
 	if loaded.LastScore != nil {
 		s.LastScore = loaded.LastScore
 	}
+	if loaded.Nudged != nil {
+		s.Nudged = loaded.Nudged
+	}
 	s.Catalog = loaded.Catalog
 	return s
 }
+
+// nudgeDue reports whether a once-a-day nudge has not been printed today.
+//
+// UTC, not local time: the only thing this must not do is fire twice in one
+// sitting, and a learner whose clock crosses midnight mid-session is a better
+// outcome than one whose timezone change re-arms it.
+func (s *guidanceState) nudgeDue(key string) bool {
+	return s.Nudged[key] != utcDay()
+}
+
+func (s *guidanceState) markNudged(key string) {
+	if s.Nudged == nil {
+		s.Nudged = map[string]string{}
+	}
+	if s.Nudged[key] == utcDay() {
+		return
+	}
+	s.Nudged[key] = utcDay()
+	s.dirty = true
+}
+
+func utcDay() string { return time.Now().UTC().Format("2006-01-02") }
 
 // save writes the state atomically (temp file + rename) so an interrupted run
 // cannot leave a truncated file that resets everyone's counters.
@@ -396,11 +467,73 @@ func (s *guidanceState) noteRunError(course, stage string, res graderRun) {
 			reason += ":" + tool
 		}
 		s.setRunError(course, stage, reason)
+		s.setBuildOut(course, stage, res.buildOut)
+		s.setBlocked(course, stage)
 	case res.buildFailed:
 		s.setRunError(course, stage, "build")
+		s.setBuildOut(course, stage, res.buildOut)
+		s.setBlocked(course, stage)
 	case res.graded():
 		s.clearRunError(course, stage)
+		s.setBuildOut(course, stage, "")
+		s.clearBlocked(course)
 	}
+}
+
+// maxBuildOutBytes bounds one blocked run's recorded build output. buildlog.go
+// already bounds what it collects; this is the belt to that braces, and it is the
+// number that keeps state.json small enough to rewrite on every run.
+const maxBuildOutBytes = 8 << 10
+
+// setBuildOut records (or drops, on "") what the build printed for one stage.
+func (s *guidanceState) setBuildOut(course, stage, text string) {
+	k := course + "/" + stage
+	if len(text) > maxBuildOutBytes {
+		text = text[:maxBuildOutBytes]
+	}
+	if text == "" {
+		if _, had := s.BuildOut[k]; had {
+			delete(s.BuildOut, k)
+			s.dirty = true
+		}
+		return
+	}
+	if s.BuildOut[k] == text {
+		return
+	}
+	s.BuildOut[k] = text
+	s.dirty = true
+}
+
+// buildOut is what the build printed on the last run of this stage that produced
+// no verdict, or "" — never graded, graded since, or an older state file.
+func (s *guidanceState) buildOut(course, stage string) string {
+	return s.BuildOut[course+"/"+stage]
+}
+
+// setBlocked remembers WHICH stage the last non-grading run of this course was.
+func (s *guidanceState) setBlocked(course, stage string) {
+	if s.Blocked[course] == stage {
+		return
+	}
+	s.Blocked[course] = stage
+	s.dirty = true
+}
+
+// clearBlocked is called by every run that grades: once anything in this course
+// has real checks to talk about, the ladder's normal rules apply again.
+func (s *guidanceState) clearBlocked(course string) {
+	if _, had := s.Blocked[course]; !had {
+		return
+	}
+	delete(s.Blocked, course)
+	s.dirty = true
+}
+
+// blockedStage is the stage a bare `sboot hint` should answer before it consults
+// the account frontier, or "" when the last local run in this course graded.
+func (s *guidanceState) blockedStage(course string) string {
+	return s.Blocked[course]
 }
 
 func (s *guidanceState) setRunError(course, stage, reason string) {

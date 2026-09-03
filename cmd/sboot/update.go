@@ -49,7 +49,9 @@ const (
 )
 
 // nudgeInterval is how often an ordinary "there is a newer version" line may
-// appear. A deprecation warning and an incident notice both ignore it.
+// appear — and, since 2026-09-02, how often the same NOTICE text may repeat. A
+// deprecation warning still ignores it, and so does a notice nobody has been shown
+// yet (dueForNotice): the ration is on repetition, never on news.
 const nudgeInterval = 24 * time.Hour
 
 // noticeMax bounds what we will print from the server. The server already
@@ -118,9 +120,24 @@ func renderNotice(w io.Writer, running string, now time.Time) {
 	}
 
 	var lines []string
-	// The notice is for incidents, so it is never throttled and comes first.
-	if n := safeLine(channel.notice); n != "" {
+	// The notice comes first, and since 2026-09-02 it is THROTTLED — once per 24h
+	// per distinct text.
+	//
+	// It used to print on every networked command, on the reasoning that a notice
+	// is for incidents and an incident should not be rationed. Then the 2026-09-01
+	// course renames used the channel for its other designed purpose (a standing
+	// announcement, not an incident) and three fresh machines met the same 178-byte
+	// line after all 32 of their networked commands — including a brand-new learner
+	// for whom `rust-start` had never existed, on PowerShell, where a native stderr
+	// line renders as a red error record (D-MACOS-9 / D-WIN-10).
+	//
+	// PER DISTINCT TEXT is what keeps the incident case whole, and it settles the
+	// scope question cli-releases.md §1 left open: the throttle is the CHANNEL's,
+	// but a notice nobody has been shown yet is never throttled, so a real incident
+	// still reaches every binary on its very next run. Only a REPEAT is rationed.
+	if n := safeLine(channel.notice); n != "" && dueForNotice(n, now) {
 		lines = append(lines, "sboot: "+n)
+		markNoticed(n, now)
 	}
 
 	// `!=`, never `<` (rule 1) — but on NORMALISED strings. release.yml stamps
@@ -132,13 +149,14 @@ func renderNotice(w io.Writer, running string, now time.Time) {
 			// The remedy is the installer, spelled out: `sboot upgrade` does not
 			// exist (the CLI release policy §3 — "do not build yet"), and a nudge
 			// naming a command that errors is worse than no nudge.
+			remedy := updateCommandFor(hostOS)
 			line := fmt.Sprintf(
-				"sboot %s → %s available · update: curl -fsSL https://sourceboot.com/install.sh | sh · notes: github.com/sourceboot/sboot/releases",
-				running, channel.latest)
+				"sboot %s → %s available · update: %s · notes: github.com/sourceboot/sboot/releases",
+				running, channel.latest, remedy)
 			if deprecated {
 				line = fmt.Sprintf(
-					"sboot %s is deprecated (minimum supported is %s) · update to %s: curl -fsSL https://sourceboot.com/install.sh | sh",
-					running, channel.min, channel.latest)
+					"sboot %s is deprecated (minimum supported is %s) · update to %s: %s",
+					running, channel.min, channel.latest, remedy)
 			}
 			lines = append(lines, line)
 			if !deprecated {
@@ -149,6 +167,23 @@ func renderNotice(w io.Writer, running string, now time.Time) {
 	for _, l := range lines {
 		fmt.Fprintln(w, l)
 	}
+}
+
+// updateCommandFor is HOW to update, per OS — the one line in the nudge a learner
+// is expected to act on.
+//
+// It was the `curl … | sh` one-liner everywhere until 2026-09-02, and on Windows
+// that is not merely the wrong spelling: pasted into PowerShell it produces a red
+// error block about `sh` not being a cmdlet (D-WIN-2), i.e. the tool's own advice
+// is the next thing that breaks. There is no install.ps1 and no `sboot upgrade`
+// (cli-releases.md §3 — "do not build yet"), and a nudge must never name a command
+// that does not exist, so Windows gets the instruction lab 00 step 1 already gives:
+// download the new .exe and replace the one you have.
+func updateCommandFor(goos string) string {
+	if goos == "windows" {
+		return "download sboot-windows-amd64.exe from github.com/sourceboot/sboot/releases and replace your sboot.exe"
+	}
+	return "curl -fsSL https://sourceboot.com/install.sh | sh"
 }
 
 // safeLine flattens and bounds a server-supplied string. See noticeMax.
@@ -179,52 +214,48 @@ type updateState struct {
 	Version int `json:"version"`
 	// RFC3339. When we last printed an ordinary update nudge on this machine.
 	LastNudge string `json:"last_nudge"`
+	// RFC3339, and the TEXT it belongs to: the notice channel's own throttle
+	// (2026-09-02). Both fields together, because "have they seen THIS one?" is
+	// the question — a new notice must never inherit an old one's timestamp.
+	// Append-only, like every other wire shape here: an update.json written by an
+	// older binary simply lacks them, which reads as "never shown" and prints.
+	LastNotice string `json:"last_notice,omitempty"`
+	Notice     string `json:"notice,omitempty"`
 }
 
-func updatePath() (string, error) {
-	dir, err := stateDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "update.json"), nil
-}
-
-// dueForNudge answers "has it been 24h?" and fails OPEN: an unreadable or corrupt
-// file costs one extra line, which is the right way round for a mechanism whose
-// whole job is to be able to reach someone.
-func dueForNudge(now time.Time) bool {
+// loadUpdateState reads the throttle file, or returns a zero state. Never an
+// error: every caller's honest fallback is "we have shown nothing yet", which
+// costs one extra line and never silences the channel.
+func loadUpdateState() updateState {
 	p, err := updatePath()
 	if err != nil {
-		return true
+		return updateState{}
 	}
 	b, err := os.ReadFile(p)
 	if err != nil {
-		return true
+		return updateState{}
 	}
 	var s updateState
 	if err := json.Unmarshal(b, &s); err != nil || s.Version != updateStateVersion {
-		return true
+		return updateState{}
 	}
-	last, err := time.Parse(time.RFC3339, s.LastNudge)
-	if err != nil {
-		return true
-	}
-	return now.Sub(last) >= nudgeInterval
+	return s
 }
 
-// markNudged records the nudge. Best-effort: a machine where we cannot write this
-// gets nudged every run, which is noisy but never wrong. Atomic (temp + rename)
-// for the same reason state.json is — an interrupted run must not leave a
-// truncated file that silently re-enables the nag.
-func markNudged(now time.Time) {
+// saveUpdateState rewrites the throttle file atomically (temp + rename), the same
+// way state.json is written and for the same reason: an interrupted run must not
+// leave a truncated file that silently re-enables the nag.
+//
+// It takes the WHOLE state, so a nudge cannot clobber the notice's bookkeeping or
+// the other way round — the failure that shape invites is one throttle quietly
+// resetting the other every run.
+func saveUpdateState(s updateState) {
 	p, err := updatePath()
 	if err != nil {
 		return
 	}
-	b, err := json.MarshalIndent(updateState{
-		Version:   updateStateVersion,
-		LastNudge: now.UTC().Format(time.RFC3339),
-	}, "", "  ")
+	s.Version = updateStateVersion
+	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return
 	}
@@ -240,6 +271,61 @@ func markNudged(now time.Time) {
 	if err := os.Rename(tmp, p); err != nil {
 		debugf("could not save the update throttle: %v", err)
 	}
+}
+
+// dueForNotice answers "should this notice print now?" and fails OPEN, like
+// dueForNudge: an unreadable file costs one extra line, which is the right way
+// round for the only channel that can reach a binary we cannot patch.
+//
+// A notice whose TEXT differs from the last one shown is always due — that is the
+// incident case, and it must not wait behind yesterday's announcement.
+func dueForNotice(text string, now time.Time) bool {
+	s := loadUpdateState()
+	if s.Notice != text || s.LastNotice == "" {
+		return true
+	}
+	last, err := time.Parse(time.RFC3339, s.LastNotice)
+	if err != nil {
+		return true
+	}
+	return now.Sub(last) >= nudgeInterval
+}
+
+// markNoticed records WHICH notice was shown and when.
+func markNoticed(text string, now time.Time) {
+	s := loadUpdateState()
+	s.Notice = text
+	s.LastNotice = now.UTC().Format(time.RFC3339)
+	saveUpdateState(s)
+}
+
+func updatePath() (string, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "update.json"), nil
+}
+
+// dueForNudge answers "has it been 24h?" and fails OPEN: an unreadable or corrupt
+// file costs one extra line, which is the right way round for a mechanism whose
+// whole job is to be able to reach someone.
+func dueForNudge(now time.Time) bool {
+	last, err := time.Parse(time.RFC3339, loadUpdateState().LastNudge)
+	if err != nil {
+		return true
+	}
+	return now.Sub(last) >= nudgeInterval
+}
+
+// markNudged records the nudge. Best-effort: a machine where we cannot write this
+// gets nudged every run, which is noisy but never wrong. Atomic (temp + rename)
+// for the same reason state.json is — an interrupted run must not leave a
+// truncated file that silently re-enables the nag.
+func markNudged(now time.Time) {
+	s := loadUpdateState()
+	s.LastNudge = now.UTC().Format(time.RFC3339)
+	saveUpdateState(s)
 }
 
 // ── version ordering, only where ordering is actually the question ──────────────
