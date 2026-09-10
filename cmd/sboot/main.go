@@ -866,6 +866,59 @@ type apiError struct {
 
 func (e *apiError) Error() string { return fmt.Sprintf("%s (HTTP %d)", e.msg, e.status) }
 
+// serverMessageMax bounds a platform sentence we re-print. The body fetchManifest
+// reads is capped at 1 MB, and a `msg` anywhere near that is not a sentence.
+const serverMessageMax = 300
+
+// serverMessage is the CLI-side mirror of the platform's safeHeaderValue
+// (platform/lib/cli-version.ts): NEVER PRINT A REMOTE STRING AS IF IT WERE OURS
+// (2026-09-04, wave-B finding #11 over review finding R-161).
+//
+// The refusal branches below quote the platform's own sentence, because it is the
+// only side that knows which refusal this is. Quoted verbatim, that sentence owns
+// our stderr: a `msg` carrying newlines re-printed
+//
+//	If it keeps failing, delete this course's cache and fetch again:
+//	  rm -rf ~/Library/Caches/sboot/courses/os-rust
+//
+// as its own indented lines, above our own output — putting back, in our voice,
+// the exact destructive instruction the classification above exists to withhold.
+// Measured against a real httptest server; a 10,000-character message produced
+// 10,311 bytes of stderr.
+//
+// So every branch that echoes a server message folds it to ONE line and clamps it.
+// It is the same rule the platform applies to cli.yaml on its way out as a header,
+// and it holds for the same reason: SBOOT_API_URL is env-settable, so "the
+// platform" is not always ours.
+func serverMessage(s string) string {
+	// Runes, not bytes: the clamp must not be able to cut a multi-byte character in
+	// half and print a replacement glyph in the middle of the platform's sentence.
+	out := make([]rune, 0, serverMessageMax+1)
+	space := false
+	truncated := false
+	for _, r := range s {
+		// Every whitespace run — newlines included — becomes one space, so the
+		// message can occupy exactly the line we gave it and no other.
+		if r == '\r' || r == '\n' || r == '\t' || r == '\v' || r == '\f' || r == ' ' {
+			space = true
+			continue
+		}
+		if space && len(out) > 0 {
+			out = append(out, ' ')
+		}
+		space = false
+		if len(out) >= serverMessageMax {
+			truncated = true
+			break
+		}
+		out = append(out, r)
+	}
+	if truncated {
+		return string(out) + "…"
+	}
+	return string(out)
+}
+
 // ── where: the answer to "so where IS my grader?" ────────────────────────────────
 //
 // This command exists because two directories is more to explain than one, and if
@@ -986,9 +1039,81 @@ func runFetch(course string) int {
 			course = env("SBOOT_COURSE", defaultCourse)
 		}
 	}
-	s, err := ensureSpec(course, "")
+	s, st, err := ensureSpecStatus(course, "")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
+		return 2
+	}
+	// THE FETCH REPORTS THE FALLBACK (2026-09-04, review finding R-161).
+	//
+	// ensureSpec fails open on purpose — a laptop on a plane keeps grading — and
+	// until today the only trace was a SBOOT_DEBUG-gated debugf line, so `sboot
+	// fetch` printed the version it ALREADY HAD as a success. That turned the one
+	// remedy our own 409 names ("run `sboot fetch <course>` and submit again") into
+	// an unbreakable two-command loop: fetch says fine, submit says stale, forever.
+	//
+	// Only THIS command refuses. `sboot test` and `sboot submit` still fall back
+	// silently, because grading with slightly old tests beats not grading — but a
+	// command whose entire job is the download has to say when the download did not
+	// happen, and exit non-zero so a script notices too.
+	if st.stale(s) {
+		fmt.Fprintf(os.Stderr, "sboot: the tests for %s were NOT updated — still using spec %s.\n", course, s.version)
+		// CLASSIFY BEFORE PRESCRIBING (2026-09-04, wave-B finding #6, over review
+		// finding R-161). This branch used to key on `st.fetched == ""` alone, which
+		// is true of every case where NO MANIFEST WAS READ — and "the platform
+		// answered and refused" is one of those. So a 401 printed "The platform could
+		// not be reached", a 403 printed the plan-upgrade sentence under the same
+		// heading, and both then offered `rm -rf <course cache>` as the remedy.
+		// Following it destroys the only offline copy of that course's tests and
+		// fails identically, leaving `sboot test` with "no tests cached … and the
+		// platform is unreachable". A destructive remedy for a problem it cannot fix
+		// is worse than the bogus success this refusal replaced.
+		//
+		// The classification is STRUCTURAL: *apiError exists precisely to separate
+		// "we got a reply" from "we got nothing" (see its declaration), so nothing
+		// here matches on an error string. And fetchManifest decides that on the
+		// STATUS LINE before it trusts the body (2026-09-04, wave-B finding #1), so
+		// a 401 or 403 delivered as a proxy's HTML page classifies exactly like a
+		// JSON one — which is the likelier production shape of both.
+		var ae *apiError
+		answered := errors.As(st.cause, &ae)
+		// One line, bounded, whatever the platform sent — see serverMessage. The
+		// branches below quote it; nothing below quotes `ae.msg` directly.
+		var said string
+		if answered {
+			said = serverMessage(ae.msg)
+		}
+		switch {
+		case answered && ae.status == http.StatusUnauthorized:
+			fmt.Fprintf(os.Stderr, "  Your login is missing or expired: %s\n"+
+				"    sboot login\n", said)
+		case answered && ae.status == http.StatusForbidden:
+			// The platform's own sentence, because it is the only side that knows
+			// which of the several refusals this is — and the pricing link only when
+			// that sentence has not already given it, so the two do not stutter.
+			fmt.Fprintf(os.Stderr, "  The platform refused: %s\n", said)
+			if !strings.Contains(said, "/pricing") {
+				fmt.Fprintf(os.Stderr, "  If this course needs a plan: %s/pricing\n", siteURL())
+			}
+		case answered:
+			fmt.Fprintf(os.Stderr, "  The platform answered HTTP %d: %s\n", ae.status, said)
+		case st.fetched == "":
+			fmt.Fprintf(os.Stderr, "  The platform could not be reached: %v\n", st.cause)
+		default:
+			fmt.Fprintf(os.Stderr, "  The platform publishes spec %s; the download did not land: %v\n", st.fetched, st.cause)
+		}
+		// "Meanwhile", not "Until it does": with the classification above there are
+		// five possible antecedents and only one of them is a download.
+		fmt.Fprintf(os.Stderr, "  Meanwhile, `sboot test` and `sboot submit` grade against the OLD tests,\n"+
+			"  which is what a \"spec is out of date\" refusal from `sboot submit` is about.\n")
+		// ONLY for a genuine transport or download failure. A half-written cache is
+		// something deleting the cache fixes; a server's answer is not.
+		if dir, dirErr := courseCacheDir(course); dirErr == nil && !answered {
+			fmt.Fprintf(os.Stderr, "  If it keeps failing, delete this course's cache and fetch again:\n"+
+				"    sboot where          # every path this binary uses\n"+
+				"    %s\n"+
+				"    sboot fetch %s\n", removeDirCommand(dir), course)
+		}
 		return 2
 	}
 	fmt.Printf("── %s spec %s: %d lab(s) cached\n   %s\n",
@@ -1061,6 +1186,14 @@ type graderRun struct {
 	// (2026-09-02 review round; ledger G140/G141). Empty when the build never
 	// started, because there was nothing to print.
 	buildOut string
+	// The ENGINE refused this lab and exited >= 2 — it printed a learner-facing
+	// reason on stderr and produced no verdict. The third shape of "nothing was
+	// graded", beside launchFailed and buildFailed, and it became a shape a
+	// learner meets on 2026-09-06 (wave 2): a `course_owned` run refuses a tree
+	// that runs code while it compiles, and a cargo config the course did not
+	// ship. Recorded where it is known rather than inferred later from
+	// `exitCode >= 2`, which is also what a plain grade-below-full-marks is not.
+	engineRefused bool
 }
 
 // graded reports whether the ENGINE PRODUCED A VERDICT for this run — the `verdict`

@@ -363,6 +363,19 @@ func renderBlockedHint(r repo, stage, reason, buildOut, stuckURL string) string 
 			out = append(out, "  "+l)
 		}
 		out = append(out, "  "+newTerminalNote())
+	case reason == "engine":
+		// The engine REFUSED this lab (G238). It printed the reason — which file,
+		// which key, what to do — and this is deliberately not a second copy of
+		// that text: nothing records it, and a paraphrase of a refusal we did not
+		// read would be a guess. What the hint owes is the honest shape of the
+		// run, so the ladder stops answering the failure BEFORE this one.
+		once = "once that is sorted"
+		out = append(out,
+			"Your last `sboot test "+stage+"` never reached a check: the grading engine refused",
+			"this lab, so nothing has been scored yet.",
+			"",
+			"It printed why it refused, and what to change, when you ran it — re-run",
+			"`sboot test "+stage+"` to read that message again; it names the file and the line.")
 	default:
 		out = append(out,
 			"Your last `sboot test "+stage+"` stopped at the build, so no check ran and there is",

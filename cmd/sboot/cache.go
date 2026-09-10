@@ -502,10 +502,38 @@ func fetchManifest(course string) (*specManifest, error) {
 	}
 	defer resp.Body.Close()
 	var m specManifest
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&m); err != nil {
-		return nil, fmt.Errorf("HTTP %d: %w", resp.StatusCode, err)
+	decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&m)
+
+	// "ANSWERED" IS A PROPERTY OF THE STATUS LINE, NOT OF THE BODY'S CONTENT TYPE
+	// (2026-09-04, wave-B finding #1 over review finding R-161). The decode used to
+	// run FIRST, so a refusal whose body is not JSON — a corporate proxy, a captive
+	// portal, a Cloudflare or Vercel protection page — came back as a plain
+	// `fmt.Errorf("HTTP %d: …")`. `errors.As(cause, &apiError)` is false for that,
+	// so runFetch classified a 401 or a 403 as "the platform could not be reached"
+	// and then offered `rm -rf <course cache>` as the remedy: following it destroys
+	// the only offline copy of that course's tests and fails identically. Measured
+	// against a real httptest server answering 401 with an HTML body, on the exact
+	// two statuses G211 names.
+	//
+	// So the status is checked before the body is trusted, and a non-200 we could
+	// not parse still returns an *apiError — it says so in the message rather than
+	// pretending to a sentence the platform never sent.
+	if resp.StatusCode != http.StatusOK {
+		msg := m.Err
+		if decodeErr != nil {
+			msg = fmt.Sprintf("HTTP %d (unparseable response body)", resp.StatusCode)
+		} else if msg == "" {
+			msg = "unexpected response"
+		}
+		return nil, &apiError{status: resp.StatusCode, msg: msg, renamedTo: m.RenamedTo}
 	}
-	if resp.StatusCode != http.StatusOK || m.Version == "" {
+	// A 200 whose body will not parse stays a TRANSPORT failure on purpose: the
+	// status line says "here is your manifest" and what arrived was not one, which
+	// is interception or corruption rather than an answer to this request.
+	if decodeErr != nil {
+		return nil, fmt.Errorf("HTTP %d: %w", resp.StatusCode, decodeErr)
+	}
+	if m.Version == "" {
 		msg := m.Err
 		if msg == "" {
 			msg = "unexpected response"
@@ -649,6 +677,37 @@ func fetchLab(course, stage, dest string) error {
 	return fetchBundle(apiURL()+"/api/v1/courses/"+course+"/spec/labs/"+stage, dest)
 }
 
+// specStatus is the NETWORK half of what ensureSpec just did, reported for the one
+// caller whose entire job IS the network half.
+//
+// ── WHY IT EXISTS (2026-09-04, review finding R-161) ──────────────────────────
+// ensureSpec fails open in three places and says so only on a SBOOT_DEBUG-gated
+// debugf line. That is right for `sboot test` — a laptop on a plane must keep
+// grading — and wrong for `sboot fetch`, which then printed the version it already
+// had as a success. The loop that produced: the platform answers a submission with
+// 409 spec skew and tells the learner by name to "run `sboot fetch <course>` and
+// submit again"; fetch reports the OLD version as cached; the next submit 409s
+// again. Two commands, forever, with our own support message pointing at the one
+// that is lying — and unreproducible on a machine that materialises fine.
+type specStatus struct {
+	// fetched is the spec version the platform's manifest just advertised, or ""
+	// when no manifest was read at all (offline, unreachable, refused).
+	fetched string
+	// cause is why the update did not land, or nil when nothing went wrong.
+	cause error
+}
+
+// stale reports whether ensureSpec handed back a spec OLDER than what the platform
+// publishes — i.e. a fail-open branch fired and this machine is about to grade
+// against frozen tests.
+//
+// It compares VERSIONS rather than trusting `cause` alone, deliberately: a
+// materialise that failed on a version already on disk changed nothing, and calling
+// that a stale fallback would refuse a fetch that had nothing left to do.
+func (st specStatus) stale(got spec) bool {
+	return st.cause != nil && st.fetched != got.version
+}
+
 // ensureSpec is the one entry point `sboot test`/`submit`/`start` use: make sure a
 // spec version is on disk, and that it holds this lab's tests.
 //
@@ -659,6 +718,14 @@ func fetchLab(course, stage, dest string) error {
 //
 // `stage` may be "" to mean "just make sure a spec exists" (used by `sboot start`).
 func ensureSpec(course, stage string) (spec, error) {
+	s, _, err := ensureSpecStatus(course, stage)
+	return s, err
+}
+
+// ensureSpecStatus is ensureSpec plus the report. Every caller that only wants the
+// spec goes through ensureSpec above; `sboot fetch` is the one that must be able to
+// tell "nothing to do" from "nothing worked".
+func ensureSpecStatus(course, stage string) (spec, specStatus, error) {
 	have, haveOK := cachedSpec(course)
 	haveLab := haveOK && (stage == "" || have.hasLab(stage))
 
@@ -679,33 +746,37 @@ func ensureSpec(course, stage string) (spec, error) {
 		// branch cannot fire.
 		var re *apiError
 		if errors.As(err, &re) && re.renamedTo != "" {
-			return spec{}, fmt.Errorf("%s", re.msg)
+			return spec{}, specStatus{cause: err}, fmt.Errorf("%s", re.msg)
 		}
 		// FAIL OPEN. Losing the freshness check costs a warning; refusing to grade
 		// because a laptop is on a plane costs the product's offline promise.
 		if haveLab {
 			debugf("spec freshness check skipped (%v); using cached spec %s", err, have.version)
-			return have, nil
+			// `fetched` stays "" — no manifest was read — and "" never equals a
+			// cached version, so this IS a stale fallback as far as `sboot fetch`
+			// is concerned. That is the honest answer: a fetch that reached
+			// nothing verified nothing.
+			return have, specStatus{cause: err}, nil
 		}
 		var ae *apiError
 		if errors.As(err, &ae) {
-			return spec{}, fmt.Errorf("cannot fetch the tests for %s: %s", course, ae.msg)
+			return spec{}, specStatus{cause: err}, fmt.Errorf("cannot fetch the tests for %s: %s", course, ae.msg)
 		}
 		// TWO DIFFERENT PROBLEMS, and until 2026-08-02 both were reported as the
 		// second one. "no tests cached for os-rust" sends a learner whose course is
 		// cached off to re-download a course they already have — when the real answer
 		// is either a mistyped lab name or one lab they have never opened.
 		if haveOK {
-			return spec{}, offlineLabError(have, stage, err)
+			return spec{}, specStatus{cause: err}, offlineLabError(have, stage, err)
 		}
-		return spec{}, fmt.Errorf("no tests cached for %s and the platform is unreachable (%v).\n"+
+		return spec{}, specStatus{cause: err}, fmt.Errorf("no tests cached for %s and the platform is unreachable (%v).\n"+
 			"  Connect once to download them, then `sboot test` works offline", course, err)
 	}
 
 	// A lab the course has not published has no bundle to fetch; say so plainly
 	// rather than after a failed download.
 	if stage != "" && m.lab(stage) == nil {
-		return spec{}, fmt.Errorf("course %s has no lab %q", course, stage)
+		return spec{}, specStatus{fetched: m.Version}, fmt.Errorf("course %s has no lab %q", course, stage)
 	}
 
 	// THE ONE PLACE THIS FILE DOES NOT FAIL OPEN. Everything above falls back to the
@@ -713,7 +784,7 @@ func ensureSpec(course, stage string) (spec, error) {
 	// offline promise. This is the opposite case: the platform answered, and the
 	// answer was that this binary is too old to be trusted with these tests.
 	if err := minCLIRefusal(course, stage, m); err != nil {
-		return spec{}, err
+		return spec{}, specStatus{fetched: m.Version, cause: err}, err
 	}
 
 	target, err := materialise(course, m)
@@ -722,18 +793,18 @@ func ensureSpec(course, stage string) (spec, error) {
 		// cached spec beats a hard stop.
 		if haveLab {
 			debugf("could not materialise spec %s (%v); using cached spec %s", m.Version, err, have.version)
-			return have, nil
+			return have, specStatus{fetched: m.Version, cause: err}, nil
 		}
-		return spec{}, err
+		return spec{}, specStatus{fetched: m.Version, cause: err}, err
 	}
 
 	if stage != "" && !target.hasLab(stage) {
 		if err := fetchLab(course, stage, target.dir); err != nil {
 			if haveLab {
 				debugf("could not fetch lab %s (%v); using cached spec %s", stage, err, have.version)
-				return have, nil
+				return have, specStatus{fetched: m.Version, cause: err}, nil
 			}
-			return spec{}, fmt.Errorf("cannot fetch the tests for %s: %w", stage, err)
+			return spec{}, specStatus{fetched: m.Version, cause: err}, fmt.Errorf("cannot fetch the tests for %s: %w", stage, err)
 		}
 	}
 
@@ -743,7 +814,7 @@ func ensureSpec(course, stage string) (spec, error) {
 	// say so (the roadmap housekeeping: "data auto-updates, code does not").
 	if target.version != have.version {
 		if err := setCurrentVersion(course, target.version); err != nil {
-			return spec{}, err
+			return spec{}, specStatus{fetched: m.Version, cause: err}, err
 		}
 		if haveOK {
 			fmt.Printf("── the tests for %s were updated (spec %s → %s)\n",
@@ -751,7 +822,7 @@ func ensureSpec(course, stage string) (spec, error) {
 		}
 		pruneOldSpecs(course, target.version)
 	}
-	return target, nil
+	return target, specStatus{fetched: m.Version}, nil
 }
 
 // minCLIRefusal is the data-side compatibility floor: an old binary meeting a spec
@@ -803,6 +874,27 @@ func installCommand() string {
 		return "download the new sboot.exe from github.com/sourceboot/sboot/releases"
 	}
 	return "curl -fsSL " + siteURL() + "/install.sh | sh"
+}
+
+// removeDirCommand is "delete this directory" in a shell the reader actually has.
+// Same reason installCommand above exists: a remedy that cannot be typed on the
+// machine reading it is not a remedy. `rm -rf` is not a Windows command and cmd's
+// own answer is spelled differently again from PowerShell's, so the one printed is
+// the one every Windows shell accepts.
+func removeDirCommand(dir string) string {
+	if runtime.GOOS == "windows" {
+		return `rmdir /s /q "` + dir + `"`
+	}
+	return "rm -rf " + shellQuote(dir)
+}
+
+// shellQuote makes a path safe to paste into a POSIX shell. Cache paths run through
+// a home directory, and a home directory can contain a space.
+func shellQuote(s string) string {
+	if s != "" && !strings.ContainsAny(s, " \t\n'\"\\$`&;|<>()*?[]#~") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // offlineLabError explains the cache miss that is NOT "you have nothing cached":
@@ -1027,20 +1119,73 @@ func stageRun(s spec, r repo) (string, error) {
 	//	LICENSE    ditto, and it belongs beside the tests rather than in a build root
 	//	bin/       the grading engine, 3 MB, exec'd where it lies (judgePath); copying
 	//	           it per repo would buy nothing and cost a copy on every run
+	staged := map[string]bool{}
 	for _, e := range dirEntries(s.dir) {
 		switch e {
 		case "spec.json", engineMarker, judgeDir:
 			continue
 		}
+		staged[e] = true
 		if err := syncTree(filepath.Join(s.dir, e), filepath.Join(run, e)); err != nil {
 			return "", fmt.Errorf("stage %s: %w", e, err)
 		}
 	}
 
+	if err := pruneStagingRoot(run, staged); err != nil {
+		return "", err
+	}
 	if err := linkOSTree(r.osDir(), filepath.Join(run, "os")); err != nil {
 		return "", err
 	}
 	return run, nil
+}
+
+// pruneStagingRoot removes every top-level DIRECTORY of the staging root that the
+// spec did not put there — and that is a grading rule, not tidiness.
+//
+// ── WHAT IT CLOSES (2026-09-06, RB-2) ──────────────────────────────────────────
+//
+// syncTree prunes WITHIN each tree it syncs, so a lab the spec dropped disappears.
+// Nothing pruned the root itself, and the root is persistent: `workDir` is
+// <cache>/courses/<id>/work/<repoKey>, reused for every run of every lab of that
+// course. So a directory created by a RUN rather than by the spec — cargo's
+// `--target-dir`, most of all — outlived every later invocation.
+//
+// That is a freshness oracle, and rust-for-beginners' lint run is graded on
+// freshness. Its `[[run]]` is `cargo clippy --target-dir lint-target …`, chosen so
+// that aging the timestamps under the learner's own `target/` cannot make the lint
+// look up to date. With `lint-target` surviving across runs, aging one source file
+// to 2017 did exactly that on the SECOND invocation in a work dir: cargo printed
+// `Finished dev profile … in 0.00s`, exited 0, and clippy never ran — while the
+// NEXT lab's own checks target dir, which had never existed, compiled the aged
+// payload for real. Measured: 18/18 on a hollow lab 04 with `std::process::exit`
+// in a graded module and the lint green.
+//
+// The cost is one clippy pass over a dependency-free library per run, which is
+// what the rule is worth: a lint that can be made stale is not a gate.
+//
+// DIRECTORIES ONLY, and generated names are kept. `target/` and `build/` are where
+// the course's real build output lives (os-rust writes `build/disk.img` at this
+// root), and deleting them would turn every practice run into a full rebuild —
+// which is the reason `generatedDirs` exists at all. Files are left alone: a
+// course whose artifact is a bare `os2.iso` at the root writes one here, and the
+// build that follows overwrites it in the same run.
+func pruneStagingRoot(run string, staged map[string]bool) error {
+	for _, e := range dirEntries(run) {
+		if staged[e] || generatedDirs[e] || e == "os" {
+			continue
+		}
+		p := filepath.Join(run, e)
+		st, err := os.Lstat(p)
+		if err != nil || !st.IsDir() {
+			continue
+		}
+		if err := os.RemoveAll(p); err != nil {
+			return fmt.Errorf("prune %s: %w", e, err)
+		}
+		debugf("pruned %s from the staging root — the spec did not put it there", e)
+	}
+	return nil
 }
 
 // linkOSTree points <run>/os at the learner's real source tree.

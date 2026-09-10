@@ -6,6 +6,13 @@
 // seven things a learner does — with everything else behind `sboot help --all`.
 // `sboot where` is the canonical demotion: still real, still documented, out of
 // the short list (ux-plan §5, "demoted to plumbing").
+//
+// VOCABULARY: "rung" is ours, not the learner's (the 2026-08-31 landing sweep;
+// dogfood-2026-08-30.md follow-ups). It stays in this package's comments, type
+// names and state keys — hint.go is built on the idea and the word is the right
+// one there — but nothing a learner reads may use it. The hint line below said
+// "one rung deeper per run", the last place it escaped; `G139` now scans every
+// surface that answers a learner in this file's and hint.go's own words.
 package main
 
 import (
@@ -20,7 +27,7 @@ usage: sboot [command] [args]      bare ` + "`sboot`" + ` shows where you are an
 
   start [course]        create a course workspace and its git repo (no-arg lists the catalog)
   test [stage]          practice: grade the current lab locally (fast loop, offline-friendly)
-  hint [stage] [check]  a hint for a failing check — one rung deeper per run
+  hint [stage] [check]  a hint for a failing check — one hint deeper per run
   explain [check]       the AI tutor on that check, fed your last run (--here: in this terminal)
   submit [stage]        official: check locally first, then upload for the server grade
   courses               the catalog + your progress
@@ -39,7 +46,7 @@ usage: sboot [command] [args]      bare `+"`sboot`"+` shows where you are and wh
 the learner verbs:
   start [course]        create a course workspace and its git repo (no-arg lists the catalog)
   test [stage]          practice: grade the current lab locally (fast loop, offline-friendly)
-  hint [stage] [check]  a hint for a failing check — one rung deeper per run
+  hint [stage] [check]  a hint for a failing check — one hint deeper per run
   explain [check]       the AI tutor on that check, fed your last run (--here: in this terminal)
   submit [stage]        official: check locally first, then upload for the server grade
   courses               the catalog + your progress

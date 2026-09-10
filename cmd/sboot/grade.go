@@ -116,6 +116,12 @@ func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderR
 			return run
 		}
 		run.exitCode = ee.ExitCode()
+		// The engine REFUSED before a build was spent: unknown lab, unreadable
+		// rubric, or (since wave 2) a tree that runs code while it compiles. It
+		// has said why on stderr; what is recorded here is that the last local
+		// run in this stage was a refusal, so `sboot hint` answers THIS run
+		// instead of repeating the reason of the one before it (G238).
+		run.engineRefused = true
 		return run
 	}
 	if labDir == "" {
@@ -290,10 +296,12 @@ func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderR
 		}
 		run.exitCode = ee.ExitCode()
 	}
-	// 2 and above is the engine REFUSING (no os/ tree, an unwritable verdict file):
+	// 2 and above is the engine REFUSING (no os/ tree, an unwritable verdict file,
+	// or a course-owned run that will not compile a tree it does not trust):
 	// it has already said why on stderr, and there is no verdict to read. 0 and 1 are
 	// grades, and a grade without a protocol file is the failure handled below.
 	if run.exitCode >= 2 {
+		run.engineRefused = true
 		return run
 	}
 

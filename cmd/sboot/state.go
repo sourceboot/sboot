@@ -78,8 +78,9 @@ type guidanceState struct {
 	// Cleared the moment the check passes, exactly like Fails.
 	Evidence map[string]string `json:"last_evidence,omitempty"`
 	// "course/stage" -> why the most recent LOCAL run produced no verdict at all:
-	// "build" (the course's build command ran and failed) or "toolchain:<tool>"
-	// (it never started). NOT a score and never rendered as one — the L2a rule
+	// "build" (the course's build command ran and failed), "toolchain:<tool>"
+	// (it never started) or "engine" (the grading engine refused the lab and
+	// exited >= 2 — G238). NOT a score and never rendered as one — the L2a rule
 	// stands — it exists so `sboot hint` can answer a learner whose build is
 	// broken instead of telling them to run the test they just ran (dogfood
 	// F00-5). Cleared by the next run that actually grades something.
@@ -472,6 +473,17 @@ func (s *guidanceState) noteRunError(course, stage string, res graderRun) {
 	case res.buildFailed:
 		s.setRunError(course, stage, "build")
 		s.setBuildOut(course, stage, res.buildOut)
+		s.setBlocked(course, stage)
+	case res.engineRefused:
+		// The engine refused the lab (G238). BEFORE wave 2 this fell through the
+		// switch, so the note kept the reason of an OLDER run and `sboot hint`
+		// answered a build failure the learner had already fixed. The build's own
+		// output is cleared with it: a refusal at resolve time means the build
+		// never ran, and a refusal at grade time means it succeeded — either way
+		// the last build log is not evidence about this run, and leaving it would
+		// let the linker classifier fire on text from a different failure.
+		s.setRunError(course, stage, "engine")
+		s.setBuildOut(course, stage, "")
 		s.setBlocked(course, stage)
 	case res.graded():
 		s.clearRunError(course, stage)
