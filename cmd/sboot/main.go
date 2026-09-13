@@ -693,7 +693,7 @@ func reportPracticeFailure(err error) {
 	if errors.As(err, &ae) {
 		switch ae.status {
 		case http.StatusForbidden:
-			fmt.Fprintf(os.Stderr, "\nsboot: this lab is not open to you yet: %s\n", ae.msg)
+			fmt.Fprintf(os.Stderr, "\nsboot: this lab is not open to you yet: %s\n", serverMessage(ae.msg))
 			fmt.Fprintf(os.Stderr, "sboot: nothing is wrong with your setup — open %s to unlock it.\n", apiURL())
 			return
 		case http.StatusUnauthorized:
@@ -709,11 +709,25 @@ func reportPracticeFailure(err error) {
 					"not signed in, so this run stayed on your machine — `sboot login` to keep it on your dashboard."))
 				return
 			}
-			fmt.Fprintf(os.Stderr, "\nsboot: the platform did not accept your token: %s\n", ae.msg)
+			fmt.Fprintf(os.Stderr, "\nsboot: the platform did not accept your token: %s\n", serverMessage(ae.msg))
 			fmt.Fprintf(os.Stderr, "sboot: reconnect with `sboot login`, or paste a fresh token from\n")
 			fmt.Fprintf(os.Stderr, "sboot:   %s/account   into SBOOT_TOKEN.\n", siteURL())
 			return
+		case http.StatusTooManyRequests:
+			// Ledger C8b: the platform answered, so "could not reach" sent a learner
+			// to debug a network that was fine. The run itself is unaffected either way.
+			fmt.Fprintf(os.Stderr, "\nsboot: the platform is limiting requests right now and did not record this run: %s\n", serverMessage(ae.msg))
+			fmt.Fprintln(os.Stderr, "sboot: wait a few minutes before the next one. Your result above stands, and nothing on your machine needs fixing.")
+			return
+		case http.StatusUpgradeRequired:
+			fmt.Fprintf(os.Stderr, "\nsboot: this sboot is too old for the platform to record the run: %s\n", serverMessage(ae.msg))
+			fmt.Fprintln(os.Stderr, "sboot: run `sboot upgrade` — your result above stands.")
+			return
 		}
+		// Any other answer is still an answer: say so, and quote it.
+		fmt.Fprintf(os.Stderr, "\nsboot: the platform answered but did not record this practice run: %s\n", serverMessage(ae.Error()))
+		fmt.Fprintln(os.Stderr, "sboot: that's fine, it's practice — your result above stands.")
+		return
 	}
 	fmt.Fprintf(os.Stderr, "\nsboot: could not reach the platform (%v)\n", err)
 	fmt.Fprintln(os.Stderr, "sboot: your practice run was NOT recorded — that's fine, it's practice.")
@@ -1534,6 +1548,26 @@ type submissionResp struct {
 	Err       string `json:"error"`
 }
 
+// uploadBackoff is how long `sboot submit` waits before each RE-send of an upload
+// that failed transiently (ledger C2): three attempts in all, about seven seconds
+// of waiting — short beside the build and run it saves, long enough for a cold
+// function or a dropped connection to come back.
+var uploadBackoff = []time.Duration{2 * time.Second, 5 * time.Second}
+
+// uploadTimeout bounds one upload attempt end to end. It sits above the
+// submissions route's 60 s maxDuration plus the upload itself, so a slow but
+// healthy platform answers before the CLI gives up — and a timeout is not retried.
+const uploadTimeout = 120 * time.Second
+
+// uploadAnswerMax caps the verdict read back from an upload. A verdict's detail is
+// the grader's trimmed report, far below this; past it, the CLI says so by name.
+const uploadAnswerMax = 8 << 20
+
+// tooLargeAnswer reports the one upload failure where an answer DID come back.
+func tooLargeAnswer(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "the platform's answer is larger than")
+}
+
 // runSubmit is a thin wrapper so the body can `return` an exit code and let its
 // defers run — the temp capture file needs cleanup, and `os.Exit` skips defers.
 func runSubmit(r repo, stage string, ga gradedArgs) {
@@ -1691,38 +1725,147 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	}
 
 	url := fmt.Sprintf("%s/api/v1/submissions?course=%s&stage=%s", apiURL(), course, stage)
-	req, err := authedRequest("POST", url, bytes.NewReader(body))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
-		return 2
+
+	// THE UPLOAD IS RETRIED, THE RUN IS NOT (ledger C2). By this line the build and
+	// the run are spent and the local check passed; a 502 from a cold function or a
+	// dropped connection used to throw all of that away with one line, and the only
+	// way forward was the whole build again. So a transient failure re-sends the
+	// SAME bytes, a few seconds apart.
+	//
+	// Re-sending is safe because the platform derives the submission's idempotency
+	// key from the request itself — user, lab, spec, archive and capture (ledger L22,
+	// lib/idempotency.ts) — so an attempt that timed out here but was judged there
+	// comes back as the original row, never a second one.
+	//
+	// Only FAST transient failures are retried: a refused or reset connection, an
+	// answer cut off mid-body, or a 5xx other than 501 (a deployment that cannot
+	// serve this backend, which no retry changes). Every 4xx is the platform's
+	// decision — a spec skew, a lock, the submit limit with its Retry-After window —
+	// and is reported at once. A request that ran into OUR timeout is not retried
+	// either: on a slow uplink every attempt would time out the same way, three
+	// full uploads later, and a slow platform may still be grading the first one.
+	var (
+		resp     *http.Response
+		respErr  error
+		raw      []byte
+		attempts int
+		timedOut bool
+	)
+	for attempt := 1; ; attempt++ {
+		attempts = attempt
+		req, err := authedRequest("POST", url, bytes.NewReader(body))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
+			return 2
+		}
+		req.Header.Set("Content-Type", contentType)
+		// SPEC SKEW (the CLI release policy §6). Which tests produced the verdict the
+		// learner is about to see? Under the retired `server` backend the answer could
+		// not change the grade — the runner rebuilt and rebooted with the in-repo rubric
+		// — but the capture above was produced with THIS spec's script, settle marker and
+		// timeout, so a stale one is judged against another run's criteria. The server
+		// compares this against lib/spec.ts `specStamp` and refuses a mismatch by name
+		// (409), which is the whole reason the header exists.
+		if s, ok := cachedSpec(course); ok {
+			req.Header.Set("X-Sboot-Spec", course+"@"+s.version)
+		}
+		// The client timeout sits above the route's own 60 s maxDuration plus the
+		// upload itself, so a slow-but-healthy platform answers before we give up.
+		resp, respErr = send(&http.Client{Timeout: uploadTimeout}, req)
+		why := ""
+		raw = nil
+		refusedRedirect, tooLarge := false, false
+		switch {
+		case respErr != nil && resp != nil:
+			// Only a refused redirect returns both: not transient, not retried.
+			resp.Body.Close()
+			refusedRedirect = true
+		case respErr == nil:
+			raw, respErr = io.ReadAll(io.LimitReader(resp.Body, uploadAnswerMax+1))
+			resp.Body.Close()
+			switch {
+			case respErr == nil && len(raw) > uploadAnswerMax:
+				// Named, rather than a decode error that reads as a broken platform.
+				respErr = fmt.Errorf("the platform's answer is larger than %d bytes", uploadAnswerMax)
+				tooLarge = true
+			// 501: this deployment cannot serve the backend. 504: the function already
+			// ran its full 60 s, so a re-send would only land on the row still marked
+			// running. Neither is changed by trying again.
+			case respErr == nil && resp.StatusCode >= 500 &&
+				resp.StatusCode != http.StatusNotImplemented && resp.StatusCode != http.StatusGatewayTimeout:
+				why = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			}
+		}
+		if respErr != nil {
+			var te interface{ Timeout() bool }
+			if errors.As(respErr, &te) && te.Timeout() {
+				timedOut = true
+			} else if !refusedRedirect && !tooLarge {
+				why = respErr.Error()
+			}
+		}
+		if why == "" || attempt == len(uploadBackoff)+1 {
+			if refusedRedirect {
+				respErr = fmt.Errorf("the upload was redirected and the redirect was not followed: %w", respErr)
+			}
+			break
+		}
+		wait := uploadBackoff[attempt-1]
+		fmt.Fprintf(os.Stderr, "── upload failed (%s) — sending the same run again in %s (attempt %d of %d)\n",
+			serverMessage(why), wait, attempt+1, len(uploadBackoff)+1)
+		time.Sleep(wait)
 	}
-	req.Header.Set("Content-Type", contentType)
-	// SPEC SKEW (the CLI release policy §6). Which tests produced the verdict the
-	// learner is about to see? Under the retired `server` backend the answer could
-	// not change the grade — the runner rebuilt and rebooted with the in-repo rubric
-	// — but the capture above was produced with THIS spec's script, settle marker and
-	// timeout, so a stale one is judged against another run's criteria. The server
-	// compares this against lib/spec.ts `specStamp` and refuses a mismatch by name
-	// (409), which is the whole reason the header exists.
-	if s, ok := cachedSpec(course); ok {
-		req.Header.Set("X-Sboot-Spec", course+"@"+s.version)
+	// Said once, on every way the upload can finally fail. It must not claim that
+	// nothing was recorded: an attempt can reach the platform, be graded, and lose
+	// only its answer on the way back. What IS true is the recovery — the same
+	// work re-submitted lands on that row (L22) instead of being graded twice.
+	//
+	// "Usually", because a re-run makes a new capture and only byte-identical work
+	// is recognised as a repeat (lib/idempotency.ts): a lab whose output varies run
+	// to run is graded again.
+	gaveUp := func() {
+		fmt.Fprintf(os.Stderr, "sboot: no grade came back (%d attempt(s)). Your local check passed.\n", attempts)
+		fmt.Fprintf(os.Stderr, "sboot: an upload may still have reached the platform and been graded — your lab page shows it: %s\n", stageStuckURL(course, stage))
+		fmt.Fprintf(os.Stderr, "sboot: otherwise run `sboot submit %s` again: it builds and runs first, then uploads, and the same work usually lands on an existing grade instead of being graded again.\n", stage)
 	}
-	resp, err := send(&http.Client{Timeout: 60 * time.Second}, req)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "sboot: could not reach the platform (%v)\n", err)
+	if respErr != nil {
+		switch {
+		case timedOut:
+			fmt.Fprintf(os.Stderr, "sboot: the platform did not answer in time (%v)\n", respErr)
+		case tooLargeAnswer(respErr):
+			fmt.Fprintf(os.Stderr, "sboot: the platform answered, but %v — your lab page shows the grade: %s\n", respErr, stageStuckURL(course, stage))
+			return 2
+		case resp == nil:
+			fmt.Fprintf(os.Stderr, "sboot: could not reach the platform (%v)\n", respErr)
+		default:
+			fmt.Fprintf(os.Stderr, "sboot: could not read the platform's answer (HTTP %d: %v)\n", resp.StatusCode, respErr)
+		}
+		gaveUp()
 		return 2
 	}
 	var created submissionResp
-	err = json.NewDecoder(resp.Body).Decode(&created)
-	resp.Body.Close()
+	err = json.Unmarshal(raw, &created)
 	if err != nil || created.ID == "" {
+		failed := resp.StatusCode >= 500 && resp.StatusCode != http.StatusNotImplemented
 		switch {
 		case resp.StatusCode == http.StatusUnauthorized:
 			reportSubmitAuthFailure(created.Err)
+		case failed && created.Err != "":
+			fmt.Fprintf(os.Stderr, "sboot: the platform failed: %s (HTTP %d)\n", serverMessage(created.Err), resp.StatusCode)
 		case created.Err != "":
-			fmt.Fprintf(os.Stderr, "sboot: submission rejected: %s (HTTP %d)\n", created.Err, resp.StatusCode)
+			fmt.Fprintf(os.Stderr, "sboot: submission rejected: %s (HTTP %d)\n", serverMessage(created.Err), resp.StatusCode)
 		default:
 			fmt.Fprintf(os.Stderr, "sboot: unexpected response (HTTP %d)\n", resp.StatusCode)
+		}
+		switch {
+		case failed:
+			gaveUp()
+		case attempts > 1:
+			// A refusal after a failed attempt — the submit limit, most likely, which
+			// the platform checks before it looks for a repeat — may be hiding a grade
+			// that earlier attempt already earned.
+			fmt.Fprintf(os.Stderr, "sboot: an earlier attempt failed partway and may have been graded — your lab page shows it: %s\n",
+				stageStuckURL(course, stage))
 		}
 		return 2
 	}
