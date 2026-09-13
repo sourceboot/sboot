@@ -60,6 +60,50 @@ type headTailCapture struct {
 	tail      []string
 	lines     int
 	buf       []byte // the current partial line
+
+	// The FIRST compiler error block, kept whole (G279, 2026-09-13). The head and
+	// the tail are positional, and the first error is not: a build whose warnings
+	// fill forty lines — any real crate with unused imports, or a noisy sibling
+	// crate compiled first — put its first error in the dropped middle, and the
+	// only error the record kept was the LAST one, in the tail. `sboot hint`
+	// quotes and matches the first error, so the capture keeps it by what it IS.
+	firstErr      []byte
+	firstErrLines int
+	firstErrState int // 0 looking, 1 inside the block, 2 done
+}
+
+const (
+	// One rustc diagnostic with its snippet and a help block is well under this.
+	buildLogFirstErrLines = 40
+	buildLogFirstErrBytes = 3 << 10
+	// Between the kept block and the head, when the block is stored separately.
+	buildLogFirstErrMark = "… [the first error, kept whole] …\n"
+)
+
+// keepFirstError follows the stream for the first compiler error block, using the
+// parser's own rules (buildhint.go: compileErrHeaderRe, isCargoSummary,
+// startsTopLevel) on the colour-stripped line, so the capture and the reader can
+// never disagree about which error is first.
+func (c *headTailCapture) keepFirstError(l string) {
+	plain := strings.TrimRight(stripANSI(l), " \t\r\n")
+	switch c.firstErrState {
+	case 0:
+		m := compileErrHeaderRe.FindStringSubmatch(plain)
+		if m == nil || (m[1] == "" && isCargoSummary(strings.TrimSpace(m[2]))) {
+			return
+		}
+		c.firstErrState = 1
+		c.firstErr = append(c.firstErr, l...)
+		c.firstErrLines = 1
+	case 1:
+		if strings.TrimSpace(plain) == "" || startsTopLevel(plain) ||
+			c.firstErrLines >= buildLogFirstErrLines || len(c.firstErr)+len(l) > buildLogFirstErrBytes {
+			c.firstErrState = 2
+			return
+		}
+		c.firstErr = append(c.firstErr, l...)
+		c.firstErrLines++
+	}
 }
 
 func newHeadTailCapture() *headTailCapture { return &headTailCapture{} }
@@ -86,6 +130,7 @@ func (c *headTailCapture) Write(p []byte) (int, error) {
 }
 
 func (c *headTailCapture) addLine(l string) {
+	c.keepFirstError(l)
 	c.lines++
 	if c.lines <= buildLogHeadLines && len(c.head) < buildLogHeadBytes {
 		c.head = append(c.head, l...)
@@ -111,6 +156,17 @@ func (c *headTailCapture) text() string {
 		c.buf = nil
 	}
 	out := string(c.head)
+	// The first error goes FIRST when the head does not already hold it whole, so
+	// the reader — which takes the first error it meets — meets it before any
+	// partial copy the head may carry, and a state-file cap that cuts from the end
+	// costs the tail rather than the one block `sboot hint` needs. A build whose
+	// first error fits in the head is stored byte-identically to before.
+	if block := string(c.firstErr); block != "" && !strings.Contains(out, block) {
+		if !strings.HasSuffix(block, "\n") {
+			block += "\n"
+		}
+		out = block + "\n" + buildLogFirstErrMark + out
+	}
 	if len(c.tail) > 0 {
 		if c.lines > c.headLines+len(c.tail) {
 			out += buildLogElision

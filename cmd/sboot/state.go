@@ -99,6 +99,18 @@ type guidanceState struct {
 	// prints ITS OWN authored answer (toolchain.go). The learner has already read
 	// the real text — it was on their screen.
 	BuildOut map[string]string `json:"last_build_output,omitempty"`
+	// "course/stage" -> how deep `sboot hint` has gone into the BUILD-FAILURE ladder
+	// (buildhint.go, 2026-09-13), and for WHICH first compiler error.
+	//
+	// The check ladder's marker (Rungs) is keyed on a check id and never resets,
+	// because a check's authored text is the same text however often the check
+	// fails. A build failure has no check id, and its ladder is chosen by the
+	// compiler's first error — so the marker carries a fingerprint of that error
+	// (code, message, file; deliberately NOT the line, which moves whenever the
+	// learner edits above it) and a different first error restarts at the top.
+	// Only a fingerprint is stored, never the compiler's text: BuildOut above
+	// already holds that, and is cleared with the failure it describes.
+	BuildHints map[string]*buildHintMark `json:"build_hints,omitempty"`
 	// course -> the stage of the most recent LOCAL run that produced no verdict at
 	// all, cleared by the next run in that course that grades anything.
 	//
@@ -205,6 +217,7 @@ func loadState() *guidanceState {
 		LastFailed: map[string][]string{},
 		RunError:   map[string]string{},
 		BuildOut:   map[string]string{},
+		BuildHints: map[string]*buildHintMark{},
 		Blocked:    map[string]string{},
 		Sync:       map[string]*courseSync{},
 		LastScore:  map[string]string{},
@@ -240,6 +253,9 @@ func loadState() *guidanceState {
 	}
 	if loaded.BuildOut != nil {
 		s.BuildOut = loaded.BuildOut
+	}
+	if loaded.BuildHints != nil {
+		s.BuildHints = loaded.BuildHints
 	}
 	if loaded.Blocked != nil {
 		s.Blocked = loaded.Blocked
@@ -484,10 +500,15 @@ func (s *guidanceState) noteRunError(course, stage string, res graderRun) {
 		// let the linker classifier fire on text from a different failure.
 		s.setRunError(course, stage, "engine")
 		s.setBuildOut(course, stage, "")
+		s.clearBuildHint(course, stage)
 		s.setBlocked(course, stage)
 	case res.graded():
 		s.clearRunError(course, stage)
 		s.setBuildOut(course, stage, "")
+		// The build ladder's position belongs to the failure it climbed (G282): a
+		// run that graded ended that failure, so the same error met again later is
+		// a new stall and starts at the top.
+		s.clearBuildHint(course, stage)
 		s.clearBlocked(course)
 	}
 }
@@ -495,7 +516,7 @@ func (s *guidanceState) noteRunError(course, stage string, res graderRun) {
 // maxBuildOutBytes bounds one blocked run's recorded build output. buildlog.go
 // already bounds what it collects; this is the belt to that braces, and it is the
 // number that keeps state.json small enough to rewrite on every run.
-const maxBuildOutBytes = 8 << 10
+const maxBuildOutBytes = 16 << 10
 
 // setBuildOut records (or drops, on "") what the build printed for one stage.
 func (s *guidanceState) setBuildOut(course, stage, text string) {

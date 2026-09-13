@@ -16,7 +16,11 @@
 // root (staged into the run dir by stageRun, like everything else in the spec
 // bundle); the failing set is what the last local grade recorded in state.json
 // (state.go LastFailed — "test writes, hint reads"); the rung marker is
-// state.json's hint_rungs. Fully offline: nothing here talks to any server.
+// state.json's hint_rungs. Offline-first: the hint itself needs no server. Since
+// 2026-09-13 each hint SHOWN sends one content-free usage event afterwards
+// (telemetry.go — course, lab, check, depth, kind; skipped under SBOOT_OFFLINE,
+// and a failure is swallowed), and a build failure has a ladder of its own
+// (buildhint.go).
 //
 // Ported from content/courses/kernel-in-rust/proto/hint.py, with three deliberate
 // divergences: (1) the failing set comes from the recorded verdict rather than
@@ -142,8 +146,23 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 	// died in the operating system's own output.
 	if checkID == "" {
 		if reason := st.lastRunError(r.course, stage); reason != "" {
-			fmt.Println(renderBlockedHint(r, stage, reason, st.buildOut(r.course, stage),
-				stageStuckURL(r.course, stage)))
+			buildOut := st.buildOut(r.course, stage)
+			url := stageStuckURL(r.course, stage)
+			// A compile error has a ladder of its own (buildhint.go, 2026-09-13).
+			// The missing-linker case keeps its branch in renderBlockedHint, FIRST
+			// and unchanged: that first error is the operating system's, not code.
+			if reason == "build" && !missingLinker(hostOS, buildOut) {
+				if text, shown, ok := runBuildHint(r, stage, run, st, buildOut, url); ok {
+					if err := st.save(); err != nil {
+						debugf("could not save hint state: %v", err)
+					}
+					fmt.Println(text)
+					reportHintShown(r.course, stage, shown)
+					return 0
+				}
+			}
+			fmt.Println(renderBlockedHint(r, stage, reason, buildOut, url))
+			reportHintShown(r.course, stage, blockedHintShown(reason, buildOut))
 			return 0
 		}
 	}
@@ -228,7 +247,29 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 	observed := selectEvidence(entry.Evidence, st.evidence(r.course, stage, target))
 
 	fmt.Println(renderHint(stage, target, entry, rung, observed, stageStuckURL(r.course, stage)))
+	shown := hintShown{check: target, rung: rung, kind: "check"}
+	if rung > len(hintTiers(entry)) {
+		shown.rung = "past"
+	}
+	reportHintShown(r.course, stage, shown)
 	return 0
+}
+
+// blockedHintShown is the usage event for a hint that answered a run with no
+// verdict and no build ladder: which of renderBlockedHint's branches spoke.
+func blockedHintShown(reason, buildOut string) hintShown {
+	h := hintShown{check: buildCheck, rung: 0}
+	switch {
+	case reason == "build" && missingLinker(hostOS, buildOut):
+		h.kind = "linker"
+	case reason == "toolchain" || strings.HasPrefix(reason, "toolchain:"):
+		h.kind = "toolchain"
+	case reason == "engine":
+		h.kind = "engine"
+	default:
+		h.kind = "build_unhinted"
+	}
+	return h
 }
 
 // hintTiers is the authored ladder for one check, in order: L1 always, L2 when
