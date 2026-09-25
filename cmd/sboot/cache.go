@@ -416,11 +416,16 @@ func cachedSpec(course string) (spec, bool) {
 // the zero value, and grade.go falls back to the Rust/QEMU defaults — so an older
 // cache keeps building exactly as it did.
 func courseGrader(course string) specGrader {
-	m, ok := cachedManifest(course)
-	if !ok {
-		return specGrader{}
+	if m, ok := cachedManifest(course); ok {
+		return m.Grader
 	}
-	return m.Grader
+	// Nothing cached: the manifest this run fetched is the answer, not "unknown"
+	// (G356). The cache stays first so a materialised spec — the thing every
+	// later command grades against — is never outranked by an earlier fetch.
+	if m, ok := fetchedManifest[course]; ok {
+		return m.Grader
+	}
+	return specGrader{}
 }
 
 // cachedManifest is the last manifest we stored for a course, or false.
@@ -540,8 +545,22 @@ func fetchManifest(course string) (*specManifest, error) {
 		}
 		return nil, &apiError{status: resp.StatusCode, msg: msg, renamedTo: m.RenamedTo}
 	}
+	fetchedManifest[course] = m
 	return &m, nil
 }
+
+// fetchedManifest keeps every manifest THIS RUN fetched — whole, so the next
+// pre-cache reader (tree, artifact, requirements) needs no memo of its own — for
+// the same reason status.go's manifestMemo keeps the lab list: on a fresh machine
+// `sboot start` fetches the manifest and writes the workspace files BEFORE the
+// spec is materialised into the cache (the Ctrl-C property, main.go runStart),
+// and courseGrader read only the cache — so a fresh machine's first README was
+// written for "an unknown course", which defaults to an OS course, and said
+// "the boot code, the kernel" and `qemu-system-x86_64` to a rust-for-systems
+// learner (Windows lap of sboot-v0.15.0, 2026-09-23; the old F00-2 shape, back on
+// the one machine every learner starts on). Per process, never persisted; tests
+// reset it with the other memos (status_test.go resetOrientationForTests).
+var fetchedManifest = map[string]specManifest{}
 
 // fetchBundle downloads a gzipped tar and extracts it over dest.
 func fetchBundle(url, dest string) error {

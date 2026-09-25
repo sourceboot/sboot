@@ -112,7 +112,7 @@ func resolveToken() (token, source string) {
 			siteMismatchNoted = true
 			fmt.Fprintf(os.Stderr, "sboot: your stored login is for %s, not %s — not using it.\n",
 				c.Site, apiURL())
-			fmt.Fprintf(os.Stderr, "sboot: run `sboot login` against this platform, or set SBOOT_TOKEN.\n")
+			fmt.Fprintf(os.Stderr, "sboot: run `sboot login` against this platform, or set %s.\n", tokenAdvice())
 		}
 	}
 	return "sboot-dev-token", "dev"
@@ -140,12 +140,32 @@ type devicePollResp struct {
 
 func runLogin() int {
 	out := os.Stderr // the flow is conversation, not data — stderr end to end
-	if os.Getenv("SBOOT_TOKEN") != "" {
-		fmt.Fprintln(out, "sboot: note — SBOOT_TOKEN is set and always overrides a stored login.")
-	}
 	if offline() {
 		fmt.Fprintln(out, "sboot: SBOOT_OFFLINE is set — connecting needs the network. Unset it and retry.")
 		return 2
+	}
+	// SBOOT_TOKEN set: NO device flow (D-WIN-7, sboot-v0.15.0). The env var
+	// overrides whatever a pairing would store, so a browser round-trip here
+	// would mint a credential this shell can never use. Check the token that IS
+	// in force instead and say what it resolves to — the headless learner who
+	// pasted a token and then ran `sboot login` "to connect" is done, and the one
+	// whose token is stale is told to change the variable, not to approve a code.
+	if os.Getenv("SBOOT_TOKEN") != "" {
+		fmt.Fprintln(out, "sboot: SBOOT_TOKEN is set, and it overrides any stored login — checking that token instead of pairing a browser.")
+		handle, rejected, code := verifyToken(out)
+		if code != 0 {
+			// Only a REJECTED token earns "change the variable": a network failure
+			// or a 5xx judged nothing, and telling that learner to throw a good
+			// token away is the skeptic's finding on this branch (2026-09-23).
+			if rejected {
+				fmt.Fprintf(out, "sboot: paste a fresh token from %s/account into SBOOT_TOKEN, or `%s` to pair through the browser instead.\n", siteURL(), tokenUnsetLine())
+			} else {
+				fmt.Fprintln(out, "sboot: the token was not judged — retry when the platform is reachable.")
+			}
+			return code
+		}
+		fmt.Fprintf(out, "\n✓ connected as @%s via SBOOT_TOKEN — nothing to store; `%s` (and take it out of your shell profile if you put it there) if you want `sboot login` to pair this machine instead.\n", handle, tokenUnsetLine())
+		return 0
 	}
 
 	host, _ := os.Hostname()
@@ -172,7 +192,7 @@ func runLogin() int {
 		// A platform released before device connect existed. The copied-token path
 		// is the documented fallback (ux-plan §11.f), so hand it over by name.
 		fmt.Fprintf(out, "sboot: this platform does not support `sboot login` yet.\n")
-		fmt.Fprintf(out, "sboot: get a token at %s/account and set it:  export SBOOT_TOKEN=<the token>\n", siteURL())
+		fmt.Fprintf(out, "sboot: get a token at %s/account and set it:  %s\n", siteURL(), tokenSetLine("<the token>"))
 		return 2
 	}
 	if decodeErr != nil || minted.Code == "" || minted.ConnectURL == "" || minted.Poll == "" {
@@ -181,14 +201,20 @@ func runLogin() int {
 		} else {
 			fmt.Fprintf(out, "sboot: unexpected response minting a pairing code (HTTP %d)\n", resp.StatusCode)
 		}
-		fmt.Fprintf(out, "sboot: fallback: get a token at %s/account and set SBOOT_TOKEN.\n", siteURL())
+		fmt.Fprintf(out, "sboot: fallback: get a token at %s/account and set it:  %s\n", siteURL(), tokenSetLine("<the token>"))
 		return 2
 	}
 
 	fmt.Fprintf(out, "connect this machine to your %s account\n\n", brandName)
 	fmt.Fprintf(out, "  code    %s\n\n", minted.Code)
 	fmt.Fprintf(out, "  open    %s\n", minted.ConnectURL)
-	fmt.Fprintf(out, "          # already signed in there? one click approves this machine\n\n")
+	fmt.Fprintf(out, "          # already signed in there? one click approves this machine\n")
+	// The fallback, ON THE HAPPY PATH (D-WIN-7, 2026-09-13): a machine with no
+	// browser to open sat at "waiting for approval" with the token route named
+	// only on the error paths. Two facts the screen owes that learner: the link
+	// works from any signed-in device, and a pasted token needs no browser here.
+	fmt.Fprintf(out, "          # no browser on this machine? open that link on any device — or skip the\n")
+	fmt.Fprintf(out, "          # pairing: copy a token from %s/account and run  %s\n\n", siteURL(), tokenSetLine("<the token>"))
 	tryOpen(minted.ConnectURL)
 
 	interval := time.Duration(minted.Interval) * time.Second
@@ -215,7 +241,7 @@ func runLogin() int {
 	if err := saveCredentials(&credentials{Token: granted.Token, Site: apiURL(), Handle: handle}); err != nil {
 		// The approval happened; losing the file must not eat the token.
 		fmt.Fprintf(out, "sboot: connected, but the token could not be stored (%v).\n", err)
-		fmt.Fprintf(out, "sboot: use it directly:  export SBOOT_TOKEN=%s\n", granted.Token)
+		fmt.Fprintf(out, "sboot: use it directly:  %s\n", tokenSetLine(granted.Token))
 		return 1
 	}
 	p, _ := credentialsPath()
@@ -290,7 +316,7 @@ func runLogout() int {
 		fmt.Fprintf(os.Stderr, "logged out — removed %s.\n", p)
 	}
 	if os.Getenv("SBOOT_TOKEN") != "" {
-		fmt.Fprintln(os.Stderr, "note: SBOOT_TOKEN is still set in your environment and still works — unset it too if you meant to disconnect.")
+		fmt.Fprintf(os.Stderr, "note: SBOOT_TOKEN is still set in your environment and still works — `%s` too if you meant to disconnect.\n", tokenUnsetLine())
 	}
 	return 0
 }
@@ -321,8 +347,23 @@ func runWhoami() int {
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&r)
 	if resp.StatusCode == http.StatusUnauthorized {
+		if source == "dev" {
+			// No credential anywhere (D-LINUX-6, 2026-09-13): the old line blamed
+			// "your token (the dev default)" — a token the learner never gave, and
+			// a name that means nothing outside this repo. Nothing was rejected;
+			// nothing was ever presented.
+			fmt.Fprintln(os.Stderr, "sboot: not connected yet — run `sboot login`.")
+			fmt.Fprintf(os.Stderr, "sboot: no browser here? paste a token from %s/account:  %s\n", siteURL(), tokenSetLine("<the token>"))
+			return 1
+		}
 		fmt.Fprintf(os.Stderr, "sboot: not connected — the platform did not accept your token (%s).\n", tokenSourceNoun(source))
-		fmt.Fprintf(os.Stderr, "sboot: reconnect with `sboot login`, or paste a fresh token from %s/account into SBOOT_TOKEN.\n", siteURL())
+		if source == "env" {
+			// `sboot login` cannot pair while the env var is set (it overrides the
+			// pairing's credential), so name the two things that CAN work.
+			fmt.Fprintf(os.Stderr, "sboot: paste a fresh token from %s/account into SBOOT_TOKEN, or `%s` and run `sboot login`.\n", siteURL(), tokenUnsetLine())
+		} else {
+			fmt.Fprintf(os.Stderr, "sboot: reconnect with `sboot login`, or paste a fresh token from %s/account into SBOOT_TOKEN.\n", siteURL())
+		}
 		return 1
 	}
 	if resp.StatusCode != http.StatusOK || r.User == "" {
@@ -344,8 +385,46 @@ func tokenSourceNoun(source string) string {
 	case "login":
 		return "stored login (sboot login)"
 	default:
-		return "the dev default"
+		// Only ever printed on a SUCCESSFUL call — a platform that accepted the
+		// built-in development token is a dev server, and the noun says so
+		// without the "dev default" phrase a learner once read on a 401.
+		return "none stored (this platform accepted the built-in development token)"
 	}
+}
+
+// verifyToken asks the platform who the CURRENT credential is — runWhoami's
+// call, shared with the SBOOT_TOKEN branch of runLogin. Returns the handle and 0,
+// or "" and the exit code after printing why; `rejected` is true only when the
+// platform ANSWERED 401 — an unreachable platform or a 5xx judged nothing.
+func verifyToken(out *os.File) (handle string, rejected bool, code int) {
+	req, err := authedRequest("GET", apiURL()+"/api/v1/completions?limit=1", nil)
+	if err != nil {
+		fmt.Fprintf(out, "sboot: %v\n", err)
+		return "", false, 2
+	}
+	resp, err := send(&http.Client{Timeout: 10 * time.Second}, req)
+	if err != nil {
+		fmt.Fprintf(out, "sboot: could not reach the platform (%v)\n", err)
+		return "", false, 1
+	}
+	defer resp.Body.Close()
+	var r struct {
+		User string `json:"user"`
+		Err  string `json:"error"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&r)
+	if resp.StatusCode == http.StatusUnauthorized {
+		fmt.Fprintln(out, "sboot: the platform did not accept the token in SBOOT_TOKEN.")
+		return "", true, 1
+	}
+	if resp.StatusCode != http.StatusOK || r.User == "" {
+		if r.Err == "" {
+			r.Err = "unexpected response"
+		}
+		fmt.Fprintf(out, "sboot: %s (HTTP %d)\n", r.Err, resp.StatusCode)
+		return "", false, 1
+	}
+	return r.User, false, 0
 }
 
 // ── small shared machinery ──────────────────────────────────────────────────────

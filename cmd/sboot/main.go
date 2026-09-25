@@ -253,6 +253,24 @@ func resolveGradedStage(r repo, ga *gradedArgs, verb string, onFrontier func(*fr
 		exitWith(2)
 	}
 	if fr != nil {
+		// Every live lab is verified — and one of them just went red on THIS
+		// machine (D-MACOS-5 / D-WIN-6, 2026-09-13): bare `sboot test` after
+		// `sboot test 05` scored 8/14 answered "nothing new to grade", and bare
+		// `sboot hint` "nothing to hint", which is the account's truth and not the
+		// learner's. `test` and `hint` answer the red lab from here; a bare
+		// `submit` at the frontier keeps its own gate (a resubmit is a decision,
+		// R1-7), and nothing prefers it below the frontier (hintStage).
+		// A run that produced NO verdict comes first, as in hintStage: the
+		// returning learner whose lab 00 build died on a missing linker typed
+		// the bare `sboot test` the rung told them to (macOS lap, 2026-09-23).
+		if verb == "test" || verb == "hint" {
+			if blocked := st.blockedStage(r.course); blocked != "" {
+				return blocked
+			}
+			if red := st.lastRedStage(r.course); red != "" {
+				return red
+			}
+		}
 		exitWith(onFrontier(fr))
 	}
 	return lab.Stage
@@ -274,6 +292,16 @@ func resolveGradedStage(r repo, ga *gradedArgs, verb string, onFrontier func(*fr
 // A function rather than inline in main() so the preference is pinned against the
 // frontier it beats (onboarding_test.go, G142): the frontier path exits the
 // process, which is exactly what a regression would do inside a test.
+//
+// The LAST RED RUN is the second exception, and it applies only AT THE FRONTIER
+// (2026-09-13 review round, D-MACOS-5 / D-WIN-6; resolveGradedStage): a run that
+// graded 8/14 on an already-verified lab — the returning learner re-proving lab 05
+// on a new machine, which lab 00 tells them to do — left the frontier to answer,
+// and the frontier said "nothing to hint" over a run that had just printed
+// `stuck? sboot hint`. It does NOT outrank an unfinished current lab: a stale red
+// on lab 03, never re-run green locally because the fix went up through `sboot
+// submit` and the web's Complete, would otherwise answer every bare hint on lab
+// 04 (skeptic, 2026-09-23 — measured).
 func hintStage(r repo, ga *gradedArgs) string {
 	if ga.stage == "" {
 		if blocked := loadState().blockedStage(r.course); blocked != "" {
@@ -855,7 +883,7 @@ func pkgInstall(pkg string) string {
 	switch hostOS {
 	case "darwin":
 		if pkg == "build-essential" {
-			return "xcode-select --install"
+			return cltInstallLine // the ONE Command Line Tools line, size and all
 		}
 		return "brew install " + strings.TrimSuffix(pkg, "-system-x86")
 	case "windows":
@@ -997,9 +1025,20 @@ func runWhere() int {
 			// is what `sboot start`'s .gitignore is for. Claiming "so your repo stays
 			// clean" was the opposite of what the symlink does.
 			// `os` is the STAGED name for every course (cache.go linkOSTree), so it
-			// is named literally here and the learner's own tree is named beside it.
+			// is named literally here and the learner's own tree is named beside it —
+			// and SAID to be the grader's fixed name (D-LINUX-11 / D-MACOS-9 / D-WIN-10,
+			// 2026-09-13), because this is the one screen where a `db/` course's
+			// learner meets the word `os/` at all, and unexplained it reads as a leak.
 			if linked, err := os.Readlink(filepath.Join(run, "os")); err == nil && linked == r.osDir() {
-				fmt.Printf("            os/ there is a symlink to your %s/, so cargo's target/ dirs land\n", r.treeName())
+				if r.treeName() == defaultTree {
+					// An os-tree course: the names coincide, so there is no leak to
+					// explain — "a link named os/ points to your os/" would be a
+					// tautology (skeptic, 2026-09-23).
+					fmt.Printf("            os/ there is a link to your repo's own os/, so cargo's target/ dirs land\n")
+				} else {
+					fmt.Printf("            a link named os/ (the grader's fixed staging name) points to your %s/,\n", r.treeName())
+					fmt.Printf("            so cargo's target/ dirs land\n")
+				}
 				fmt.Printf("            in your repo — `sboot start`'s .gitignore already covers them.\n")
 			}
 		}
@@ -1676,6 +1715,11 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	if !force {
 		st.record(course, stage, res.checks)
 		st.noteRunError(course, stage, res)
+		// A submit that graded is a graded run for the red-stage rule too: a
+		// local PASS here is how most red labs turn green (skeptic, 2026-09-23).
+		if res.graded() && res.max > 0 {
+			st.setLastRed(course, stage, res.score < res.max)
+		}
 		if err := st.save(); err != nil {
 			debugf("could not save guidance state: %v", err)
 		}
@@ -2025,6 +2069,14 @@ func reportGateFailure(stage, freshDefault string, res graderRun) {
 		fmt.Fprintf(os.Stderr, "     start lab %s:     work through its brief, then sboot test %s\n", labNumber(stage), stage)
 		return
 	}
+	// A build that died on a MISSING LINKER is not "these" to fix, and there is
+	// no capture to force (skeptic, 2026-09-23): the rung above already named
+	// the install, so say only that the gate waits for it.
+	if res.buildFailed && missingLinker(hostOS, res.buildOut) {
+		fmt.Fprintln(os.Stderr, "   The build never got past your machine's missing linker (the install line is above);")
+		fmt.Fprintf(os.Stderr, "   no submission was created and nothing was sent. Once it is installed: sboot test %s, then submit.\n", stage)
+		return
+	}
 	fmt.Fprintln(os.Stderr, "   `sboot submit` grades the same checks you just ran, so fix these first —")
 	fmt.Fprintln(os.Stderr, "   no submission was created and nothing was sent.")
 	fmt.Fprintf(os.Stderr, "   Think the local grader is wrong, or want this failure on the record?\n")
@@ -2362,8 +2414,21 @@ func repairStart(course, dest, title, firstStage, firstTitle, specTree string, y
 	printFirstLab(course, dest, firstStage, firstTitle)
 }
 
-// printFirstLab is the handoff both paths end on: the first live lab, the command
-// that grades it, and its lesson URL (P6 — a URL at the decision moment).
+// printFirstLab is the handoff both paths end on: the lab to work next, the
+// command that grades it, and its lesson URL (P6 — a URL at the decision moment).
+//
+// "Next" is the CURRENT-LAB RULE's answer, not always the first lab (D-MACOS-8,
+// 2026-09-13): `sboot start` on a machine whose account had finished the course
+// said "begin at lab 00 — sboot test # grades 00-welcome" while the very next bare
+// `sboot test` graded lab 05 and bare `sboot` said "course complete". One rule —
+// currentLab, the same one bare `test` and the dashboard read — answers here too.
+// Online that is one more GET of the account's completions per `start` (bounded
+// by the same 10 s the dashboard spends; courseProgress always asks the platform
+// when it can, so the next command asks again — the sync is saved for the
+// OFFLINE fallback, nothing more); offline the rule is not asked at all — `start`
+// has seeded an empty sync, which would only ever say "the first lab". A fresh
+// account resolves to the first lab exactly as before, and when the rule cannot
+// answer the first lab is the honest fallback.
 func printFirstLab(course, dest, firstStage, firstTitle string) {
 	firstTest := firstStage
 	if firstTest == "" {
@@ -2374,7 +2439,39 @@ func printFirstLab(course, dest, firstStage, firstTitle string) {
 		headline = labSlug(firstTest)
 	}
 	p := painter(os.Stdout)
-	fmt.Printf("\nbegin at lab %s — %s:\n", labNumber(firstTest), p(ansiAmber, headline))
+	current, fr := labInfo{}, (*frontierInfo)(nil)
+	if !offline() {
+		st := loadState()
+		lab, f, _, err := currentLab(st, course)
+		saveQuietly(st)
+		if err == nil {
+			current, fr = lab, f
+		}
+	}
+	if current.Stage != "" || fr != nil {
+		lab := current
+		if fr != nil {
+			fmt.Printf("\nevery live lab in %s is already verified on this account.\n", course)
+			if dest != "." {
+				fmt.Printf("  cd %s\n", dest)
+			}
+			fmt.Printf("  %s            %s\n", p(ansiGreen, "sboot test <lab>"), p(ansiDim, "# re-proves any lab on this machine"))
+			fmt.Printf("  %s                       %s\n", p(ansiGreen, "sboot"), p(ansiDim, "# the map"))
+			return
+		}
+		if lab.Stage != firstTest {
+			firstTest = lab.Stage
+			headline = lab.Title
+			if headline == "" {
+				headline = labSlug(firstTest)
+			}
+		}
+	}
+	verb := "begin at"
+	if firstStage != "" && firstTest != firstStage {
+		verb = "pick up at"
+	}
+	fmt.Printf("\n%s lab %s — %s:\n", verb, labNumber(firstTest), p(ansiAmber, headline))
 	if dest != "." {
 		fmt.Printf("  cd %s\n", dest)
 	}
@@ -2442,7 +2539,7 @@ func reportSignedOut(retry string) {
 	fmt.Fprintf(os.Stderr, "    %s\n", p(ansiGreen, "sboot login"))
 	fmt.Fprintf(os.Stderr, "    %s\n", retry)
 	fmt.Fprintf(os.Stderr, "\n  No browser here? Take a token from %s/account instead:\n", siteURL())
-	fmt.Fprintf(os.Stderr, "    export SBOOT_TOKEN=<the token>\n")
+	fmt.Fprintf(os.Stderr, "    %s\n", tokenSetLine("<the token>"))
 }
 
 // fetchTests puts the course's tests and grading engine in the cache, and the

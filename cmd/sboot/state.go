@@ -132,6 +132,16 @@ type guidanceState struct {
 	// graded run. Purely presentational (the ▸ row's "last practice 3/5"), so
 	// losing it costs one dash in the status screen and nothing else.
 	LastScore map[string]string `json:"last_score,omitempty"`
+	// course -> the stage of the most recent LOCAL graded run that did NOT pass
+	// in full, cleared when that same stage later passes in full.
+	//
+	// The second question a bare `sboot hint` (and, at the frontier, a bare
+	// `sboot test`) asks before the account (D-MACOS-5 / D-WIN-6, 2026-09-13):
+	// Blocked above covers a run with no verdict; this covers a run that graded
+	// red on a lab the account already holds verified — the returning learner
+	// re-proving lab 05 on a new machine — who was told "all live labs are
+	// verified — nothing to hint" by a frontier that never saw the 8/14.
+	LastRed map[string]string `json:"last_red_stage,omitempty"`
 	// The course catalog as of the last successful GET /api/v1/courses, so
 	// `sboot courses` and the out-of-repo status degrade to cached orientation
 	// rather than a wall (P7).
@@ -221,6 +231,7 @@ func loadState() *guidanceState {
 		Blocked:    map[string]string{},
 		Sync:       map[string]*courseSync{},
 		LastScore:  map[string]string{},
+		LastRed:    map[string]string{},
 		Nudged:     map[string]string{},
 	}
 	dir, err := stateDir()
@@ -265,6 +276,9 @@ func loadState() *guidanceState {
 	}
 	if loaded.LastScore != nil {
 		s.LastScore = loaded.LastScore
+	}
+	if loaded.LastRed != nil {
+		s.LastRed = loaded.LastRed
 	}
 	if loaded.Nudged != nil {
 		s.Nudged = loaded.Nudged
@@ -602,6 +616,7 @@ func (s *guidanceState) recordScore(course, stage string, score, max int) {
 	if max <= 0 {
 		return
 	}
+	s.setLastRed(course, stage, score < max)
 	v := fmt.Sprintf("%d/%d", score, max)
 	k := course + "/" + stage
 	if s.LastScore[k] == v {
@@ -609,6 +624,30 @@ func (s *guidanceState) recordScore(course, stage string, score, max int) {
 	}
 	s.LastScore[k] = v
 	s.dirty = true
+}
+
+// setLastRed records a graded run's colour for the course: a red run makes its
+// stage the one a bare hint answers; a full-marks run on that same stage ends the
+// claim. A full-marks run on a DIFFERENT stage leaves it — the red lab is still
+// red, and still the freshest failing thing on this machine.
+func (s *guidanceState) setLastRed(course, stage string, red bool) {
+	switch {
+	case red:
+		if s.LastRed[course] == stage {
+			return
+		}
+		s.LastRed[course] = stage
+	case s.LastRed[course] == stage:
+		delete(s.LastRed, course)
+	default:
+		return
+	}
+	s.dirty = true
+}
+
+// lastRedStage is the stage of this course's most recent local red run, or "".
+func (s *guidanceState) lastRedStage(course string) string {
+	return s.LastRed[course]
 }
 
 // setSync replaces one course's cached server progress after a successful fetch.

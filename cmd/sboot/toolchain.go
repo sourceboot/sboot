@@ -60,11 +60,16 @@ var hostOS = runtime.GOOS
 func linkerSignatures(goos string) []string {
 	switch goos {
 	case "darwin":
+		// `xcrun: error: unable to find utility "<tool>"` is NOT here (dropped
+		// 2026-09-23, skeptic): it is also what a machine WITH the Command Line
+		// Tools prints for a full-Xcode-only tool, where `xcode-select --install`
+		// does nothing — the one darwin spelling that could fire on a machine
+		// the remedy cannot fix. A Mac with no tools at all prints the two
+		// MEASURED lines above first.
 		return []string{
 			"no developer tools were found",                                 // MEASURED (rustc's `= note:` line)
 			"xcode-select: error: unable to get active developer directory", // MEASURED (xcode-select -p)
 			"xcrun: error: invalid active developer path",
-			"xcrun: error: unable to find utility",
 		}
 	case "windows":
 		return []string{
@@ -137,23 +142,32 @@ func devToolsAbsent(goos string) bool {
 // linkerHint is what to say and what to type, per OS. Two lines of explanation
 // (why a Rust install is not enough) and then the command — the shape
 // `pkgInstall("gh")` already has, and the sizes are the ones the laps measured on
-// real machines, because "one more download" and "5.5 GB" are different decisions
+// real machines, because "one more download" and "7 GB" are different decisions
 // for someone on a phone tether.
+//
+// THE NUMBERS ARE THE PAGE'S (G333, sboot-v0.15.0): every `N MB|GB` here must appear
+// in the shared welcome's linker-<os> block (content/shared/welcome.md, re-measured
+// 2026-09-16 — wave 3 decision 2), because a learner who reads lab 00 and then hits
+// this hint is otherwise told two sizes for one download. verify-content §15
+// (scripts/lib/welcome-guards.mjs checkCliSizes) reads these three arms and fails the
+// build on a token the page does not carry, so a re-measurement lands on the page
+// first and here second, never here alone.
 func linkerHint(goos string) []string {
 	switch goos {
 	case "darwin":
 		return []string{
 			"Rust compiles your code and then hands it to your Mac's own linker to finish —",
 			"and macOS ships without one until you install Apple's Command Line Tools:",
-			"  xcode-select --install     # ~900 MB, once per machine; click through the dialog",
+			"  " + cltInstallLine,
 		}
 	case "windows":
 		return []string{
 			"Rust compiles your code and then hands it to Windows' own linker to finish, and",
 			"that linker is Microsoft's, not Rust's. Two ways to get one — both fully graded:",
-			"  1. install the Visual C++ Build Tools (~5.5 GB, once) — the option rustup offers:",
+			"  1. rustup's option 1, the Visual Studio Community installer, which brings the C++",
+			"     build tools (roughly 7 GB and 15–20 minutes, once — plan on about 10 GB free):",
 			"     https://visualstudio.microsoft.com/visual-cpp-build-tools/  (\"Desktop development with C++\")",
-			"  2. or switch Rust to its own GNU toolchain, a much smaller download (~350 MB):",
+			"  2. or switch Rust to its own GNU toolchain (about 350 MB to download, 1.5 GB on disk):",
 			// The form the Windows lap MEASURED to work once rustup is already
 			// installed (windows.md D-WIN-1): `rustup-init.exe --default-host …` is a
 			// no-op by then, and `rustup default <toolchain>` loses to the
@@ -168,9 +182,42 @@ func linkerHint(goos string) []string {
 		return []string{
 			"Rust compiles your code and then hands it to your system's linker to finish —",
 			"and your distribution does not install one by default:",
-			"  " + linuxInstallLine("build-essential") + "     # ~100 MB, once per machine",
+			"  " + linuxInstallLine("build-essential") + "     # about 70 MB to download, 230 MB on disk, once",
 		}
 	}
+}
+
+// cltInstallLine is the one Command Line Tools remedy, printed by the linker hint
+// after a failed build and by `sboot start` before a doomed `git init`
+// (concierge.go localRepoStep) — ONE string so the two cannot quote two sizes.
+const cltInstallLine = "xcode-select --install     # about 1 GB on disk, once per machine; click through the dialog"
+
+// tokenSetLine is how to put a pasted token into the environment on THIS shell.
+// PowerShell has no `export` (D-WIN-4, 2026-09-13): a Windows learner who typed the
+// Unix line got "The term 'export' is not recognized" on the signed-out screen,
+// the first screen `sboot start` shows before a login. `token` is the literal to
+// print — a placeholder like `<the token>`, or the real one when the flow already
+// holds it and only failed to store it.
+func tokenSetLine(token string) string {
+	if hostOS == "windows" {
+		return "$env:SBOOT_TOKEN = \"" + token + "\""
+	}
+	return "export SBOOT_TOKEN=" + token
+}
+
+// tokenAdvice is the one-line "how to set it" that prose sites append ("or set
+// SBOOT_TOKEN" was a verb PowerShell reads as Set-Variable).
+func tokenAdvice() string {
+	return "`" + tokenSetLine("<the token>") + "`"
+}
+
+// tokenUnsetLine is the other half: how to take a pasted token back out of THIS
+// shell, so `sboot login` can pair. "unset" is prose on PowerShell.
+func tokenUnsetLine() string {
+	if hostOS == "windows" {
+		return "Remove-Item Env:SBOOT_TOKEN"
+	}
+	return "unset SBOOT_TOKEN"
 }
 
 // ── which package manager, on Linux ────────────────────────────────────────────
@@ -191,7 +238,11 @@ var linuxManagers = []struct {
 	probe string
 	mgr   linuxPkgManager
 }{
-	{"apt-get", linuxPkgManager{install: "sudo apt-get install -y"}},
+	// `apt-get update` FIRST (D-LINUX-2, 2026-09-13): a fresh Ubuntu cloud image
+	// has an empty package list, and `apt-get install` on it exits 100 with
+	// "Unable to locate package" — the learner's very first command, failing on a
+	// machine that has nothing wrong with it. The update is cheap and idempotent.
+	{"apt-get", linuxPkgManager{install: "sudo apt-get update && sudo apt-get install -y"}},
 	{"dnf", linuxPkgManager{install: "sudo dnf install", names: []string{
 		"build-essential=gcc", "qemu-system-x86=qemu-system-x86", "gh=gh"}}},
 	{"pacman", linuxPkgManager{install: "sudo pacman -S", names: []string{
@@ -216,7 +267,7 @@ func linuxInstallLine(pkg string) string {
 		}
 		return m.mgr.install + " " + m.mgr.name(pkg)
 	}
-	return "sudo apt-get install -y " + pkg
+	return "sudo apt-get update && sudo apt-get install -y " + pkg
 }
 
 func (m linuxPkgManager) name(pkg string) string {

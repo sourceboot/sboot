@@ -690,6 +690,10 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 			if score := cs.Verified[l.Stage]; score != "" {
 				v += " " + score
 			}
+			// And SAYS it is outside the count (D-LINUX-9, 2026-09-13): this row sat
+			// under "0 of 11 live labs verified" with a ✓ on it, and the header read
+			// as wrong. The count is the marketed one and stays; the row explains.
+			v += " · setup, outside the count"
 			fmt.Printf("  %s\n", p(ansiDim, padTo(label, width)+v))
 		case done:
 			score := cs.Verified[l.Stage]

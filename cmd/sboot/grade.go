@@ -229,7 +229,21 @@ func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderR
 		// Recorded as a fact on the run rather than left for a caller to infer from
 		// its shape: nothing was scored, so this is not a 0/0 practice result
 		// (ledger L2a/L2b) and `sboot hint` answers it as a build (L28).
-		fmt.Fprintln(os.Stderr, "\nBUILD FAILED — fix the errors above and try again.")
+		//
+		// Unless the build's own output says the MACHINE has no linker (D-LINUX-4 /
+		// D-MACOS-4, 2026-09-13): "fix the errors above" is the wrong framing for a
+		// learner who has written no code, and the right answer was one command
+		// away in `sboot hint`. The classifier already fired there; it fires here
+		// too, inline, so the most fragile moment of lab 00 costs one command fewer.
+		if missingLinker(hostOS, run.buildOut) {
+			fmt.Fprintln(os.Stderr, "\nBUILD FAILED — not your code: this machine has no linker, so nothing was scored.")
+			for _, l := range linkerHint(hostOS) {
+				fmt.Fprintln(os.Stderr, "  "+l)
+			}
+			fmt.Fprintf(os.Stderr, "  then `sboot test %s` again.\n", labID)
+		} else {
+			fmt.Fprintln(os.Stderr, "\nBUILD FAILED — fix the errors above and try again.")
+		}
 		run.buildFailed = true
 		run.exitCode = 1
 		return run

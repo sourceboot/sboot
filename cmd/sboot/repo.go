@@ -319,8 +319,12 @@ func sbootToml(course, tree string) string {
 	if tree != "" && tree != defaultTree {
 		extra = fmt.Sprintf("# Your source lives in %s/ for this course.\ntree = %q\n", tree, tree)
 	}
+	// ASCII ONLY in this file (D-WIN-9, 2026-09-13): stock Windows PowerShell 5.1
+	// decodes a BOM-less UTF-8 file as the ANSI code page, so an em dash here
+	// rendered as `â€"` in the first file a learner opens with `type`. The README
+	// keeps its typography — GitHub renders it — but this one is read in a shell.
 	return fmt.Sprintf(`# This file tells the `+"`sboot`"+` CLI which %s course this repo is for.
-# Everything else — the tests and the grading engine — lives outside this repo:
+# Everything else -- the tests and the grading engine -- lives outside this repo:
 # run `+"`sboot where`"+` to see exactly where.
 course = %q
 `, brandName, course) + extra

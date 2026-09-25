@@ -102,6 +102,44 @@ func runRepo(yes bool, name string) int {
 		fmt.Fprintln(out, "     run that, then `sboot repo` again — it does the rest in one confirm.")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "  b) do it by hand:")
+		// The rail's `git remote add` and `git push` need a repo with a commit in
+		// it, and on a Mac that met `sboot start` before the Command Line Tools
+		// there is none (D-MACOS-6, 2026-09-13): `git init` was refused, so the
+		// rail as printed failed at its second line. Name the prerequisite first —
+		// the same one-line answer `sboot start` gives — instead of a rail that
+		// cannot work in the state it is offered in.
+		// No `.git` needs no git to know; with one, the head is asked only when
+		// the Command Line Tools exist — on a Mac without them /usr/bin/git is the
+		// shim that opens Apple's install dialog, which this path never used to
+		// trigger (skeptic, 2026-09-23). The `cd` is printed because findRepo
+		// walks up: `sboot repo` from inside db/ would otherwise be told to
+		// `sboot start` "here", where start would unpack a second workspace.
+		noCommit := !isDir(filepath.Join(r.dir, ".git")) ||
+			(!devToolsAbsent(hostOS) && !gitHasHead(r.dir))
+		if noCommit {
+			// On a Mac without the Command Line Tools `sboot start` can only print
+			// this same line (macOS lap, 2026-09-23) — so it comes first here too,
+			// or the rail sends the learner in a circle.
+			// And a repo that exists with no commit is, on a fresh Linux box, git
+			// with no identity (Linux lap, 2026-09-23): `sboot start` there only
+			// prints the identity to-do, so the rail names it — the same two lines.
+			// The tools question comes FIRST and alone: gitIdentity runs `git
+			// config`, and on the Mac this branch exists for that is the shim
+			// (/code-review #61 finding 1 — a switch init would have run it
+			// before the case was read).
+			if devToolsAbsent(hostOS) {
+				fmt.Fprintf(out, "     first  %s\n", cltInstallLine)
+				fmt.Fprintf(out, "     then   cd %s\n", quoteIfSpaced(r.dir))
+			} else if name, email := gitIdentity(r.dir); isDir(filepath.Join(r.dir, ".git")) && (name == "" || email == "") {
+				fmt.Fprintln(out, "     first  git config --global user.name \"Your Name\"")
+				fmt.Fprintln(out, "            git config --global user.email \"you@example.com\"   # git refuses to commit without these")
+				fmt.Fprintf(out, "     then   cd %s\n", quoteIfSpaced(r.dir))
+			} else {
+				fmt.Fprintf(out, "     first  cd %s\n", quoteIfSpaced(r.dir))
+			}
+			fmt.Fprintf(out, "            sboot start %s        # makes the local repo and its first commit\n", r.course)
+			fmt.Fprintln(out, "            (nothing is committed yet, so the two git lines below would fail)")
+		}
 		printManualRail(out, r.dir, repo)
 		return 0
 	}
@@ -189,11 +227,13 @@ func ghInstallLine() string {
 		if _, err := exec.LookPath("dnf"); err == nil {
 			return "sudo dnf install gh"
 		}
+		// `update` first, for the reason toolchain.go's apt line gives: a fresh
+		// image's package list is empty and the install alone exits 100.
 		if _, err := exec.LookPath("apt-get"); err == nil {
-			return "sudo apt-get install gh"
+			return "sudo apt-get update && sudo apt-get install -y gh"
 		}
 		if _, err := exec.LookPath("apt"); err == nil {
-			return "sudo apt install gh"
+			return "sudo apt update && sudo apt install -y gh"
 		}
 		// Neither package manager found: name the project's own page rather than
 		// guessing a distro.
@@ -299,7 +339,7 @@ func printDevToolsTodo(out *os.File, retry string) {
 	fmt.Fprintln(out, "   git here is Apple's, and this Mac has no Command Line Tools yet — so it cannot run:")
 	// The same line, and the same measured size, as the missing-linker rung in
 	// toolchain.go: it is one install, so it must read as one install.
-	fmt.Fprintf(out, "     %s     # ~900 MB, once per machine; click through the dialog\n", pkgInstall("build-essential"))
+	fmt.Fprintf(out, "     %s\n", cltInstallLine)
 	// Wrapped by hand at ~85 columns, like the rest of this command's narration.
 	fmt.Fprintf(out, "   when it finishes, run `%s` again here — it keeps your\n", retry)
 	fmt.Fprintln(out, "   files and only adds the repository.")
@@ -452,7 +492,10 @@ func printIdentityTodo(out *os.File, dir, course string) {
 	fmt.Fprintln(out, "   your work is saved, but not committed — git has no name and email yet:")
 	fmt.Fprintln(out, `     git config --global user.name "Your Name"`)
 	fmt.Fprintln(out, "     git config --global user.email you@example.com")
-	fmt.Fprintf(out, "     cd %s && git add -A && git commit -m %q\n", quoteIfSpaced(dir), "start "+course)
+	// `;` on every OS: Windows PowerShell 5.1 has no `&&` ("The token '&&' is
+	// not a valid statement separator in this version" — Windows lap, 2026-09-23),
+	// and `;` is a statement separator in bash, zsh and PowerShell alike.
+	fmt.Fprintf(out, "     cd %s; git add -A; git commit -m %q\n", quoteIfSpaced(dir), "start "+course)
 }
 
 // ── the nudge: your repo has no remote yet ──────────────────────────────────────
