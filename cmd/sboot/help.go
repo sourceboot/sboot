@@ -69,6 +69,7 @@ flags:
   --here                answer in this terminal instead of opening the chat (explain)
   --message, -m TEXT    your question, instead of the one explain composes (explain)
   --json                machine-readable output on `+"`sboot`"+`, test and submit
+  --checks              test: every check, one line each, instead of the task list
   --yes, -y             answer yes to every prompt (start, repo, reveal)
   --dir NAME            unpack into this folder instead of the course's own (start)
   --name NAME           create a repo of this name instead of the default (repo)

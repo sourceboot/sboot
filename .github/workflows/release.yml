@@ -72,7 +72,7 @@ jobs:
 
           Pin this version:
           \`\`\`sh
-          SBOOT_VERSION=$GITHUB_REF_NAME curl -fsSL https://sourceboot.com/install.sh | sh
+          curl -fsSL https://sourceboot.com/install.sh | SBOOT_VERSION=$GITHUB_REF_NAME sh
           \`\`\`
 
           Verify downloads against \`SHA256SUMS\`. Releases are never deleted or

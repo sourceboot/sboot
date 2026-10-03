@@ -366,7 +366,22 @@ func (s *guidanceState) tierSpec(course, stage string) string {
 // once the stage has id-carrying checks and something to say: a first run where
 // everything passes writes nothing, preserving "an all-green learner (and the
 // e2e stub grader) gets no state file at all".
+//
+// THE TASK LIST'S TWO CORRECTIONS (docs/lab-page-v2.md §4, 2026-09-30), applied
+// only when the engine wrote a listing (`tasks` non-nil):
+//
+//	· a check the run marked `absent` — its test does not exist yet, because the
+//	  task is not started — is neither a failure nor a pass: its counter is left
+//	  where it was, so a task begun on the fourth run meets Layer 1 on its first
+//	  real failure instead of Layer 2 (the counter used to climb on every run);
+//	· the failing set is written CURRENT TASK FIRST, so a bare `sboot hint`
+//	  (hint.go defaultHintTarget, "the first failing check") points at the task
+//	  the learner is on rather than at the first failing row in rubric order.
 func (s *guidanceState) record(course, stage string, checks []localCheck) {
+	s.recordListed(course, stage, checks, nil)
+}
+
+func (s *guidanceState) recordListed(course, stage string, checks []localCheck, tasks *taskListing) {
 	var failing []string
 	haveIDs := false
 	for _, c := range checks {
@@ -375,6 +390,17 @@ func (s *guidanceState) record(course, stage string, checks []localCheck) {
 		}
 		haveIDs = true
 		k := stateKey(course, stage, c.id)
+		if tasks != nil && tasks.States[c.id] == "absent" {
+			// Not tried, so not failed — and whatever an earlier real failure left
+			// as this row's evidence is not this run's: a later `sboot hint` must
+			// not quote it as if it were.
+			failing = append(failing, c.id)
+			if _, had := s.Evidence[k]; had {
+				delete(s.Evidence, k)
+				s.dirty = true
+			}
+			continue
+		}
 		if c.pass {
 			if _, had := s.Fails[k]; had {
 				delete(s.Fails, k)
@@ -399,6 +425,9 @@ func (s *guidanceState) record(course, stage string, checks []localCheck) {
 	if len(failing) == 0 && !had {
 		return // nothing failed and nothing was tracked — leave no trace
 	}
+	if tasks != nil && tasks.Current > 0 {
+		failing = currentTaskFirst(failing, tasks)
+	}
 	if had && sameStrings(s.LastFailed[lk], failing) {
 		return
 	}
@@ -407,6 +436,45 @@ func (s *guidanceState) record(course, stage string, checks []localCheck) {
 	}
 	s.LastFailed[lk] = failing
 	s.dirty = true
+}
+
+// currentTaskFirst reorders a failing set so the current task's own rows lead it,
+// the rest keeping their rubric order behind them.
+func currentTaskFirst(failing []string, tasks *taskListing) []string {
+	own := map[string]bool{}
+	for _, t := range tasks.Tasks {
+		if t.N != tasks.Current {
+			continue
+		}
+		rows := t.Checks
+		if t.With != nil {
+			// A `:::done with M` task's rows are its partner's — the ones the
+			// terminal just printed as its evidence.
+			for _, p := range tasks.Tasks {
+				if p.N == *t.With {
+					rows = p.Checks
+				}
+			}
+		}
+		for _, id := range rows {
+			own[id] = true
+		}
+	}
+	// Within the head, a row that RAN and failed leads a row whose test does not
+	// exist yet: a bare `sboot hint` then answers the failure with its evidence
+	// rather than the unwritten test with a generic rung.
+	var head, headAbsent, tail []string
+	for _, id := range failing {
+		switch {
+		case own[id] && tasks.States[id] == "absent":
+			headAbsent = append(headAbsent, id)
+		case own[id]:
+			head = append(head, id)
+		default:
+			tail = append(tail, id)
+		}
+	}
+	return append(append(head, headAbsent...), tail...)
 }
 
 // maxEvidenceBytes bounds one check's stored observation. The engine already

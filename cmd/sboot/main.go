@@ -115,6 +115,7 @@ type gradedArgs struct {
 	defaulted bool   // the stage came from the current-lab rule, not the learner
 	force     bool
 	jsonOut   bool
+	checks    bool // test: the flat per-check list, not the task list (lab page v2)
 	yes       bool
 	here      bool   // explain: answer in this terminal instead of opening the chat
 	message   string // explain: the learner's own question
@@ -146,6 +147,15 @@ func parseCommon(cmd string, args []string, maxPos int, opts *gradedArgs) []stri
 				usageError("--json is not available on `sboot %s` (it is on `sboot`, test and submit)", cmd)
 			}
 			opts.jsonOut = true
+		case !terminated && a == "--checks":
+			// THE FULL PER-CHECK LIST (docs/lab-page-v2.md §4): a converted lab's
+			// `sboot test` prints the task list; this asks for every check, one line
+			// each, as every lab printed before 2026-09-30 and every unconverted lab
+			// still does.
+			if cmd != "test" {
+				usageError("--checks only means something for `sboot test`")
+			}
+			opts.checks = true
 		case !terminated && (a == "--yes" || a == "-y"):
 			if cmd != "start" && cmd != "repo" && cmd != "reveal" {
 				usageError("--yes only means something for `sboot start`, `sboot repo` and `sboot reveal`")
@@ -609,7 +619,11 @@ func runTestCode(r repo, stage string, ga gradedArgs) int {
 	// ladder (the failure-guidance spec). The grader itself stays historyless.
 	st := loadState()
 	jsonMode = ga.jsonOut
+	// The task list is the default on a converted lab (grader/tasks.go); --checks
+	// and --json ask for the flat list (the JSON verdict is per check already).
+	tasksMode = !ga.checks && !ga.jsonOut
 	res := runGrader(run, r.course, stage, st.tierSpec(r.course, stage), "", r.tree)
+	tasksMode = false
 	// Recorded BEFORE the launch-failure exit, because a run that never reached a
 	// check is exactly the run `sboot hint` had nothing to say about (F00-5).
 	st.noteRunError(r.course, stage, res)
@@ -618,7 +632,7 @@ func runTestCode(r repo, stage string, ga gradedArgs) int {
 		reportGraderMissing(r, res.launchErr)
 		return 2
 	}
-	st.record(r.course, stage, res.checks)
+	st.recordListed(r.course, stage, res.checks, res.tasks)
 	st.recordScore(r.course, stage, res.score, res.max)
 	if err := st.save(); err != nil {
 		debugf("could not save guidance state: %v", err)
@@ -640,7 +654,7 @@ func runTestCode(r repo, stage string, ga gradedArgs) int {
 		if ga.jsonOut {
 			printVerdictJSON("test", r.course, stage, res)
 		}
-		if err := reportPractice(r.course, stage, res.score, res.max, res.passed, res.detail); err != nil {
+		if err := reportPractice(r.course, stage, res.score, res.max, res.passed, res.detail, res.checks); err != nil {
 			reportPracticeFailure(err)
 		}
 	}
@@ -664,9 +678,13 @@ func stageStuckURL(course, stage string) string {
 func printVerdictJSON(command, course, stage string, res graderRun) {
 	checks := make([]map[string]any, 0, len(res.checks))
 	for _, c := range res.checks {
-		checks = append(checks, map[string]any{
-			"id": c.id, "pass": c.pass, "points": c.points, "desc": c.desc,
-		})
+		row := map[string]any{"id": c.id, "pass": c.pass, "points": c.points, "desc": c.desc}
+		if c.absent {
+			// Additive (§12.2 rule 6): a row the listing read as not started says
+			// so, instead of reading as a plain failure.
+			row["state"] = "absent"
+		}
+		checks = append(checks, row)
 	}
 	b, _ := json.MarshalIndent(map[string]any{
 		"command": command, "course": course, "stage": stage,
@@ -1183,6 +1201,10 @@ type localCheck struct {
 	pass   bool
 	points int
 	desc   string
+	// absent: the engine's listing read this row as not started (its test does
+	// not exist yet — grade.go). Left out of the practice report, left alone by
+	// the ladder; a flat verdict never sets it.
+	absent bool
 	// LAYER 0 for this check, verbatim as the engine generated it: what the
 	// learner's own run did, never a criterion of ours (grader/guidance.go
 	// Observe). Empty for a check that passed, and for a verdict from an engine
@@ -1216,6 +1238,11 @@ type graderRun struct {
 	// the practice record was still written as 0/0. That defect is now fixed, so the
 	// fact is recorded honestly, at the one place that knows it.
 	buildFailed bool
+	// The task listing the engine wrote beside its verdict when `sboot test` asked
+	// for the task list (grade.go tasksMode): per-check pass/fail/absent and the
+	// current task. Nil for the flat list. Read by the ladder counter (a check that
+	// has not been tried has not failed) and by the bare `sboot hint` target.
+	tasks *taskListing
 	// The engine ran to a VERDICT and this run carries it: a protocol file was read
 	// back and it contained an LBX_SCORE record. False is every other outcome —
 	// the build failed, the engine refused the lab, it wrote nothing, it wrote half
@@ -1509,7 +1536,22 @@ type practiceResp struct {
 	Err  string `json:"error"`
 }
 
-func reportPractice(course, stage string, score, max int, passed bool, detail string) error {
+func reportPractice(course, stage string, score, max int, passed bool, detail string, checks []localCheck) error {
+	// STRUCTURED PER-CHECK RESULTS, BESIDE THE LINES (docs/lab-page-v2.md §5,
+	// 2026-09-30). `detail` stays what every released binary sends — the engine's
+	// `[PASS]/[FAIL] <desc>` lines — and `checks` adds the same verdict by ID, so
+	// the lab page's ticks match a row by its stable identity rather than by a
+	// desc a rubric edit can reword. /api/v1 is append-only: a server that predates
+	// the field ignores it, and one that reads it stores it beside the detail.
+	// An `absent` row is not sent: the page then reads it as not run (unknown),
+	// which is what the terminal said, instead of as a failure.
+	results := make([]map[string]any, 0, len(checks))
+	for _, c := range checks {
+		if c.id == "" || c.absent {
+			continue
+		}
+		results = append(results, map[string]any{"id": c.id, "pass": c.pass, "points": c.points})
+	}
 	body, _ := json.Marshal(map[string]any{
 		"course":    course,
 		"stage":     stage,
@@ -1517,6 +1559,7 @@ func reportPractice(course, stage string, score, max int, passed bool, detail st
 		"max_score": max,
 		"passed":    passed,
 		"detail":    detail,
+		"checks":    results,
 	})
 	req, err := authedRequest("POST", apiURL()+"/api/v1/completions", bytes.NewReader(body))
 	if err != nil {
@@ -1713,7 +1756,11 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	// the SERVER's verdict renders, and stays at tier 1: the server has nothing
 	// honest to escalate to. Local rendering is local rendering.
 	if !force {
-		st.record(course, stage, res.checks)
+		// With the listing when the bundle has one (grade.go asks for it on this
+		// path too): a not-started task's rows are left alone, and the failing set
+		// leads with the current task's — the same two corrections `sboot test`
+		// applies, so a run of submits does not undo them.
+		st.recordListed(course, stage, res.checks, res.tasks)
 		st.noteRunError(course, stage, res)
 		// A submit that graded is a graded run for the red-stage rule too: a
 		// local PASS here is how most red labs turn green (skeptic, 2026-09-23).

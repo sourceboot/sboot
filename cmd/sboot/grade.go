@@ -41,6 +41,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -62,6 +63,30 @@ const defaultBuildCmd = "cargo xtask build"
 // build's stdout joins stderr. Set by the command dispatch before runGrader;
 // package-level because this binary has no goroutines.
 var jsonMode bool
+
+// tasksMode asks the engine for the TASK LIST instead of the flat check list
+// (docs/lab-page-v2.md §4; grader/tasks.go). Set by `sboot test` for a run that
+// is not --checks and not --json; never by `sboot submit`, whose official verdict
+// prints every row as it always did.
+var tasksMode bool
+
+// taskListing is what the engine wrote to --tasks-out: per-check states (pass /
+// fail / absent) and the current task, read by the ladder counter and the hint
+// target. Nil when the run printed the flat list.
+type taskListing struct {
+	Current int               `json:"current"`
+	States  map[string]string `json:"states"`
+	Tasks   []taskRow         `json:"tasks"`
+}
+
+// taskRow is one task of the listing: its own rows, or (`with` set) the partner
+// whose rows tick it.
+type taskRow struct {
+	N      int      `json:"n"`
+	State  string   `json:"state"`
+	With   *int     `json:"with"`
+	Checks []string `json:"checks"`
+}
 
 // runGrader builds the staged workspace and grades this lab against its PUBLISHED
 // checks, returning everything the CLI needs to report and record the run.
@@ -284,6 +309,27 @@ func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderR
 	if captureOut != "" {
 		args = append(args, "--capture-out", captureOut)
 	}
+	// THE TASK LIST, WHEN THE LAB HAS ONE. The bundle of a converted lab carries
+	// tasks.json (grader/tasks.go); only then is the engine asked, so a bare
+	// `sboot test` on an unconverted lab sends the argv it always sent. An engine
+	// older than the flag exits 2 on it — the same handshake as resolve's
+	// `--grader` — and the run is retried once without, printing the flat list.
+	// The LISTING is asked for whenever the bundle has one (`--tasks-out`), on
+	// `sboot submit` as much as on `sboot test`: it is what keeps the ladder honest
+	// about not-started tasks (state.go recordListed) on both paths. The printed
+	// task list (`--tasks`) is `sboot test`'s alone; submit prints the flat list.
+	tasksOut := ""
+	base := len(args)
+	hasListing := fileExists(filepath.Join(labDir, "tasks.json"))
+	withTasks := tasksMode && hasListing
+	if hasListing {
+		tasksOut = filepath.Join(runDir, "build", "tasks.json")
+		_ = os.Remove(tasksOut)
+		args = append(args, "--tasks-out", tasksOut)
+		if withTasks {
+			args = append(args, "--tasks")
+		}
+	}
 
 	// The judge's streams go through the F00-1 display filter (retree.go): what
 	// the engine prints — its `── running` banners and the [[run]] output teed
@@ -292,14 +338,39 @@ func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderR
 	// and the practice record, which must keep what actually ran.
 	judgeOut, judgeErr, flushRetree := retreeStreams(runDir, tree)
 	var captured bytes.Buffer
-	judge := exec.Command(engine, args...)
-	judge.Dir = runDir
-	judge.Stdout = io.MultiWriter(judgeOut, &captured)
-	if jsonMode {
-		judge.Stdout = &captured // stdout is reserved for the JSON verdict
+	var capturedErr headBuffer
+	runJudge := func(args []string) error {
+		captured.Reset()
+		capturedErr.Reset()
+		judge := exec.Command(engine, args...)
+		judge.Dir = runDir
+		judge.Stdout = io.MultiWriter(judgeOut, &captured)
+		if jsonMode {
+			judge.Stdout = &captured // stdout is reserved for the JSON verdict
+		}
+		// stderr streams LIVE (the course's runs go through it). Only when the
+		// listing flags are on the argv is its HEAD also kept — a few KiB, enough
+		// for the one line an older engine prints before grading anything — so an
+		// unconverted course's chatty suite is never buffered.
+		judge.Stderr = judgeErr
+		if hasListing {
+			judge.Stderr = io.MultiWriter(judgeErr, &capturedErr)
+		}
+		return judge.Run()
 	}
-	judge.Stderr = judgeErr
-	err = judge.Run()
+	err = runJudge(args)
+	if hasListing {
+		var ee *exec.ExitError
+		// Only an engine that does not know the flags is retried — it says so, in
+		// the one line it prints before grading anything (no verdict file; the
+		// first unknown flag it meets is `--tasks-out`, or `--tasks`). Any other
+		// exit 2 is a refusal the new engine meant, printed once.
+		if errors.As(err, &ee) && ee.ExitCode() == 2 && !fileExists(protocolPath) &&
+			strings.Contains(capturedErr.String(), "unknown argument '--tasks") {
+			hasListing, withTasks = false, false
+			err = runJudge(args[:base])
+		}
+	}
 	flushRetree()
 	if err != nil {
 		var ee *exec.ExitError
@@ -351,7 +422,76 @@ func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderR
 		}
 	}
 	run.detail = strings.Join(lines, "\n")
+	if withTasks {
+		// The task list printed no per-check lines, so the record is built from
+		// the verdict itself — the same rows, in the same spelling the flat list
+		// prints (`[PASS] <desc> (<N> pt)`, then `score:`), so a server reading
+		// detail by line sees exactly what every earlier binary sent.
+		run.detail = detailFromChecks(run.checks, run.score, run.max)
+	}
+	if hasListing {
+		if b, readErr := os.ReadFile(tasksOut); readErr == nil {
+			var tl taskListing
+			if json.Unmarshal(b, &tl) == nil {
+				run.tasks = &tl
+				// A row the listing read as `absent` — its test does not exist yet —
+				// is marked on the check itself: the practice report leaves it out,
+				// so the page shows it as not run rather than as failed, which is
+				// what the terminal just said about it.
+				for i := range run.checks {
+					if tl.States[run.checks[i].id] == "absent" {
+						run.checks[i].absent = true
+					}
+				}
+			}
+		}
+		_ = os.Remove(tasksOut)
+	}
 	return run
+}
+
+// headBuffer keeps the FIRST headBufferCap bytes written to it and drops the rest:
+// the handshake above needs one early stderr line, never a run's whole stream.
+type headBuffer struct{ buf []byte }
+
+const headBufferCap = 8 << 10
+
+// Write ALWAYS reports the whole slice consumed: it sits inside an io.MultiWriter
+// on the engine's stderr, and a short count there is io.ErrShortWrite — os/exec
+// stops copying, the pipe closes, and the engine dies of SIGPIPE on its next
+// write, before any verdict (the second review, 2026-10-01: every converted-lab
+// run past 8 KiB of stderr).
+func (b *headBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if room := headBufferCap - len(b.buf); room > 0 {
+		if len(p) > room {
+			p = p[:room]
+		}
+		b.buf = append(b.buf, p...)
+	}
+	return n, nil
+}
+
+func (b *headBuffer) Reset()         { b.buf = b.buf[:0] }
+func (b *headBuffer) String() string { return string(b.buf) }
+
+// detailFromChecks spells a verdict the way the engine's flat list prints it.
+func detailFromChecks(checks []localCheck, score, max int) string {
+	var lines []string
+	for _, c := range checks {
+		v := "FAIL"
+		if c.pass {
+			v = "PASS"
+		}
+		lines = append(lines, fmt.Sprintf("[%s] %s (%d pt)", v, c.desc, c.points))
+	}
+	lines = append(lines, fmt.Sprintf("score: %d/%d", score, max))
+	return strings.Join(lines, "\n")
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 // labGraderManifest is what `resolve --grader` reported about the lab itself:
