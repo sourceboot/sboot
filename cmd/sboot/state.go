@@ -62,6 +62,14 @@ type guidanceState struct {
 	// once a stage has ids to say something about, so the e2e stub grader (no
 	// check ids) still creates no state file.
 	LastFailed map[string][]string `json:"last_failed,omitempty"`
+	// "course/stage" -> the ids in LastFailed that the run's task listing read as
+	// NOT STARTED (`absent`: the task's test does not exist yet), in the same
+	// order. LastFailed keeps them, so a bare `sboot hint` can still point at the
+	// current task; this is what lets the hint call such a row what it is rather
+	// than "your failing check" (2026-10-03 review round PL-11 / D-LINUX-10,
+	// ledger G467). Append-only like every field here: an older binary does not
+	// see it, and a run with nothing absent deletes the entry.
+	Absent map[string][]string `json:"last_absent,omitempty"`
 	// "course/stage/check-id" -> the LAYER 0 observation the most recent graded
 	// run produced for a check that FAILED — the learner's own evidence, verbatim
 	// as the engine generated it (grader/guidance.go Observe).
@@ -182,6 +190,12 @@ type courseSync struct {
 	LastAttempt string `json:"last_attempt,omitempty"`
 	// RFC3339. When this course was last synced from the server.
 	SyncedAt string `json:"synced_at,omitempty"`
+	// The account the server answered for (2026-10-03, PL-1). What mergeSync keys
+	// on: a stage verified for one account is never carried into another's view
+	// on a machine where both have signed in. "" for a cache written before this
+	// field, by `sboot start`'s seed, or with no handle in the answer — and such
+	// a cache is replaced, never merged.
+	Handle string `json:"handle,omitempty"`
 }
 
 // catalogCache is the course catalog as of the last successful fetch.
@@ -225,6 +239,7 @@ func loadState() *guidanceState {
 		Rungs:      map[string]int{},
 		Evidence:   map[string]string{},
 		LastFailed: map[string][]string{},
+		Absent:     map[string][]string{},
 		RunError:   map[string]string{},
 		BuildOut:   map[string]string{},
 		BuildHints: map[string]*buildHintMark{},
@@ -258,6 +273,9 @@ func loadState() *guidanceState {
 	}
 	if loaded.LastFailed != nil {
 		s.LastFailed = loaded.LastFailed
+	}
+	if loaded.Absent != nil {
+		s.Absent = loaded.Absent
 	}
 	if loaded.RunError != nil {
 		s.RunError = loaded.RunError
@@ -382,7 +400,7 @@ func (s *guidanceState) record(course, stage string, checks []localCheck) {
 }
 
 func (s *guidanceState) recordListed(course, stage string, checks []localCheck, tasks *taskListing) {
-	var failing []string
+	var failing, absent []string
 	haveIDs := false
 	for _, c := range checks {
 		if c.id == "" {
@@ -395,6 +413,7 @@ func (s *guidanceState) recordListed(course, stage string, checks []localCheck, 
 			// as this row's evidence is not this run's: a later `sboot hint` must
 			// not quote it as if it were.
 			failing = append(failing, c.id)
+			absent = append(absent, c.id)
 			if _, had := s.Evidence[k]; had {
 				delete(s.Evidence, k)
 				s.dirty = true
@@ -425,6 +444,7 @@ func (s *guidanceState) recordListed(course, stage string, checks []localCheck, 
 	if len(failing) == 0 && !had {
 		return // nothing failed and nothing was tracked — leave no trace
 	}
+	s.setAbsent(lk, absent)
 	if tasks != nil && tasks.Current > 0 {
 		failing = currentTaskFirst(failing, tasks)
 	}
@@ -517,6 +537,30 @@ func (s *guidanceState) evidence(course, stage, checkID string) string {
 func (s *guidanceState) lastFailed(course, stage string) ([]string, bool) {
 	f, ok := s.LastFailed[course+"/"+stage]
 	return f, ok
+}
+
+// setAbsent records which of a stage's failing rows the last run read as not
+// started, deleting the entry when none were (so a flat verdict, or a run with
+// every row tried, leaves nothing behind).
+func (s *guidanceState) setAbsent(key string, ids []string) {
+	if len(ids) == 0 {
+		if _, had := s.Absent[key]; had {
+			delete(s.Absent, key)
+			s.dirty = true
+		}
+		return
+	}
+	if sameStrings(s.Absent[key], ids) {
+		return
+	}
+	s.Absent[key] = ids
+	s.dirty = true
+}
+
+// notStarted reports whether the last graded run of this stage read the check as
+// not started — its test did not exist yet — rather than as failing.
+func (s *guidanceState) notStarted(course, stage, checkID string) bool {
+	return containsString(s.Absent[course+"/"+stage], checkID)
 }
 
 // hasLocalWork reports whether ANY local trace of working this stage exists on
@@ -718,10 +762,57 @@ func (s *guidanceState) lastRedStage(course string) string {
 	return s.LastRed[course]
 }
 
+// isVerified reports whether the cached server progress holds this stage verified.
+func (s *guidanceState) isVerified(course, stage string) bool {
+	if cs := s.Sync[course]; cs != nil {
+		_, ok := cs.Verified[stage]
+		return ok
+	}
+	return false
+}
+
 // setSync replaces one course's cached server progress after a successful fetch.
 func (s *guidanceState) setSync(course string, sync *courseSync) {
 	s.Sync[course] = sync
 	s.dirty = true
+}
+
+// mergeSync is setSync for a server answer: VERIFIED NEVER SHRINKS (2026-10-03,
+// review round PL-1 = D-LINUX-1/D-WIN-2, ledger G463).
+//
+// A completed lab stays completed forever (CLAUDE.md, "Access, pricing"), yet the
+// sync rebuilt Verified from scratch out of the newest 200 attempts the server
+// returned — so once 200 practice runs buried a lab's one verified row, the next
+// sync un-verified it: 7 of 7 became 0 of 7, the next lab drew locked, bare `sboot
+// test`/`sboot hint` went back to lab 00, and `sboot courses` (one all-course
+// window) let practice in one course erase another's. The server now answers every
+// verified row whatever the window (G461), and this is the CLI's own half for a
+// platform that does not: every stage the cache already held verified is kept.
+//
+// Two answers are believed outright, and they are why this is not a blind union:
+//   - a DIFFERENT ACCOUNT (or a cache with no account on it): the cache describes
+//     someone else's progress, or cannot say whose;
+//   - an answer with NO ROWS for the course: the window can bury a row only under
+//     newer ones, so an empty answer is the server saying the progress is gone — a
+//     reset (scripts/reset-learner.mjs, the canary between rounds) or a deletion.
+//
+// Returns the course's progress as stored, which is what the caller should render.
+func (s *guidanceState) mergeSync(course string, fresh *courseSync, handle string, serverHasRows bool) *courseSync {
+	fresh.Handle = handle
+	if old := s.Sync[course]; old != nil && serverHasRows && handle != "" && old.Handle == handle {
+		for stage, score := range old.Verified {
+			if _, have := fresh.Verified[stage]; have {
+				continue
+			}
+			if fresh.Verified == nil {
+				fresh.Verified = map[string]string{}
+			}
+			fresh.Verified[stage] = score
+			delete(fresh.Practice, stage)
+		}
+	}
+	s.setSync(course, fresh)
+	return fresh
 }
 
 // markVerified folds one freshly verified stage into the cache — called when a

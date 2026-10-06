@@ -224,13 +224,34 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 
 	// The defaulted-target header (stderr — it is framing, not the hint): what
 	// this run is about, and how to aim elsewhere.
-	if stageDefaulted || checkDefaulted {
+	//
+	// IT SAYS WHAT THE ROW'S STATE REALLY IS (2026-10-03 review round PL-11 /
+	// D-LINUX-10, ledger G467). A bare hint points at the current task, and when
+	// that task's test does not exist yet the last run printed its row "not
+	// started" — so calling it "your failing check" contradicted the screen above
+	// it, and the row that DID fail (a later task's) went unmentioned. A
+	// not-started row says so, on a named hint as well as a defaulted one, and the
+	// rows that ran and failed are offered by id.
+	notStarted := st.notStarted(r.course, stage, target)
+	if stageDefaulted || checkDefaulted || notStarted {
 		p := painter(os.Stderr)
 		line := p(ansiAmber, fmt.Sprintf("hint — %s · %s", stage, target))
-		if checkDefaulted {
+		switch {
+		case notStarted:
+			line += p(ansiDim, " # not started — your last run found no test for it yet, so this is what it will check")
+		case checkDefaulted:
 			line += p(ansiDim, " # your failing check; sboot hint <check> targets another")
 		}
 		fmt.Fprintln(os.Stderr, line)
+		if notStarted {
+			if ran := ranAndFailed(failing, st, r.course, stage, target); len(ran) > 0 {
+				fmt.Fprintf(os.Stderr, "%s %s\n", p(ansiDim, "  failed in your last run:"),
+					p(ansiGreen, fmt.Sprintf("sboot hint %s %s", stage, ran[0])))
+				if len(ran) > 1 {
+					fmt.Fprintf(os.Stderr, "  %s\n", p(ansiDim, fmt.Sprintf("(and %d more: %s)", len(ran)-1, strings.Join(ran[1:], ", "))))
+				}
+			}
+		}
 		fmt.Fprintln(os.Stderr)
 	}
 
@@ -352,6 +373,19 @@ func renderHint(stage, checkID string, e hintEntry, rung int, observed, stuckURL
 // did they all run — which is almost never what the learner got wrong, while the
 // specific check's hint is about the actual failure and was one command away.
 const umbrellaSuffix = ".suite"
+
+// ranAndFailed is the failing set without the rows the last run read as not
+// started, and without `except` — the rows a learner can be offered as "this one
+// actually failed", in the recorded order.
+func ranAndFailed(failing []string, st *guidanceState, course, stage, except string) []string {
+	var out []string
+	for _, id := range failing {
+		if id != except && !st.notStarted(course, stage, id) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
 
 // defaultHintTarget picks which failing check a bare `sboot hint` answers: the first
 // SPECIFIC one, falling back to verdict order when every failing check is an

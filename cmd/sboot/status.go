@@ -160,6 +160,28 @@ type attemptRow struct {
 	Passed   flexBool `json:"passed"`
 	Verified flexBool `json:"verified"`
 	Created  string   `json:"created_at"`
+	// THE GRADE THAT STANDS (2026-10-05, ledger G499 = D-LINUX-17's CLI half). On a
+	// verified row, Score/MaxScore are the Complete press's COPY of the passed
+	// submission's points, never refreshed, so after a rubric change the dashboard
+	// read 10/10 beside a 16/16 submit. A platform from 2026-10-05 adds the newest
+	// passed submission's points — the pair the lab page's header shows (G496) — and
+	// verifiedScore prefers them. ADDED fields (/api/v1 is append-only): absent from
+	// an older platform, and on a row with no passed submission known, which leaves
+	// today's reading exactly as it was.
+	LatestPassedScore *int `json:"latest_passed_score"`
+	LatestPassedMax   *int `json:"latest_passed_max_score"`
+}
+
+// verifiedScore is what a verified row prints as its points: the grade that stands
+// when the platform sent it, else the row's own copy; "" when there is no maximum.
+func (a attemptRow) verifiedScore() string {
+	if a.LatestPassedScore != nil && a.LatestPassedMax != nil && *a.LatestPassedMax > 0 {
+		return fmt.Sprintf("%d/%d", *a.LatestPassedScore, *a.LatestPassedMax)
+	}
+	if a.MaxScore > 0 {
+		return fmt.Sprintf("%d/%d", a.Score, a.MaxScore)
+	}
+	return ""
 }
 
 func (a attemptRow) course() string {
@@ -242,11 +264,7 @@ func syncFromAttempts(d *completionsData, course string) *courseSync {
 		}
 		if bool(a.Verified) && bool(a.Passed) {
 			if _, have := cs.Verified[a.stage()]; !have {
-				score := ""
-				if a.MaxScore > 0 {
-					score = fmt.Sprintf("%d/%d", a.Score, a.MaxScore)
-				}
-				cs.Verified[a.stage()] = score
+				cs.Verified[a.stage()] = a.verifiedScore()
 			}
 		}
 	}
@@ -285,8 +303,9 @@ func startedCourses(d *completionsData) []string {
 // answer.
 func courseProgress(st *guidanceState, course string) (cs *courseSync, src, handle string) {
 	if d, err := fetchCompletions(course); err == nil {
-		cs = syncFromAttempts(d, course)
-		st.setSync(course, cs)
+		// mergeSync, not setSync: a lab this account was seen verified stays
+		// verified (PL-1, G463) — the window the answer comes from can bury it.
+		cs = st.mergeSync(course, syncFromAttempts(d, course), d.handle, len(d.attempts) > 0)
 		return cs, "server", d.handle
 	} else {
 		debugf("completions fetch skipped (%v)", err)
@@ -764,7 +783,8 @@ func outOfRepoStatus(st *guidanceState, jsonOut bool) int {
 		handle = d.handle
 		started = startedCourses(d)
 		for _, c := range started {
-			st.setSync(c, syncFromAttempts(d, c))
+			// A started course has rows in the answer by construction.
+			st.mergeSync(c, syncFromAttempts(d, c), d.handle, true)
 		}
 	} else {
 		debugf("completions fetch skipped (%v)", err)
@@ -1002,7 +1022,8 @@ func runCourses() int {
 		progressSrc = "server"
 		started = startedCourses(d)
 		for _, c := range started {
-			st.setSync(c, syncFromAttempts(d, c))
+			// A started course has rows in the answer by construction.
+			st.mergeSync(c, syncFromAttempts(d, c), d.handle, true)
 		}
 	} else {
 		debugf("completions fetch skipped (%v)", err)

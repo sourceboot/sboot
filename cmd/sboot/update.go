@@ -175,13 +175,21 @@ func renderNotice(w io.Writer, running string, now time.Time) {
 // It was the `curl … | sh` one-liner everywhere until 2026-09-02, and on Windows
 // that is not merely the wrong spelling: pasted into PowerShell it produces a red
 // error block about `sh` not being a cmdlet (D-WIN-2), i.e. the tool's own advice
-// is the next thing that breaks. There is no install.ps1 and no `sboot upgrade`
-// (cli-releases.md §3 — "do not build yet"), and a nudge must never name a command
-// that does not exist, so Windows gets the instruction lab 00 step 1 already gives:
-// download the new .exe and replace the one you have.
+// is the next thing that breaks. A nudge must never name a command that does not
+// exist (`G143`), so from 2026-09-02 Windows was told to download the new .exe from
+// the releases page and replace its sboot.exe by hand.
+//
+// Since sboot-v0.17.0 it names the Windows installer, served at /install.ps1 by
+// every production deploy since the 2026-10-02 promote — the same line lab 00
+// gives. It installs over the old binary, and names any other older sboot.exe it
+// finds on the PATH (the hand-placed copies this line replaces). The DIRECT form, typed into
+// PowerShell: it starts no child process, so it has no command line for Defender
+// to judge. Never the child-process wrapper around it, which Defender refused as
+// Trojan:Win32/Commando.A!ml on a fresh Windows 11 (`G387`, docs/lab.md
+// 2026-09-29). `sboot upgrade` still does not exist (cli-releases.md §3).
 func updateCommandFor(goos string) string {
 	if goos == "windows" {
-		return "download sboot-windows-amd64.exe from github.com/sourceboot/sboot/releases and replace your sboot.exe"
+		return "irm https://sourceboot.com/install.ps1 | iex"
 	}
 	return "curl -fsSL https://sourceboot.com/install.sh | sh"
 }

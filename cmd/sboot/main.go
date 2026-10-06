@@ -87,6 +87,14 @@ const defaultAPI = "https://sourceboot.com"
 const defaultCourse = "os-rust"
 const brandName = "SourceBoot"
 
+// Where a learner writes when the CLI meets an answer it cannot read (Puneet,
+// 2026-10-04: the channel is email). The SECOND spelling of platform/lib/brand.ts
+// CONTACT_EMAIL — the CLI cannot import it — so platform/tests/contact.test.ts
+// (ledger G571) fails if the two ever differ, or if any other harness file types an
+// address at the site's domain. The reply window is deliberately NOT here: it is a
+// promise, and a promise compiled into a binary cannot be corrected once installed.
+const contactEmail = "feedback@sourceboot.com"
+
 // Where the public site is, for anything a learner might READ later — chiefly the
 // README `sboot start` writes into a repo they may publish. Deliberately not
 // `defaultAPI`: a README that links to http://localhost:3000 is worse than no link.
@@ -262,6 +270,21 @@ func resolveGradedStage(r repo, ga *gradedArgs, verb string, onFrontier func(*fr
 		fmt.Fprintf(os.Stderr, "sboot: name the lab instead: `sboot %s <stage>` — or reconnect (`sboot login`) and retry.\n", verb)
 		exitWith(2)
 	}
+	// BARE `sboot hint` FOLLOWS THE LAST FAILING RUN (2026-10-03 review round,
+	// D-WIN-2/D-LINUX-1, ledger G464). Below the frontier too, now: the learner who
+	// just ran `sboot test 06` red and typed the `stuck? sboot hint` it printed
+	// was answered about whatever lab the account frontier named — lab 00, once
+	// the verified window had slid. The red lab is fresher than any frontier.
+	// It yields to the frontier's own rule below (unchanged), and it is skipped
+	// when the account already holds the red lab VERIFIED: that is the stale red
+	// the 2026-09-23 skeptic measured (a lab fixed through submit and Complete on
+	// another machine), which must not answer every bare hint on the next lab. A
+	// local passing submit clears the red itself (runGraded → setLastRed).
+	if verb == "hint" && fr == nil {
+		if red := st.lastRedStage(r.course); red != "" && red != lab.Stage && !st.isVerified(r.course, red) {
+			return red
+		}
+	}
 	if fr != nil {
 		// Every live lab is verified — and one of them just went red on THIS
 		// machine (D-MACOS-5 / D-WIN-6, 2026-09-13): bare `sboot test` after
@@ -308,10 +331,11 @@ func resolveGradedStage(r repo, ga *gradedArgs, verb string, onFrontier func(*fr
 // graded 8/14 on an already-verified lab — the returning learner re-proving lab 05
 // on a new machine, which lab 00 tells them to do — left the frontier to answer,
 // and the frontier said "nothing to hint" over a run that had just printed
-// `stuck? sboot hint`. It does NOT outrank an unfinished current lab: a stale red
-// on lab 03, never re-run green locally because the fix went up through `sboot
-// submit` and the web's Complete, would otherwise answer every bare hint on lab
-// 04 (skeptic, 2026-09-23 — measured).
+// `stuck? sboot hint`. Since 2026-10-03 (G464, resolveGradedStage) it answers
+// below the frontier too — unless the account holds the red lab VERIFIED: a stale
+// red on lab 03, never re-run green locally because the fix went up through the
+// web's Complete from elsewhere, would otherwise answer every bare hint on lab 04
+// (skeptic, 2026-09-23 — measured). A local passing submit clears the red itself.
 func hintStage(r repo, ga *gradedArgs) string {
 	if ga.stage == "" {
 		if blocked := loadState().blockedStage(r.course); blocked != "" {
@@ -602,7 +626,7 @@ func runTest(r repo, stage string, ga gradedArgs) {
 	// and only when there is a local repo with no remote. `test` runs dozens of
 	// times an hour, so anything more often is noise in the one loop that must
 	// stay quiet.
-	repoNudge(r, true)
+	repoNudge(r, stage, true)
 	exitWith(code)
 }
 
@@ -735,6 +759,12 @@ func runDebug(r repo, stage string) int {
 // practice", which sent a learner who had hit an access lock off to debug their
 // network. `sboot submit` always got this right ("submission rejected: …").
 func reportPracticeFailure(err error) {
+	// Asked for, not a failure: one line, no "could not reach" — the network was
+	// never tried, and nothing about the learner's connection is in question.
+	if errors.Is(err, errPracticeOffline) {
+		fmt.Fprintln(os.Stderr, "\nsboot: SBOOT_OFFLINE is set, so this practice run was NOT recorded — that's fine, it's practice.")
+		return
+	}
 	var ae *apiError
 	if errors.As(err, &ae) {
 		switch ae.status {
@@ -1529,6 +1559,45 @@ func exitWith(code int) {
 	os.Exit(code)
 }
 
+// exitPlatform is the exit code for a run that got no verdict because the PLATFORM
+// or the network failed, not because of anything on this machine (ledger C6,
+// sboot-v0.17.0). Every code is part of the CLI's promise to scripts
+// (the CLI release policy §0): a released binary cannot be redeployed, so a code
+// never changes meaning and a new one is appended, never renumbered.
+//
+//	0  success: full marks, or the command did its job
+//	1  a graded run that came up short (a verdict, just not a full one)
+//	2  no verdict, and the fix is on this side: usage, the workspace, a missing
+//	   tool, the account, or the platform REFUSING this request (a 4xx — a lock,
+//	   a stale token, out-of-date tests, a CLI below the floor) — and, outside
+//	   submit's upload, every network failure, as before
+//	3  no verdict from `sboot submit`, and the fault is the platform's or the
+//	   network's: on the upload, unreachable, timed out, a 5xx, an answer that
+//	   could not be read, a grading error or an upload nothing graded; and the
+//	   submit limit (429, which says when to come back) whether the preflight or
+//	   the upload meets it. Re-running later is the remedy.
+//
+// Only `sboot submit` answers 3 so far: its upload, and its preflight's 429. Everything
+// else that needs the network — including the tests fetch `submit` itself makes
+// before the build on an uncached lab — still exits 2 when it fails, as every
+// release before this one did.
+const exitPlatform = 3
+
+// platformAnswerCode is the exit code for an answer that carried no verdict: a
+// 4xx is the platform's decision about this request, so 2 — except 429, which
+// asks for the same request later, so exitPlatform with every other "try again"
+// (the blind TL review, 2026-10-04). Anything else is the platform failing to
+// give a verdict, so exitPlatform.
+func platformAnswerCode(status int) int {
+	if status == http.StatusTooManyRequests {
+		return exitPlatform
+	}
+	if status >= 400 && status < 500 {
+		return 2
+	}
+	return exitPlatform
+}
+
 type practiceResp struct {
 	OK   bool   `json:"ok"`
 	User string `json:"user"`
@@ -1536,7 +1605,18 @@ type practiceResp struct {
 	Err  string `json:"error"`
 }
 
+// errPracticeOffline is reportPractice's answer under SBOOT_OFFLINE: the run was
+// not sent, because the learner asked for no network at all.
+var errPracticeOffline = errors.New("SBOOT_OFFLINE is set")
+
 func reportPractice(course, stage string, score, max int, passed bool, detail string, checks []localCheck) error {
+	// SBOOT_OFFLINE PROMISES "skip every network call" (`sboot --help`, the manual's
+	// Offline section), and this POST was the one an offline practice run still made
+	// with the platform reachable (ledger L12). Checked here, at the request, rather
+	// than at the call site, so every path that records practice is covered.
+	if offline() {
+		return errPracticeOffline
+	}
 	// STRUCTURED PER-CHECK RESULTS, BESIDE THE LINES (docs/lab-page-v2.md §5,
 	// 2026-09-30). `detail` stays what every released binary sends — the engine's
 	// `[PASS]/[FAIL] <desc>` lines — and `checks` adds the same verdict by ID, so
@@ -1639,7 +1719,8 @@ var uploadBackoff = []time.Duration{2 * time.Second, 5 * time.Second}
 // uploadTimeout bounds one upload attempt end to end. It sits above the
 // submissions route's 60 s maxDuration plus the upload itself, so a slow but
 // healthy platform answers before the CLI gives up — and a timeout is not retried.
-const uploadTimeout = 120 * time.Second
+// A var only so a test can shorten it (the C6 timeout case); nothing sets it.
+var uploadTimeout = 120 * time.Second
 
 // uploadAnswerMax caps the verdict read back from an upload. A verdict's detail is
 // the grader's trimmed report, far below this; past it, the CLI says so by name.
@@ -1659,7 +1740,7 @@ func runSubmit(r repo, stage string, ga gradedArgs) {
 	// moment "put this on GitHub" is an offer rather than an interruption; the
 	// daily throttle belongs on `test`, the loop that runs all day.
 	if code == 0 {
-		repoNudge(r, false)
+		repoNudge(r, stage, false)
 	}
 	exitWith(code)
 }
@@ -1679,6 +1760,18 @@ func reportSubmitAuthFailure(msg string) {
 func submit(r repo, stage string, ga gradedArgs) int {
 	force := ga.force
 	gradedHeader("submitting", r.course, stage, "submit", ga.defaulted)
+	// SBOOT_OFFLINE PROMISES "skip every network call", and an official grade is
+	// nothing BUT a network call: the product of a submit is the server's verdict.
+	// Until 2026-10-04 (ledger G506, found beside L12) an offline submit with the
+	// platform reachable uploaded and was graded. It now refuses at once, the way
+	// `login` and `whoami` do (auth.go), before a build or a boot is spent on a run
+	// that could only end without a verdict — the local check IS `sboot test`,
+	// which works offline. Exit 2: the fix is on this side.
+	if offline() {
+		fmt.Fprintln(os.Stderr, "sboot: SBOOT_OFFLINE is set — an official grade needs the platform, so nothing was built or sent.")
+		fmt.Fprintf(os.Stderr, "sboot: `sboot test %s` grades it locally; unset SBOOT_OFFLINE to submit.\n", stage)
+		return 2
+	}
 	osDir := r.osDir()
 	if st, err := os.Stat(osDir); err != nil || !st.IsDir() {
 		fmt.Fprintf(os.Stderr, "sboot: no %s/ tree at %s\n", r.treeName(), osDir)
@@ -1696,7 +1789,11 @@ func submit(r repo, stage string, ga gradedArgs) int {
 			return 2
 		}
 		fmt.Fprintf(os.Stderr, "sboot: submission rejected: %s\n", ae.Error())
-		return 2
+		// The same table as the upload's answer (C6): the platform's refusal()
+		// checks the submit limit on this GET too, so a rate-limited learner meets
+		// the 429 HERE, and it must exit 3 exactly as the POST's would. Every other
+		// status the preflight acts on (403, 404, 410) is a 4xx refusal, so 2.
+		return platformAnswerCode(ae.status)
 	}
 
 	// The tests and the grader come from the cache; `os/` stays in the repo. Same
@@ -1787,6 +1884,13 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		// submitted (below), for a learner who disputes the local verdict or wants the
 		// failure on the record. What it can no longer do is submit without one.
 		reportSubmitGraderMissing(r, stage, res.launchErr)
+		return 2
+	case res.engineRefused:
+		// THE ENGINE REFUSED THE RUN (G507): it exited 2 with no verdict and has
+		// already said why on stderr. That is not a failed check — nothing was
+		// graded — so it is neither the gate's exit 1 nor something --force can
+		// send: there is no result to upload.
+		fmt.Fprintln(os.Stderr, "\n── not submitted: the grading engine refused this run (its reason is above), so there is no local result to send.")
 		return 2
 	case res.exitCode != 0 && !force:
 		reportGateFailure(stage, freshDefault, res)
@@ -1925,19 +2029,22 @@ func submit(r repo, stage string, ga gradedArgs) int {
 			fmt.Fprintf(os.Stderr, "sboot: the platform did not answer in time (%v)\n", respErr)
 		case tooLargeAnswer(respErr):
 			fmt.Fprintf(os.Stderr, "sboot: the platform answered, but %v — your lab page shows the grade: %s\n", respErr, stageStuckURL(course, stage))
-			return 2
+			return exitPlatform
 		case resp == nil:
 			fmt.Fprintf(os.Stderr, "sboot: could not reach the platform (%v)\n", respErr)
 		default:
 			fmt.Fprintf(os.Stderr, "sboot: could not read the platform's answer (HTTP %d: %v)\n", resp.StatusCode, respErr)
 		}
 		gaveUp()
-		return 2
+		// Unreachable, timed out, cut off, or a redirect loop: no answer at all,
+		// which is never something on this machine to fix (C6).
+		return exitPlatform
 	}
 	var created submissionResp
 	err = json.Unmarshal(raw, &created)
 	if err != nil || created.ID == "" {
 		failed := resp.StatusCode >= 500 && resp.StatusCode != http.StatusNotImplemented
+		unreadable := false
 		switch {
 		case resp.StatusCode == http.StatusUnauthorized:
 			reportSubmitAuthFailure(created.Err)
@@ -1947,6 +2054,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 			fmt.Fprintf(os.Stderr, "sboot: submission rejected: %s (HTTP %d)\n", serverMessage(created.Err), resp.StatusCode)
 		default:
 			fmt.Fprintf(os.Stderr, "sboot: unexpected response (HTTP %d)\n", resp.StatusCode)
+			unreadable = true
 		}
 		switch {
 		case failed:
@@ -1958,7 +2066,16 @@ func submit(r repo, stage string, ga gradedArgs) int {
 			fmt.Fprintf(os.Stderr, "sboot: an earlier attempt failed partway and may have been graded — your lab page shows it: %s\n",
 				stageStuckURL(course, stage))
 		}
-		return 2
+		// An answer this binary cannot read has no sentence of ours to explain it (an
+		// edge's HTML 413, a proxy's page, a 200 with no submission in it), so the
+		// learner is told where to send what they saw — last, after any recovery line
+		// (plan.md "A learner can reach us", sprint 1 item 8b; ledger G571).
+		if unreadable {
+			fmt.Fprintf(os.Stderr, "sboot: if this keeps happening, email %s with the command you ran and what it printed.\n", contactEmail)
+		}
+		// A 4xx is a refusal (2); a 5xx, a 501 or a 2xx with no submission in it is
+		// the platform failing to answer (3). C6.
+		return platformAnswerCode(resp.StatusCode)
 	}
 	fmt.Fprintf(os.Stderr, "── submitted (%d KB) — graded on the server\n", len(body)/1024)
 	if ga.jsonOut {
@@ -2064,7 +2181,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		return 1
 	case "error":
 		fmt.Fprintln(vw, "\n  ⚠ grading error on the server — please retry; if it persists, report it.")
-		return 2
+		return exitPlatform
 	default:
 		// `pending` or `running`: the platform accepted the upload and could not
 		// grade it — the judge was unreachable, errored, or this deployment has none
@@ -2080,7 +2197,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		fmt.Fprintln(vw, "     side, not with your code — nothing about your submission was judged.")
 		fmt.Fprintf(vw, "     Run `sboot submit %s` again in a few minutes. If it happens twice in a\n", stage)
 		fmt.Fprintln(vw, "     row the grading service is down, and re-submitting will not help.")
-		return 2
+		return exitPlatform
 	}
 }
 
@@ -2141,7 +2258,9 @@ func reportGateFailure(stage, freshDefault string, res graderRun) {
 func submitPreflight(course, stage string) *apiError {
 	// SBOOT_OFFLINE promises "skip every network call", and this call is the
 	// easiest one to honor it with: it is an optimisation, and skipping it just
-	// means the POST decides — which offline it will, by failing to send.
+	// means the POST decides. (Unreachable since 2026-10-04: submit refuses under
+	// SBOOT_OFFLINE before it gets here, G506. Until then this said the POST would
+	// decide by failing to send, which was only true on a machine really offline.)
 	if offline() {
 		return nil
 	}

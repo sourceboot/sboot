@@ -140,7 +140,15 @@ func runRepo(yes bool, name string) int {
 			fmt.Fprintf(out, "            sboot start %s        # makes the local repo and its first commit\n", r.course)
 			fmt.Fprintln(out, "            (nothing is committed yet, so the two git lines below would fail)")
 		}
-		printManualRail(out, r.dir, repo)
+		// The rail pushes COMMITS (PL-3, G466): with changes since the last one it
+		// would have put the starter on GitHub and called it the learner's work, so
+		// the commit is a step of the rail, not a footnote. Asked only with a
+		// HEAD — the no-commit branch above may be a Mac whose git is the shim.
+		commit := ""
+		if !noCommit && gitDirty(r.dir) {
+			commit = commitLine("")
+		}
+		printManualRail(out, r.dir, repo, commit)
 		return 0
 	}
 
@@ -175,6 +183,11 @@ func runRepo(yes bool, name string) int {
 
 	fmt.Fprintf(out, "gh detected — authed as %s · no remote on this workspace yet\n", atUser(user))
 	fmt.Fprintf(out, "this creates ONE private repo in your account and pushes what you have — your code, your repo, our credential never involved.\n")
+	// gh pushes COMMITS (PL-3, G466). Said before the confirm, with the command,
+	// so a yes is a yes to what will actually land on GitHub.
+	if gitHasHead(r.dir) && gitDirty(r.dir) {
+		fmt.Fprintf(out, "note: you have changes that are not committed, and a push sends commits only — to include them, first:  %s\n", commitLine(""))
+	}
 	if !yes && !interactiveTTY() {
 		fmt.Fprintf(out, "re-run from a terminal (or with --yes) to confirm:\n")
 		fmt.Fprintf(out, "  create github.com/%s/%s (private) and push\n", userOrYou(user), repo)
@@ -243,13 +256,19 @@ func ghInstallLine() string {
 
 // printManualRail is offer (b): the commands, from the right directory, with the
 // one sentence that decides whether the last of them works.
-func printManualRail(out *os.File, dir, repo string) {
+//
+// `commit` ("" for none) is the command that commits uncommitted work, printed
+// after the `cd` and before the push, because `git push` sends commits only.
+func printManualRail(out *os.File, dir, repo, commit string) {
 	fmt.Fprintf(out, "     open   https://github.com/new?name=%s        # prefilled; create it private, no README\n", repo)
 	// THE `cd` IS THE BUG THIS EXISTS TO NOT REPEAT (P-12): without it the learner
 	// runs these in the PARENT folder, and the repo they push is their home
 	// directory. `start` has already run `git init` in here, so the rail is two
 	// commands, not five.
 	fmt.Fprintf(out, "     then   cd %s\n", quoteIfSpaced(dir))
+	if commit != "" {
+		fmt.Fprintf(out, "            %s   # git push sends commits only — this one holds your changes\n", commit)
+	}
 	fmt.Fprintf(out, "            git remote add origin https://github.com/<you>/%s.git\n", repo)
 	fmt.Fprintln(out, "            git push -u origin main")
 	fmt.Fprintln(out)
@@ -519,7 +538,15 @@ func nudgeKey(course string) string { return "repo/" + course }
 // the commit is the thing that has not happened, and `sboot repo` would refuse
 // with "nothing is committed yet" if they followed it. With a repo and no HEAD
 // the truthful line is the one that finishes the commit.
-func repoNudge(r repo, daily bool) {
+//
+// NOR ONE THAT EXISTS BUT HOLDS NONE OF THE WORK (2026-10-03 review round PL-3 =
+// D-LINUX-3/D-MACOS-11, ledger G465). With a HEAD, the line still said "your work
+// is committed here" after all eight labs' submits, while `git log` held the one
+// `start` commit and every source file was modified — and `sboot repo` pushes
+// commits, so following the nudge would have put the untouched starter on GitHub
+// under lab 00's "safe from a dead laptop" promise. Uncommitted changes now get the
+// commit line first, named for the lab (`stage`, "" when unknown).
+func repoNudge(r repo, stage string, daily bool) {
 	if _, err := exec.LookPath("git"); err != nil {
 		return
 	}
@@ -546,11 +573,59 @@ func repoNudge(r repo, daily bool) {
 			return
 		}
 		fmt.Fprintf(os.Stderr, "nothing is committed here yet — %s, then %s\n",
-			p(ansiGreen, "git add -A && git commit"), p(ansiGreen, "sboot repo"))
+			p(ansiGreen, commitLine(stage)), p(ansiGreen, "sboot repo"))
+		return
+	}
+	if gitDirty(r.dir) {
+		what := "you have changes that are not committed"
+		// A git that cannot count (G494) keeps the generic line: "nothing since
+		// the starter" is a claim about the history, and an error is no answer.
+		if n, ok := gitCommitCount(r.dir); ok && n <= 1 {
+			// Only `sboot start`'s own commit: none of the learner's work is in it.
+			what = "nothing since the starter is committed yet"
+		}
+		fmt.Fprintf(os.Stderr, "%s, and there is no copy on GitHub — %s, then %s\n",
+			what, p(ansiGreen, commitLine(stage)), p(ansiGreen, "sboot repo"))
 		return
 	}
 	fmt.Fprintf(os.Stderr, "your work is committed here but has no home on GitHub yet — %s\n",
 		p(ansiGreen, "sboot repo"))
+}
+
+// commitLine is the one command that commits everything a learner has changed,
+// with a message naming the lab when we know it. `git add -A` is right here: the
+// workspace's .gitignore (repo.go) keeps build output and our data out of it.
+// Joined with `;`, never `&&`: Windows PowerShell 5.1 has no `&&` (G357).
+func commitLine(stage string) string {
+	msg := "my work so far"
+	if n := labNumber(stage); n != "" {
+		msg = "lab " + n
+	}
+	return fmt.Sprintf("git add -A; git commit -m %q", msg)
+}
+
+// gitDirty reports whether the repo AT `dir` has changes a commit would take —
+// modified, staged or untracked files that .gitignore does not exclude. A git
+// that cannot answer reads as clean: the nudge then says what it always said.
+func gitDirty(dir string) bool {
+	b, err := gitRun(dir, "status", "--porcelain")
+	return err == nil && strings.TrimSpace(string(b)) != ""
+}
+
+// gitCommitCount is how many commits HEAD has, and false when git cannot say —
+// a failed `rev-list`, or an answer that is not a count. Never a guessed 0: the
+// caller read 0 as "only the starter" and told a learner with a history that
+// nothing of theirs was committed.
+func gitCommitCount(dir string) (int, bool) {
+	b, err := gitRun(dir, "rev-list", "--count", "HEAD")
+	if err != nil {
+		return 0, false
+	}
+	n := 0
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &n); err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // ── plumbing ────────────────────────────────────────────────────────────────────
