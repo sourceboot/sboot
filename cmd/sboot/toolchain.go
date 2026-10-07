@@ -159,6 +159,11 @@ func linkerHint(goos string) []string {
 			"Rust compiles your code and then hands it to your Mac's own linker to finish —",
 			"and macOS ships without one until you install Apple's Command Line Tools:",
 			"  " + cltInstallLine,
+			// G591 (Puneet's dogfood, 2026-10-06): `xcode-select --install` can
+			// QUEUE rather than install, and this hint fires only on output that
+			// says the Tools are absent NOW — so an earlier run has not finished.
+			"Already ran it? Then it has not finished: the Tools are not installed yet. Look for",
+			"its dialog, or for the download in Software Update. `xcode-select -p` prints a folder once they are in.",
 		}
 	case "windows":
 		return []string{

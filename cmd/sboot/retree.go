@@ -55,9 +55,13 @@ func retreeText(text, runDir, tree string) string {
 	sep := string(filepath.Separator)
 	prefixes := []string{runDir}
 	// macOS hands out symlinked temp roots (/var → /private/var); cargo may
-	// print either spelling, so both prefixes are claimed when they differ.
+	// print either spelling, so both prefixes are claimed when they differ —
+	// the RESOLVED one first: it ends with the typed one (`/private/tmp/x` holds
+	// `/tmp/x`), so tried second it was already cut out of the middle and cargo's
+	// `(/private/tmp/x/game/lantern)` printed as `/privategame/lantern` (ledger
+	// G634, RFB-B-2; G241 is the engine's twin).
 	if resolved, err := filepath.EvalSymlinks(runDir); err == nil && resolved != runDir {
-		prefixes = append(prefixes, resolved)
+		prefixes = []string{resolved, runDir}
 	}
 	for _, p := range prefixes {
 		staged := p + sep + stagedTree

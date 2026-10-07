@@ -111,14 +111,16 @@ func TestChecksWithoutIDsAreNotTracked(t *testing.T) {
 	}
 }
 
-// Nothing to record means nothing to write. A learner whose stage passes first try
-// — and every E2E run, whose stub grader emits no check ids — should not have a
-// state file conjured into their config dir.
+// Nothing to record means nothing to write: every E2E run, whose stub grader emits
+// no check ids, should not have a state file conjured into its config dir. (A
+// learner whose stage passes first try IS recorded since ledger G631 — `sboot
+// hint` after it must know the run happened — and `sboot start` has already
+// written their state file anyway, seeding the progress cache.)
 func TestNothingToRecordWritesNoFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("SBOOT_STATE_DIR", dir)
 	st := loadState()
-	st.record("os-rust", "01-boot", []localCheck{{id: "serial:pm_rust", pass: true}})
+	st.record("os-rust", "01-boot", []localCheck{{pass: true}})
 	if err := st.save(); err != nil {
 		t.Fatalf("save: %v", err)
 	}

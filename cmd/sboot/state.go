@@ -166,6 +166,12 @@ type guidanceState struct {
 	// binary reading this file simply does not see the map, and nudges as it
 	// always did.
 	Nudged map[string]string `json:"nudged_on,omitempty"`
+
+	// Workspaces is where each course's work was last seen on this machine — the
+	// folder and the GitHub remote (credentials stripped) — so a returning learner
+	// is told where their code is (resume.go, dogfood D3, 2026-10-06). Additive
+	// and omitempty: an older binary ignores it on load.
+	Workspaces map[string]*workspaceRecord `json:"workspaces,omitempty"`
 	// Where this was loaded from. Unexported, so never serialized.
 	path string
 	// Whether record() actually changed anything. Nothing to record means nothing
@@ -301,6 +307,7 @@ func loadState() *guidanceState {
 	if loaded.Nudged != nil {
 		s.Nudged = loaded.Nudged
 	}
+	s.Workspaces = loaded.Workspaces
 	s.Catalog = loaded.Catalog
 	return s
 }
@@ -441,9 +448,9 @@ func (s *guidanceState) recordListed(course, stage string, checks []localCheck, 
 	}
 	lk := course + "/" + stage
 	_, had := s.LastFailed[lk]
-	if len(failing) == 0 && !had {
-		return // nothing failed and nothing was tracked — leave no trace
-	}
+	// A first run that passes is recorded too, as the explicit empty list below:
+	// it used to leave no trace, so `sboot hint` right after it told the learner
+	// to run the `sboot test` they had just run (ledger G631, RFB-A-2).
 	s.setAbsent(lk, absent)
 	if tasks != nil && tasks.Current > 0 {
 		failing = currentTaskFirst(failing, tasks)

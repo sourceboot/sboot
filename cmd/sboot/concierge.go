@@ -79,7 +79,14 @@ func runRepo(yes bool, name string) int {
 	}
 
 	if url, ok := existingRemote(r.dir); ok {
-		fmt.Fprintf(out, "remote already set → %s — nothing to create.\n", url)
+		// Recorded (and printed) with any credential stripped: an https remote can
+		// carry a token, and this line used to echo it (G596, 2026-10-06).
+		rememberWorkspace(r.course, r.dir, url)
+		shown := safeRemote(url)
+		if shown == "" {
+			shown = "(a remote with credentials in it; `git remote -v` shows it)"
+		}
+		fmt.Fprintf(out, "remote already set → %s — nothing to create.\n", shown)
 		fmt.Fprintln(out, "push as usual with git; `sboot repo` only ever offers — it never touches an existing remote.")
 		return 0
 	}
@@ -209,6 +216,9 @@ func runRepo(yes bool, name string) int {
 		fmt.Fprintf(out, "sboot: %v\n", err)
 		fmt.Fprintln(out, "sboot: fix the above and re-run `sboot repo` — nothing here blocks the course.")
 		return 1
+	}
+	if origin, ok := existingRemote(r.dir); ok {
+		rememberWorkspace(r.course, r.dir, origin)
 	}
 	p := painter(os.Stdout)
 	fmt.Println(p(ansiGreen, "✓ pushed → "+url))

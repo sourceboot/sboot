@@ -112,11 +112,11 @@ func explainOpenChat(course, stage string, ev explainEv) int {
 // THE FRAGMENT IS `#chat`, NOT `#stuck`, from v0.12.0 (DECISIONS.md §C, the
 // four-tab mock's answer 5). The lab page is four tabs now — Reading · Lab ·
 // Chat with Guru · Code Review — and the chat this verb hands off to is a TAB,
-// not a section of the Lab tab. `#stuck` still resolves, on the Lab tab's Grading
-// heading, which is what keeps every already-released binary's printed link
-// landing on the ladder: the two anchors are different destinations for two
-// different verbs, and only this one moved. `sboot test`/`sboot hint` keep
-// printing `#stuck` (stageStuckURL) because the ladder is where they belong.
+// not a section of the Lab tab. `sboot test`/`sboot hint` keep printing `#stuck`
+// (stageStuckURL), and since 2026-10-06 (D5) the page opens that same chat tab
+// for it — the words those verbs print beside it promise "the same chat on this
+// lab's page", and every released binary is mended by the page alone. The ladder's
+// own anchor is `#grading`. This verb's `#chat` carries the check; `#stuck` none.
 //
 // ADDITIVE BY CONSTRUCTION: the page ignores parameters it does not know and a
 // browser ignores a fragment it cannot find, so a CLI ahead of the deployment

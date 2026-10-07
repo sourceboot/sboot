@@ -636,12 +636,24 @@ func runTest(r repo, stage string, ga gradedArgs) {
 // run, the ladder bookkeeping and the L2a "graded nothing" rule.
 func runTestCode(r repo, stage string, ga gradedArgs) int {
 	gradedHeader("grading", r.course, stage, "test", ga.defaulted)
+	// Where this course's work is, recorded on every test (resume.go): the
+	// command a learner runs most is what keeps the record current for a workspace
+	// made by an older CLI or moved since. And a starter graded against a later
+	// lab is told so BEFORE the verdict (G597), because prepare can end the run.
+	//
+	// ONE load serves the record, the note and the grade (G603): prepare does not
+	// touch state.json. The save before prepare stays, because prepare can exit and
+	// the record must outlive that, but it writes only when the record changed.
+	st := loadState()
+	origin, _ := existingRemote(r.dir)
+	st.recordWorkspace(r.course, r.dir, origin)
+	freshScaffoldNote(os.Stderr, st, r)
+	saveQuietly(st)
 	run := prepare(r, stage)
 
 	// Failure guidance: read the per-check consecutive-failure counters BEFORE
 	// grading, so we can tell the grader which checks have earned the Layer 2
 	// ladder (the failure-guidance spec). The grader itself stays historyless.
-	st := loadState()
 	jsonMode = ga.jsonOut
 	// The task list is the default on a converted lab (grader/tasks.go); --checks
 	// and --json ask for the flat list (the JSON verdict is per check already).
@@ -696,6 +708,13 @@ func runTestCode(r repo, stage string, ga gradedArgs) int {
 // and the metered explain chat live (§11.i).
 func stageStuckURL(course, stage string) string {
 	return fmt.Sprintf("%s/courses/%s/stages/%s#stuck", siteURL(), course, stage)
+}
+
+// gradeOnLabPage is where a submit that lost its answer sends the learner: the
+// lab page's Code Review tab, which holds the grade. Not stageStuckURL — since D5
+// `#stuck` opens the Guru chat, which is help, not the grade (G604).
+func gradeOnLabPage(course, stage string) string {
+	return fmt.Sprintf("your lab page shows the grade: %s/courses/%s/stages/%s#review", siteURL(), course, stage)
 }
 
 // printVerdictJSON is `--json`'s verdict object (§12.2 rule 6), on stdout.
@@ -2020,7 +2039,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	// to run is graded again.
 	gaveUp := func() {
 		fmt.Fprintf(os.Stderr, "sboot: no grade came back (%d attempt(s)). Your local check passed.\n", attempts)
-		fmt.Fprintf(os.Stderr, "sboot: an upload may still have reached the platform and been graded — your lab page shows it: %s\n", stageStuckURL(course, stage))
+		fmt.Fprintf(os.Stderr, "sboot: an upload may still have reached the platform and been graded — %s\n", gradeOnLabPage(course, stage))
 		fmt.Fprintf(os.Stderr, "sboot: otherwise run `sboot submit %s` again: it builds and runs first, then uploads, and the same work usually lands on an existing grade instead of being graded again.\n", stage)
 	}
 	if respErr != nil {
@@ -2028,7 +2047,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		case timedOut:
 			fmt.Fprintf(os.Stderr, "sboot: the platform did not answer in time (%v)\n", respErr)
 		case tooLargeAnswer(respErr):
-			fmt.Fprintf(os.Stderr, "sboot: the platform answered, but %v — your lab page shows the grade: %s\n", respErr, stageStuckURL(course, stage))
+			fmt.Fprintf(os.Stderr, "sboot: the platform answered, but %v — %s\n", respErr, gradeOnLabPage(course, stage))
 			return exitPlatform
 		case resp == nil:
 			fmt.Fprintf(os.Stderr, "sboot: could not reach the platform (%v)\n", respErr)
@@ -2063,8 +2082,8 @@ func submit(r repo, stage string, ga gradedArgs) int {
 			// A refusal after a failed attempt — the submit limit, most likely, which
 			// the platform checks before it looks for a repeat — may be hiding a grade
 			// that earlier attempt already earned.
-			fmt.Fprintf(os.Stderr, "sboot: an earlier attempt failed partway and may have been graded — your lab page shows it: %s\n",
-				stageStuckURL(course, stage))
+			fmt.Fprintf(os.Stderr, "sboot: an earlier attempt failed partway and may have been graded — %s\n",
+				gradeOnLabPage(course, stage))
 		}
 		// An answer this binary cannot read has no sentence of ours to explain it (an
 		// edge's HTML 413, a proxy's page, a 200 with no submission in it), so the
@@ -2452,6 +2471,11 @@ func runStart(course, dirFlag string, yes bool) {
 		exitWith(2)
 	}
 
+	// A fresh copy, on a machine that knows where this course's work was: say so
+	// first, with the way back (dogfood D3, G595/G596). A notice, not a refusal —
+	// a second copy is sometimes what the learner wants.
+	startNotice(course, dest)
+
 	fmt.Printf("── fetching the %s starter tree\n", course)
 	// UNPACK BESIDE THE DESTINATION, THEN MOVE IT IN. A download that dies half way
 	// used to leave a partial tree in ./<course> that the NEXT `sboot start` then
@@ -2490,16 +2514,7 @@ func runStart(course, dirFlag string, yes bool) {
 	fetchTests(course, firstStage)
 
 	abs, _ := filepath.Abs(dest)
-	fmt.Printf("\n── your workspace is ready: %s\n", abs)
-	// The tree name and what it holds both come from the course (dogfood F00-1):
-	// `rust-for-systems` unpacks a `db/` holding a SQLite reader, and was told `os/ is
-	// yours` and that publishing it publishes a kernel it does not have.
-	fmt.Printf("   %s/ is yours. sboot.toml says which course this is.\n", treeOr(specTree))
-	fmt.Printf("   Our tests and grader are NOT in here — they live in the %s data dir,\n", brandName)
-	fmt.Printf("   so publishing this repo publishes %s and nothing else.\n", treeSubject(course))
-	if s, ok := cachedSpec(course); ok {
-		fmt.Printf("   tests + grader: %s\n", s.dir)
-	}
+	printWorkspaceReady(abs, course, specTree)
 
 	// Seed the progress cache: a fresh start means nothing is verified yet, and
 	// writing that down is what lets `sboot test` default its stage offline
@@ -2509,6 +2524,7 @@ func runStart(course, dirFlag string, yes bool) {
 		st.setSync(course, &courseSync{Verified: map[string]string{},
 			SyncedAt: time.Now().UTC().Format(time.RFC3339)})
 	}
+	st.recordWorkspace(course, abs, "")
 	saveQuietly(st)
 
 	// The LOCAL repo — git init, identity, first commit. Nothing here can reach
@@ -2576,6 +2592,8 @@ func repairStart(course, dest, title, firstStage, firstTitle, specTree string, y
 		}
 		fmt.Println("   your own files were not touched — only what was absent came back.")
 	}
+	origin, _ := existingRemote(abs)
+	rememberWorkspace(course, abs, origin)
 	localRepoStep(os.Stderr, abs, course, yes)
 	printFirstLab(course, dest, firstStage, firstTitle)
 }
@@ -2887,4 +2905,15 @@ func deref(p *int) int {
 		return 0
 	}
 	return *p
+}
+
+// printWorkspaceReady is `sboot start`'s closing paragraph. The tree name and what
+// it holds both come from the course (dogfood F00-1): `rust-for-systems` unpacks a
+// `db/` holding a SQLite reader, and was told `os/ is yours` and that publishing it
+// publishes a kernel it does not have. It says what the repo holds, never where
+// the course's tests live (ledger G635, RFB-A-7: pages say what, not how).
+func printWorkspaceReady(abs, course, specTree string) {
+	fmt.Printf("\n── your workspace is ready: %s\n", abs)
+	fmt.Printf("   %s/ is yours. sboot.toml says which course this is.\n", treeOr(specTree))
+	fmt.Printf("   Publishing this repo publishes %s and nothing else.\n", treeSubject(course))
 }
