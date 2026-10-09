@@ -146,8 +146,8 @@ func parseCommon(cmd string, args []string, maxPos int, opts *gradedArgs) []stri
 		case !terminated && a == "--":
 			terminated = true
 		case !terminated && (a == "--force" || a == "-f"):
-			if cmd != "submit" {
-				usageError("--force only means something for `sboot submit`")
+			if cmd != "submit" && cmd != "upgrade" {
+				usageError("--force only means something for `sboot submit` and `sboot upgrade`")
 			}
 			opts.force = true
 		case !terminated && a == "--json":
@@ -188,9 +188,9 @@ func parseCommon(cmd string, args []string, maxPos int, opts *gradedArgs) []stri
 			i++
 			opts.message = args[i]
 		case !terminated && (a == "--dir" || strings.HasPrefix(a, "--dir=")):
-			// `sboot start` names the folder after the ARTIFACT since 2026-09-02
-			// (`word-game-sb`), so the override that was implicit — the folder was
-			// always the course id — has to become explicit.
+			// `sboot start` names the folder itself (`sourceboot-<course>` since
+			// 2026-10-07, `<artifact>-sb` before), so a learner who wants another
+			// name says so here.
 			if cmd != "start" {
 				usageError("--dir only means something for `sboot start`")
 			}
@@ -436,6 +436,13 @@ func main() {
 		parseCommon(cmd, rest, 0, &ga)
 		exitWith(runRepo(ga.yes, ga.name))
 
+	case "upgrade", "update": // `update` is the alias; help and the manual name `upgrade`
+		parseCommon("upgrade", rest, 0, &ga)
+		exitWith(runUpgrade(ga.force))
+
+	case "completion":
+		exitWith(runCompletion(rest))
+
 	case "start":
 		pos := parseCommon(cmd, rest, 1, &ga)
 		course := env("SBOOT_COURSE", "")
@@ -454,7 +461,7 @@ func main() {
 		// help that picks the wrong repo.
 		pos := parseCommon(cmd, rest, 1, &ga)
 		if len(pos) != 1 {
-			usageError("`sboot resume` needs a folder or a git URL: `sboot resume ~/word-game-sb`")
+			usageError("`sboot resume` needs a folder or a git URL: `sboot resume ~/sourceboot-rust-for-beginners`")
 		}
 		exitWith(runResume(pos[0]))
 
@@ -2412,18 +2419,12 @@ func readCapture(path string) []byte {
 // nobody should have to type over their own work. A non-empty directory with NO
 // sboot.toml is still refused: it is not ours, and we do not know what is in it.
 func runStart(course, dirFlag string, yes bool) {
-	// The folder's NAME comes from the course's manifest (`artifact:` → the
-	// `<artifact>-sb` a learner shows people), so ask before anything lands on
-	// disk. The cache answers first and offline; the network refreshes it. A
-	// failure here is not fatal — the fallback is the course id, which is what
-	// every workspace made before 2026-09-02 is called.
-	artifact := courseArtifact(course)
+	// Ask the platform before anything lands on disk: a signed-out learner is
+	// answered here, and the title and first lab come from the manifest. The
+	// folder's name does not depend on it (`sourceboot-<course>`, workspaceName).
 	title, firstStage, firstTitle := course, "", ""
 	specTree := ""
 	if m, err := fetchManifest(course); err == nil {
-		if m.Artifact != "" {
-			artifact = m.Artifact
-		}
 		if m.Title != "" {
 			title = m.Title
 		}
@@ -2447,7 +2448,7 @@ func runStart(course, dirFlag string, yes bool) {
 
 	dest := dirFlag
 	if dest == "" {
-		dest = workspaceName(course, artifact)
+		dest = workspaceName(course)
 	}
 	// Standing IN a workspace for this course is the same question as pointing at
 	// one: repair it, rather than nesting a second copy inside it.

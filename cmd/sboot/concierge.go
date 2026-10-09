@@ -64,7 +64,7 @@ const ghTokenDoc = "https://docs.github.com/en/authentication/keeping-your-accou
 
 // runRepo owns the remote: detect the machine's state, explain, offer once.
 //
-// `name` is the repo to create ("" = the course's own default, `<artifact>-sb`).
+// `name` is the repo to create ("" = the course's own default, `sourceboot-<course>`).
 func runRepo(yes bool, name string) int {
 	r, err := findRepo()
 	if err != nil {
@@ -75,7 +75,7 @@ func runRepo(yes bool, name string) int {
 	out := os.Stderr
 	repo := name
 	if repo == "" {
-		repo = repoName(r.course, courseArtifact(r.course))
+		repo = repoName(r.course)
 	}
 
 	if url, ok := existingRemote(r.dir); ok {
@@ -86,8 +86,22 @@ func runRepo(yes bool, name string) int {
 		if shown == "" {
 			shown = "(a remote with credentials in it; `git remote -v` shows it)"
 		}
+		// Set but never pushed to, with gh signed in: offer the push (DF-3).
+		if code, handled := offerFirstPush(out, r.dir, url, shown, yes); handled {
+			return code
+		}
 		fmt.Fprintf(out, "remote already set → %s — nothing to create.\n", shown)
 		fmt.Fprintln(out, "push as usual with git; `sboot repo` only ever offers — it never touches an existing remote.")
+		if gitHasHead(r.dir) && !hasUpstream(r.dir) {
+			fmt.Fprintf(out, "never pushed yet? the first push names the branch:  git push -u origin %s\n", currentBranch(r.dir))
+			// The token and gh advice is for an https GitHub remote only — the
+			// remote offerFirstPush can finish. An ssh push takes a key, not a
+			// token, and another host is not GitHub's (G719).
+			_, _, isGitHubHTTPS := githubSlug(url)
+			if _, err := exec.LookPath("gh"); err != nil && isGitHubHTTPS {
+				fmt.Fprintf(out, "  GitHub wants a token, not your password — or install gh (%s) and `sboot repo` pushes it in one confirm.\n", ghInstallLine())
+			}
+		}
 		return 0
 	}
 	if _, err := exec.LookPath("git"); err != nil {
@@ -155,7 +169,7 @@ func runRepo(yes bool, name string) int {
 		if !noCommit && gitDirty(r.dir) {
 			commit = commitLine("")
 		}
-		printManualRail(out, r.dir, repo, commit)
+		printManualRail(out, r.dir, repo, commit, knownGitHubLogin())
 		return 0
 	}
 
@@ -269,7 +283,7 @@ func ghInstallLine() string {
 //
 // `commit` ("" for none) is the command that commits uncommitted work, printed
 // after the `cd` and before the push, because `git push` sends commits only.
-func printManualRail(out *os.File, dir, repo, commit string) {
+func printManualRail(out *os.File, dir, repo, commit, login string) {
 	fmt.Fprintf(out, "     open   https://github.com/new?name=%s        # prefilled; create it private, no README\n", repo)
 	// THE `cd` IS THE BUG THIS EXISTS TO NOT REPEAT (P-12): without it the learner
 	// runs these in the PARENT folder, and the repo they push is their home
@@ -279,9 +293,13 @@ func printManualRail(out *os.File, dir, repo, commit string) {
 	if commit != "" {
 		fmt.Fprintf(out, "            %s   # git push sends commits only — this one holds your changes\n", commit)
 	}
-	fmt.Fprintf(out, "            git remote add origin https://github.com/<you>/%s.git\n", repo)
+	remote, note := manualRemoteLine(login, repo)
+	fmt.Fprintf(out, "            %s\n", remote)
 	fmt.Fprintln(out, "            git push -u origin main")
 	fmt.Fprintln(out)
+	if note != "" {
+		fmt.Fprintf(out, "     %s\n", note)
+	}
 	fmt.Fprintln(out, "     GitHub will ask for a token, not your password — make one here:")
 	fmt.Fprintf(out, "     %s\n", ghTokenDoc)
 }

@@ -89,14 +89,14 @@ type specManifest struct {
 	// `sboot start` only writes the sboot.toml line when it differs from the default.
 	Tree string `json:"tree"`
 	// The slug of the thing this course builds — `word-game`, `kernel`,
-	// `sqlite-reader` (course.yaml `artifact`, 2026-09-02). It names two things a
-	// learner lives with: the folder `sboot start` unpacks into and the private
-	// GitHub repo `sboot repo` creates, both `<artifact>-sb`.
+	// `sqlite-reader` (course.yaml `artifact`, 2026-09-02). From 2026-09-02 to
+	// 2026-10-07 it named the folder `sboot start` unpacks into and the repo `sboot
+	// repo` creates (`<artifact>-sb`); since then both are `sourceboot-<course>`
+	// (workspaceName) and this CLI no longer reads it. The field stays because the
+	// manifest is append-only and released binaries still read it.
 	//
 	// Absent from an older platform's manifest and from every course that has not
-	// been named, so the empty value has to MEAN the course id rather than being
-	// an error — the same append-only rule as Tree above, and the same fallback
-	// shape: what a workspace is already called cannot become wrong.
+	// been named, so the empty value is not an error.
 	Artifact string `json:"artifact"`
 	// The course's BUILD TOOLING bundle (`xtask/` and cargo config for a Rust
 	// course; nothing but the LICENCE for a Makefile one). Named `engine` for the
@@ -453,40 +453,28 @@ func cachedManifest(course string) (specManifest, bool) {
 	return m, true
 }
 
-// workspaceName is the folder `sboot start` unpacks into and the base of the repo
-// name `sboot repo` proposes: `<artifact>-sb` when the course names an artifact,
-// else the course id — which is what every workspace created before 2026-09-02 is
-// already called, so nothing on anyone's disk changes name.
+// workspacePrefix is the brand half of a workspace's name. It is the lowercase
+// spelling of brandName (main.go), kept beside the one function that uses it.
+const workspacePrefix = "sourceboot-"
+
+// workspaceName is the folder `sboot start` unpacks into: `sourceboot-<course>`
+// (`sourceboot-rust-for-beginners`). Puneet's ruling of 2026-10-07 replaced P-11's
+// `<artifact>-sb` (2026-09-02): the folder alone did not say which course it was.
+// The course id is what the learner typed, so `ls` months later answers "which
+// course" by itself, and two courses that build the same thing (kernel-in-rust and
+// kernel-in-c, both `kernel`) can no longer collide on one name.
 //
-// The `-sb` suffix is the signature (P-11, ratified 2026-09-02): `word-game-sb`
-// is unique enough on a personal GitHub account and identifiable as ours when a
-// reader finds three of them, where `word-game` collides with everything.
-func workspaceName(course, artifact string) string {
-	if artifact == "" {
-		return course
-	}
-	return artifact + "-sb"
+// No workspace on anyone's disk is renamed: `sboot` finds a course by its
+// sboot.toml, never by its folder's name, so a `word-game-sb` made by 0.18.0 and
+// earlier keeps working where it is (ledger G645).
+func workspaceName(course string) string {
+	return workspacePrefix + course
 }
 
-// repoName is workspaceName's sibling for the REMOTE, and it differs in exactly
-// one case: a course with no artifact still gets the `-sb` signature on GitHub
-// (`os-rust-sb`), because a repo called `os-rust` in someone's account says
-// nothing about whose course it was, while a FOLDER called `os-rust` is what
-// their disk already holds and must not be renamed under them.
-func repoName(course, artifact string) string {
-	if artifact == "" {
-		return course + "-sb"
-	}
-	return artifact + "-sb"
-}
-
-// courseArtifact is the cached artifact slug, or "" — see workspaceName.
-func courseArtifact(course string) string {
-	m, ok := cachedManifest(course)
-	if !ok {
-		return ""
-	}
-	return m.Artifact
+// repoName is the private GitHub repo `sboot repo` proposes: the same name as the
+// folder, so what a learner types and what a reader finds on GitHub agree.
+func repoName(course string) string {
+	return workspaceName(course)
 }
 
 // ── fetching ────────────────────────────────────────────────────────────────────

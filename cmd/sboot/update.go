@@ -146,9 +146,10 @@ func renderNotice(w io.Writer, running string, now time.Time) {
 	if channel.latest != "" && !sameVersion(channel.latest, running) {
 		deprecated := versionBelow(running, channel.deprecatedBelow)
 		if deprecated || dueForNudge(now) {
-			// The remedy is the installer, spelled out: `sboot upgrade` does not
-			// exist (the CLI release policy §3 — "do not build yet"), and a nudge
-			// naming a command that errors is worse than no nudge.
+			// The remedy is the installer, spelled out. Until sboot-v0.19.0 that
+			// was because `sboot upgrade` did not exist; from 0.19.0 it is because
+			// this line may point BACKWARDS (§7), where `sboot upgrade` refuses
+			// without --force, and the installer works on any binary.
 			remedy := updateCommandFor(hostOS)
 			line := fmt.Sprintf(
 				"sboot %s → %s available · update: %s · notes: github.com/sourceboot/sboot/releases",
@@ -186,12 +187,14 @@ func renderNotice(w io.Writer, running string, now time.Time) {
 // PowerShell: it starts no child process, so it has no command line for Defender
 // to judge. Never the child-process wrapper around it, which Defender refused as
 // Trojan:Win32/Commando.A!ml on a fresh Windows 11 (`G387`, docs/lab.md
-// 2026-09-29). `sboot upgrade` still does not exist (cli-releases.md §3).
+// 2026-09-29). `sboot upgrade` exists from sboot-v0.19.0 (harness/selfupdate.go),
+// and the nudge still names the installer: it is the line that works on every
+// binary, including one too broken to run its own upgrade.
 func updateCommandFor(goos string) string {
 	if goos == "windows" {
 		return "irm https://sourceboot.com/install.ps1 | iex"
 	}
-	return "curl -fsSL https://sourceboot.com/install.sh | sh"
+	return "curl -fsSL " + installShURL + " | sh"
 }
 
 // safeLine flattens and bounds a server-supplied string. See noticeMax.

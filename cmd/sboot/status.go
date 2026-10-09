@@ -839,9 +839,8 @@ func outOfRepoStatus(st *guidanceState, jsonOut bool) int {
 	fmt.Println()
 	if len(cat) == 0 {
 		fmt.Printf("the catalog could not be reached — browse it at %s/courses\n\n", siteURL())
-		// No folder is named here: since 2026-09-02 it is `<artifact>-sb` from the
-		// course's manifest, which this line has not fetched — and a folder name
-		// that is wrong for the front-door course is worse than none.
+		// No folder is named here: it is `sourceboot-<id>` for whichever course the
+		// learner picks, and this line does not know which one that will be.
 		fmt.Printf("next:  %s        %s\n", p(ansiGreen, "sboot start <id>"), p(ansiDim, "# unpacks a course into its own folder"))
 		fmt.Printf("read:  %s/courses\n", siteURL())
 		return 0

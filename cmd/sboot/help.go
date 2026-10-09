@@ -61,11 +61,14 @@ everything else:
   debug [stage]         boot this stage under QEMU frozen for a debugger on :1234
   fetch [course]        download the current lab's tests on purpose (refresh/pre-cache)
   where                 print where your repo, tests and grader live
+  upgrade [--force]     upgrade sboot itself to the latest release (runs the installer)
+  completion SHELL      print tab completion for zsh, bash, fish or powershell
   version               print the version (also --version)
   help [--all]          this text (also --help, -h)
 
 flags:
-  --force, -f           submit even if the local check fails (submit only)
+  --force, -f           submit even if the local check fails (submit); go back to an
+                        older latest release (upgrade)
   --here                answer in this terminal instead of opening the chat (explain)
   --message, -m TEXT    your question, instead of the one explain composes (explain)
   --json                machine-readable output on `+"`sboot`"+`, test and submit
