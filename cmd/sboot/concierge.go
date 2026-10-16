@@ -39,7 +39,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 )
 
@@ -99,7 +98,7 @@ func runRepo(yes bool, name string) int {
 			// token, and another host is not GitHub's (G719).
 			_, _, isGitHubHTTPS := githubSlug(url)
 			if _, err := exec.LookPath("gh"); err != nil && isGitHubHTTPS {
-				fmt.Fprintf(out, "  GitHub wants a token, not your password — or install gh (%s) and `sboot repo` pushes it in one confirm.\n", ghInstallLine())
+				fmt.Fprintf(out, "  GitHub wants a token, not your password — or install gh (%s) and `sboot repo` pushes it in one confirm.\n", ghInstallInline())
 			}
 		}
 		return 0
@@ -119,7 +118,11 @@ func runRepo(yes bool, name string) int {
 		fmt.Fprintf(out, "to put this on GitHub, %s uses GitHub's own CLI (`gh`) — it holds the login, we never do.\n", brandName)
 		fmt.Fprintln(out, "it is not installed here. two ways forward:")
 		fmt.Fprintln(out)
-		fmt.Fprintf(out, "  a) install it:  %s\n", ghInstallLine())
+		install, then := ghInstallLine()
+		fmt.Fprintf(out, "  a) install it:  %s\n", install)
+		if then != "" {
+			fmt.Fprintf(out, "     %s\n", then)
+		}
 		fmt.Fprintln(out, "     run that, then `sboot repo` again — it does the rest in one confirm.")
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, "  b) do it by hand:")
@@ -249,33 +252,52 @@ func runRepo(yes bool, name string) int {
 // that cannot work is worse than no line, because the reader cannot tell our
 // mistake from theirs. So: brew if it is actually here, else brew's own installer
 // first; apt or dnf by which one exists; winget on Windows.
-func ghInstallLine() string {
-	switch runtime.GOOS {
+//
+// `cmd` is ONE command, a line to paste whole; `then` is what to do after it, in
+// words, or "". Homebrew's installer and `brew install gh` used to share one
+// line ("…install.sh)\"   then:  brew install gh"), and pasted whole that hands the
+// installer `then:` as $0 and `brew install gh` as its arguments — Homebrew's
+// install.sh answers `Unrecognized option: 'brew'` (Puneet, 2026-10-07; G961). Not
+// `&&` either: on Apple Silicon `brew` is not on PATH until the installer's own
+// "Next steps" lines have run. The OS is hostOS, the seam every OS-keyed remedy
+// reads, so the darwin branch runs under test on any host.
+func ghInstallLine() (cmd, then string) {
+	switch hostOS {
 	case "darwin":
 		if _, err := exec.LookPath("brew"); err == nil {
-			return "brew install gh"
+			return "brew install gh", ""
 		}
-		// Homebrew first, gh second — two commands, in the order they must run.
-		return `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` +
-			"   then:  brew install gh"
+		return `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`,
+			"when it finishes, run the 'Next steps' lines it prints, then: brew install gh"
 	case "windows":
-		return "winget install --id GitHub.cli"
+		return "winget install --id GitHub.cli", ""
 	default:
 		if _, err := exec.LookPath("dnf"); err == nil {
-			return "sudo dnf install gh"
+			return "sudo dnf install gh", ""
 		}
 		// `update` first, for the reason toolchain.go's apt line gives: a fresh
 		// image's package list is empty and the install alone exits 100.
 		if _, err := exec.LookPath("apt-get"); err == nil {
-			return "sudo apt-get update && sudo apt-get install -y gh"
+			return "sudo apt-get update && sudo apt-get install -y gh", ""
 		}
 		if _, err := exec.LookPath("apt"); err == nil {
-			return "sudo apt update && sudo apt install -y gh"
+			return "sudo apt update && sudo apt install -y gh", ""
 		}
 		// Neither package manager found: name the project's own page rather than
 		// guessing a distro.
-		return "see https://github.com/cli/cli#installation"
+		return "see https://github.com/cli/cli#installation", ""
 	}
+}
+
+// ghInstallInline is ghInstallLine for the middle of a sentence: the one command
+// where there is one, and on a Mac without Homebrew the two steps in words — an
+// installer pasted inside parentheses is no command at all (G961).
+func ghInstallInline() string {
+	cmd, then := ghInstallLine()
+	if then != "" {
+		return "https://brew.sh, then `brew install gh`"
+	}
+	return cmd
 }
 
 // printManualRail is offer (b): the commands, from the right directory, with the

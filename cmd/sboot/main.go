@@ -378,6 +378,95 @@ func gradedHeader(verbing, course, stage, verb string, defaulted bool) {
 	fmt.Fprintln(os.Stderr, line)
 }
 
+// welcomeAheadLine is the one line under a bare `sboot submit`'s header when the
+// lab it grades is lab 00 but the work in the tree is already the next lab's
+// (DF-S-7, Puneet's dogfood: a bare submit graded lab 00 while he was writing lab
+// 01). The product shape is the PM's and the TL's, 2026-10-16: name it, do not
+// ask, do not block — lab 01 is locked behind lab 00 for everyone (G651), so
+// lab 00 is the only lab this submit can grade.
+//
+// Narrow on purpose: only a DEFAULTED stage (an explicit `sboot submit 00-…` is
+// the learner's own choice), only a welcome lab (a later lab's own work is the
+// work), and only when there is work ahead of it — the tree's tracked source
+// differs from the starter commit (lab 00 asks for no edit), or this machine
+// has graded, hinted or failed the next live lab. "" otherwise.
+func welcomeAheadLine(st *guidanceState, r repo, stage string, defaulted bool) string {
+	if !defaulted || !isWelcomeLab(stage) {
+		return ""
+	}
+	labs, _ := cachedLabsInfo(r.course)
+	next, seen := "", false
+	for _, l := range labs {
+		if seen && l.Live {
+			next = l.Stage
+			break
+		}
+		seen = seen || l.Stage == stage
+	}
+	if next == "" {
+		return ""
+	}
+	if !st.hasLocalWork(r.course, next) && !sourceChangedSinceStart(r) {
+		return ""
+	}
+	n, w := labNumber(next), labNumber(stage)
+	return fmt.Sprintf("your changes look like lab %s's work; lab %s opens once lab %s is complete, so this grades lab %s (your setup).", n, n, w, w)
+}
+
+// starterPublishSubject is how the subject of every commit the public starter
+// repos' publish script makes ends: scripts/publish-starter.sh:802 commits
+// "${REPO_NAME%-starter} starter — the workspace a learner starts from" (copied
+// from there; change both together). A learner who `git clone`s a starter gets
+// that repo's whole publish history, whose root is the FIRST publish, not the
+// one the clone holds.
+const starterPublishSubject = " starter — the workspace a learner starts from"
+
+// sourceChangedSinceStart reports whether the learner's tree, as git tracks it,
+// differs from the starter it began as: the newest starter-publish commit when
+// the history has one (a `git clone` of a public starter), else the root commit
+// (`sboot start`'s "start <course>", or the "Initial commit" of a `gh repo create
+// --template` repo — each holds the starter as the learner got it). Every answer
+// git cannot give reads as unchanged: no repo, no git, a Mac whose git is the
+// Command Line Tools shim (asking it opens Apple's install dialog), or a history
+// git cannot walk.
+func sourceChangedSinceStart(r repo) bool {
+	if !isDir(filepath.Join(r.dir, ".git")) || devToolsAbsent(hostOS) {
+		return false
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return false
+	}
+	b, err := gitRun(r.dir, "log", "--format=%H %s", "HEAD")
+	if err != nil {
+		return false
+	}
+	base := ""
+	for _, line := range strings.Split(string(b), "\n") {
+		// git log is newest first, so the first match is the latest publish.
+		if h, subject, ok := strings.Cut(line, " "); ok && strings.HasSuffix(subject, starterPublishSubject) {
+			base = h
+			break
+		}
+	}
+	if base == "" {
+		b, err = gitRun(r.dir, "rev-list", "--max-parents=0", "HEAD")
+		roots := strings.Fields(string(b))
+		if err != nil || len(roots) == 0 {
+			return false
+		}
+		base = roots[len(roots)-1]
+	}
+	// --quiet exits 1 when there are differences, 0 when none; anything else is
+	// git failing, which is not a change. Cargo.lock, at any depth, is not the
+	// learner's work: lab 00's own `cargo test` can rewrite the tracked lockfile
+	// (a newer cargo re-serialises it), and an untouched lab 00 would then read
+	// as changed (G970).
+	tree := r.treeName()
+	_, err = gitRun(r.dir, "diff", "--quiet", base, "--", tree, ":(exclude,glob)"+tree+"/**/Cargo.lock")
+	var ee *exec.ExitError
+	return errors.As(err, &ee) && ee.ExitCode() == 1
+}
+
 func main() {
 	// FIRST, before a single byte is written: on Windows the console renders this
 	// binary's UTF-8 as cp437 mojibake unless it is told otherwise, and the runes
@@ -591,7 +680,7 @@ func startNoArg() int {
 			}
 		}
 		idW, titleW := courseColumns(live, nil)
-		rows, _ := catalogRows(p, live, nil, idW, titleW)
+		rows := catalogRows(p, live, nil, idW, titleW)
 		for _, line := range rows {
 			fmt.Println(line)
 		}
@@ -1160,10 +1249,12 @@ func repoStateLines(dir string) []string {
 // prefetch when a lab is completed (cache.go).
 func runFetch(course string) int {
 	if course == "" {
-		if r, err := findRepo(); err == nil {
-			course = r.course
-		} else {
-			course = env("SBOOT_COURSE", defaultCourse)
+		// No course named and no workspace: refuse by name, as every verb outside a
+		// workspace does (QA WK1-C-3, G917). This fell back to defaultCourse, the
+		// deprecated os-rust, which no picker has offered since G620.
+		course = os.Getenv("SBOOT_COURSE")
+		if course == "" {
+			course = requireRepo("fetch").course
 		}
 	}
 	s, st, err := ensureSpecStatus(course, "")
@@ -1772,20 +1863,29 @@ func runSubmit(r repo, stage string, ga gradedArgs) {
 }
 
 // reportSubmitAuthFailure is the 401 tile: both doors (`sboot login` and the
-// copied-token path), and what was NOT lost.
-func reportSubmitAuthFailure(msg string) {
+// copied-token path), and what was NOT lost. `ran` is whether a passing local run
+// happened first: a 401 at the preflight comes before any build, so there is no
+// run to call safe (QA WK1-C-5, G919).
+func reportSubmitAuthFailure(msg string, ran bool) {
 	if msg == "" {
 		msg = "invalid or missing token"
 	}
 	fmt.Fprintf(os.Stderr, "sboot: the platform did not accept your token (401: %s).\n", msg)
 	fmt.Fprintln(os.Stderr, "sboot: reconnect with `sboot login`, or paste a fresh token from")
 	fmt.Fprintf(os.Stderr, "sboot:   %s/account   into SBOOT_TOKEN.\n", siteURL())
+	if !ran {
+		fmt.Fprintln(os.Stderr, "sboot: nothing was submitted.")
+		return
+	}
 	fmt.Fprintln(os.Stderr, "sboot: nothing was submitted — your passing run is safe to resend.")
 }
 
 func submit(r repo, stage string, ga gradedArgs) int {
 	force := ga.force
 	gradedHeader("submitting", r.course, stage, "submit", ga.defaulted)
+	if line := welcomeAheadLine(loadState(), r, stage, ga.defaulted); line != "" {
+		fmt.Fprintln(os.Stderr, painter(os.Stderr)(ansiDim, line))
+	}
 	// SBOOT_OFFLINE PROMISES "skip every network call", and an official grade is
 	// nothing BUT a network call: the product of a submit is the server's verdict.
 	// Until 2026-10-04 (ledger G506, found beside L12) an offline submit with the
@@ -1811,7 +1911,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	// run is the one bad outcome the gate creates, and one cheap GET removes it.
 	if ae := submitPreflight(course, stage); ae != nil {
 		if ae.status == http.StatusUnauthorized {
-			reportSubmitAuthFailure(ae.msg)
+			reportSubmitAuthFailure(ae.msg, false)
 			return 2
 		}
 		fmt.Fprintf(os.Stderr, "sboot: submission rejected: %s\n", ae.Error())
@@ -2073,7 +2173,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		unreadable := false
 		switch {
 		case resp.StatusCode == http.StatusUnauthorized:
-			reportSubmitAuthFailure(created.Err)
+			reportSubmitAuthFailure(created.Err, true)
 		case failed && created.Err != "":
 			fmt.Fprintf(os.Stderr, "sboot: the platform failed: %s (HTTP %d)\n", serverMessage(created.Err), resp.StatusCode)
 		case created.Err != "":
@@ -2419,6 +2519,14 @@ func readCapture(path string) []byte {
 // nobody should have to type over their own work. A non-empty directory with NO
 // sboot.toml is still refused: it is not ours, and we do not know what is in it.
 func runStart(course, dirFlag string, yes bool) {
+	// SBOOT_OFFLINE promises "skip every network call", and a start is a download
+	// (QA WK1-C-2, G916): the manifest call below already respected the switch and
+	// fell through, the workspace download did not. Refused at once, before a
+	// folder is made, the way G506 refuses a submit and auth.go a login.
+	if offline() {
+		fmt.Fprintln(os.Stderr, "sboot: SBOOT_OFFLINE is set — starting a course downloads it, so nothing was fetched or created. Unset it and retry.")
+		exitWith(2)
+	}
 	// Ask the platform before anything lands on disk: a signed-out learner is
 	// answered here, and the title and first lab come from the manifest. The
 	// folder's name does not depend on it (`sourceboot-<course>`, workspaceName).

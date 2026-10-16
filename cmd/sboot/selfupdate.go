@@ -126,17 +126,51 @@ func runUpgrade(force bool) int {
 		fmt.Fprintln(out, "sboot: this is a source build — update it with `git pull` and `go build`.")
 		return 2
 	}
+	// Where this binary lives and who owns it, before the platform is asked
+	// anything (G751, code review of sprint 1's bundle E): when there is no version
+	// answer — SBOOT_OFFLINE, a dead network, no header — a package-manager-owned
+	// binary gets its manager's line, not "could not reach the platform". When
+	// there IS an answer, the refusal waits for it (G767, code review of sprint 2
+	// #16): a Homebrew binary at or ahead of latest is told so, exit 0, and clears
+	// the nudge (G718) — `brew upgrade sboot` there does nothing. The refusal, the
+	// Windows line and the unwritable folder all say how to APPLY an upgrade, and a
+	// binary at or ahead of latest has none to apply (G666, G668).
+	exe, err := updateExe()
+	if err == nil {
+		if real, e := filepath.EvalSymlinks(exe); e == nil {
+			exe = real
+		}
+	}
+	if err != nil {
+		fmt.Fprintf(out, "sboot: cannot tell where this sboot is installed (%v). to update by hand:\n  %s\n", err, install)
+		return 2
+	}
+	owner, instead := packageManagerFor(exe)
+	refuseOwned := func() int {
+		fmt.Fprintf(out, "sboot: this sboot (%s) was installed by %s, and `sboot upgrade` does not fight it.\n", exe, owner)
+		fmt.Fprintf(out, "sboot: instead:  %s\n", instead)
+		return 2
+	}
 	if os.Getenv("SBOOT_OFFLINE") != "" {
+		if owner != "" {
+			return refuseOwned()
+		}
 		fmt.Fprintln(out, "sboot: SBOOT_OFFLINE is set, so this cannot ask which version is latest. unset it, or reinstall by hand:")
 		fmt.Fprintf(out, "  %s\n", install)
 		return 2
 	}
 	latest, err := latestFromServer()
 	if err != nil {
+		if owner != "" {
+			return refuseOwned()
+		}
 		fmt.Fprintf(out, "sboot: could not reach the platform (%v) — nothing changed.\n", err)
 		return 2
 	}
 	if latest == "" {
+		if owner != "" {
+			return refuseOwned()
+		}
 		fmt.Fprintln(out, "sboot: the platform did not say which version is latest — nothing changed. to reinstall by hand:")
 		fmt.Fprintf(out, "  %s\n", install)
 		return 2
@@ -164,22 +198,10 @@ func runUpgrade(force bool) int {
 			return 0
 		}
 	}
+	if owner != "" {
+		return refuseOwned()
+	}
 
-	exe, err := updateExe()
-	if err == nil {
-		if real, e := filepath.EvalSymlinks(exe); e == nil {
-			exe = real
-		}
-	}
-	if err != nil {
-		fmt.Fprintf(out, "sboot: cannot tell where this sboot is installed (%v). to update by hand:\n  %s\n", err, install)
-		return 2
-	}
-	if owner, instead := packageManagerFor(exe); owner != "" {
-		fmt.Fprintf(out, "sboot: this sboot (%s) was installed by %s, and `sboot upgrade` does not fight it.\n", exe, owner)
-		fmt.Fprintf(out, "sboot: instead:  %s\n", instead)
-		return 2
-	}
 	if upgradeGOOS == "windows" {
 		// A running sboot.exe cannot be replaced by the process that is running
 		// it, and starting PowerShell as a child is the wrapper Defender flagged

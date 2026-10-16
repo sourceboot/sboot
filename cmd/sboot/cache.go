@@ -306,8 +306,9 @@ func cacheDir() (string, error) {
 // injected.
 //
 // WHY THE INDIRECTION. `scripts/install.sh` has to write its install marker into
-// THIS directory — `sboot upgrade` reads it back to decide whether it may replace
-// the binary (the CLI release policy §4) — so a shell script and this Go function
+// THIS directory — written for a reader that decides whether it may replace the
+// binary (the CLI release policy §4; `sboot upgrade` decides from the binary's path
+// today, see installMarkerName) — so a shell script and this Go function
 // must agree about where it is, on each OS, forever. A test can only prove that on
 // the machine it runs on unless the OS is a parameter, and the machine doing the
 // fixing is a Linux one. Same idiom, same reason, as `tarGzDirSep` in archive.go:
@@ -342,9 +343,11 @@ func dataDirFor(goos string, getenv func(string) string, userHome func() (string
 }
 
 // installMarkerName is the file `scripts/install.sh` drops beside the cache to
-// record HOW this binary was installed. `sboot upgrade` (§4) reads it so it never
-// fights Homebrew, a distro package or a `go install` — "refuse rather than
-// fight", and every refusal names the command that does work.
+// record HOW this binary was installed, so a later reader can tell a curl install
+// from Homebrew, a distro package or a `go install` — "refuse rather than fight",
+// and every refusal names the command that does work. Only the tests read the
+// marker so far; `sboot upgrade` (sboot-v0.19.0) tells who owns the binary from
+// its path and SBOOT_INSTALL_METHOD (selfupdate.go packageManagerFor).
 //
 // It has to be written by the FIRST release or the first cohort is permanently
 // undetectable: nothing can retroactively add a marker to an install that already
@@ -767,6 +770,14 @@ func ensureSpecStatus(course, stage string) (spec, specStatus, error) {
 		}
 		var ae *apiError
 		if errors.As(err, &ae) {
+			// A 401 names the way in (QA WK1-C-4, G918): `sboot test <stage>`, `sboot
+			// hint <stage>` and `sboot fetch` all end here, and the bare refusal
+			// left a signed-out learner with nothing to type. whoami's two lines.
+			if ae.status == http.StatusUnauthorized {
+				return spec{}, specStatus{cause: err}, fmt.Errorf("cannot fetch the tests for %s: %s\n"+
+					"  not connected yet — run `sboot login`.\n"+
+					"  no browser here? paste a token from %s/account:  %s", course, ae.msg, siteURL(), tokenSetLine("<the token>"))
+			}
 			return spec{}, specStatus{cause: err}, fmt.Errorf("cannot fetch the tests for %s: %s", course, ae.msg)
 		}
 		// TWO DIFFERENT PROBLEMS, and until 2026-08-02 both were reported as the

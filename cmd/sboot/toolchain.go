@@ -151,7 +151,11 @@ func devToolsAbsent(goos string) bool {
 // this hint is otherwise told two sizes for one download. verify-content §15
 // (scripts/lib/welcome-guards.mjs checkCliSizes) reads these three arms and fails the
 // build on a token the page does not carry, so a re-measurement lands on the page
-// first and here second, never here alone.
+// first and here second, never here alone. Presence is not agreement, so the
+// Windows GNU arm is held to the block's LEAD figures as well (G943,
+// sboot-v0.20.0: the 2026-10-14 `--profile minimal` measurement, 163 MB / 0.9 GB):
+// harness/onboarding_test.go reads the block and compares, so the page stays the
+// one source and this line its checked copy.
 func linkerHint(goos string) []string {
 	switch goos {
 	case "darwin":
@@ -172,15 +176,20 @@ func linkerHint(goos string) []string {
 			"  1. rustup's option 1, the Visual Studio Community installer, which brings the C++",
 			"     build tools (roughly 7 GB and 15–20 minutes, once — plan on about 10 GB free):",
 			"     https://visualstudio.microsoft.com/visual-cpp-build-tools/  (\"Desktop development with C++\")",
-			"  2. or switch Rust to its own GNU toolchain (about 350 MB to download, 1.5 GB on disk):",
+			"  2. or switch Rust to its own GNU toolchain (about 163 MB to download, 0.9 GB on disk):",
 			// The form the Windows lap MEASURED to work once rustup is already
 			// installed (windows.md D-WIN-1): `rustup-init.exe --default-host …` is a
 			// no-op by then, and `rustup default <toolchain>` loses to the
 			// workspace's rust-toolchain.toml, which pins only the channel and lets
 			// rustup fill the host half in from `default-host` — so that setting is
 			// the lever, and it is sticky. The fully-qualified toolchain name makes
-			// the install correct in either order.
-			"     rustup toolchain install stable-x86_64-pc-windows-gnu",
+			// the install correct in either order. `--profile minimal -c clippy,rustfmt`
+			// is the page's own (linker-windows block): without it rustup installs its
+			// CONFIGURED profile, which on a machine set up the Visual Studio way
+			// (bare rustup-init.exe) is "default" and adds rust-docs — about 23 MiB more
+			// to download and roughly 0.9 GB more on disk — so the figures above
+			// would not describe this line (the TL review, 2026-10-16).
+			"     rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal -c clippy,rustfmt",
 			"     rustup set default-host x86_64-pc-windows-gnu",
 		}
 	default:

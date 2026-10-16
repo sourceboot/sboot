@@ -229,14 +229,18 @@ func fetchCompletions(course string) (*completionsData, error) {
 		Attempts []attemptRow `json:"attempts"`
 		Err      string       `json:"error"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		return nil, fmt.Errorf("HTTP %d: %w", resp.StatusCode, err)
-	}
+	decodeErr := json.NewDecoder(resp.Body).Decode(&r)
+	// The status first, the body only for its message (G768): a 401 whose body is
+	// not JSON — a protected preview's HTML, a proxy's page — is still the
+	// platform's refusal, and cacheLabel reads it off *apiError.
 	if resp.StatusCode != http.StatusOK {
-		if r.Err == "" {
+		if decodeErr != nil || r.Err == "" {
 			r.Err = "unexpected response"
 		}
 		return nil, &apiError{status: resp.StatusCode, msg: r.Err}
+	}
+	if decodeErr != nil {
+		return nil, fmt.Errorf("HTTP %d: %w", resp.StatusCode, decodeErr)
 	}
 	d := &completionsData{handle: r.User}
 	for _, a := range r.Attempts {
@@ -298,22 +302,40 @@ func startedCourses(d *completionsData) []string {
 	return out
 }
 
+// cacheLabel says WHY a view is served from the progress cache, given the error
+// the completions fetch failed with (QA RL19-1, G721/G750). A 401 is the platform
+// ANSWERING — online, no login — and on a fresh install's own check line (install.sh
+// runs a bare `sboot`) "offline" sent a learner to look at their network. Only a
+// fetch nothing answered (or SBOOT_OFFLINE) is offline; any other answer is just
+// stale progress.
+func cacheLabel(err error) string {
+	var ae *apiError
+	switch {
+	case errors.As(err, &ae) && ae.status == http.StatusUnauthorized:
+		return "not signed in — as of last sync"
+	case errors.As(err, &ae):
+		return "as of last sync"
+	}
+	return "offline — as of last sync"
+}
+
 // courseProgress is the "server truth when online, cache offline" rule for one
-// course. src is "server" | "cache" | "none"; handle is known only from a live
-// answer.
-func courseProgress(st *guidanceState, course string) (cs *courseSync, src, handle string) {
-	if d, err := fetchCompletions(course); err == nil {
+// course. src is "server" | "cache" | "none"; fetchErr is why the live answer
+// was not had (nil on "server"), so a screen can tell a 401 from no network
+// (cacheLabel, G721; repoStatus, G915).
+func courseProgress(st *guidanceState, course string) (cs *courseSync, src string, fetchErr error) {
+	d, err := fetchCompletions(course)
+	if err == nil {
 		// mergeSync, not setSync: a lab this account was seen verified stays
 		// verified (PL-1, G463) — the window the answer comes from can bury it.
 		cs = st.mergeSync(course, syncFromAttempts(d, course), d.handle, len(d.attempts) > 0)
-		return cs, "server", d.handle
-	} else {
-		debugf("completions fetch skipped (%v)", err)
+		return cs, "server", nil
 	}
+	debugf("completions fetch skipped (%v)", err)
 	if cached := st.Sync[course]; cached != nil {
-		return cached, "cache", ""
+		return cached, "cache", err
 	}
-	return nil, "none", ""
+	return nil, "none", err
 }
 
 // ── the lab list (the spec manifest) ────────────────────────────────────────────
@@ -548,19 +570,32 @@ func saveQuietly(st *guidanceState) {
 func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 	labs, title, err := manifestLabs(r.course)
 	if err != nil {
-		// P7: a workspace with nothing cached and no network still orients.
+		// P7: a workspace with nothing cached and no network still orients. A
+		// platform that ANSWERED is not unreachable (QA WK1-C-1, G915 — G721's
+		// class): a 401 is a machine with no login, and its next move is the login.
+		why := "no lab list cached and the platform is unreachable"
+		next := fmt.Sprintf("sboot fetch %s          # once online — cached labs still grade offline", r.course)
+		var ae *apiError
+		if errors.As(err, &ae) {
+			why = "no lab list cached (the platform answered: " + serverMessage(ae.msg) + ")"
+			next = fmt.Sprintf("sboot fetch %s", r.course)
+			if ae.status == http.StatusUnauthorized {
+				why = "no lab list cached (not signed in)"
+				next = "sboot login               # then bare sboot shows your labs"
+			}
+		}
 		if jsonOut {
 			return statusJSON(map[string]any{
 				"command": "status", "in_repo": true, "course": r.course,
-				"error": "no lab list cached and the platform is unreachable",
+				"error": why,
 			})
 		}
-		fmt.Printf("%s — no lab list cached and the platform is unreachable.\n\n", r.course)
-		fmt.Printf("next:  sboot fetch %s          # once online — cached labs still grade offline\n", r.course)
+		fmt.Printf("%s — %s.\n\n", r.course, why)
+		fmt.Printf("next:  %s\n", next)
 		fmt.Printf("read:  %s/courses/%s\n", siteURL(), r.course)
 		return 0
 	}
-	cs, src, _ := courseProgress(st, r.course)
+	cs, src, progressErr := courseProgress(st, r.course)
 	if cs == nil {
 		cs = &courseSync{Verified: map[string]string{}}
 	}
@@ -655,7 +690,7 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 		}
 		if current != nil {
 			out["current"] = current.Stage
-			out["next"] = "sboot test"
+			out["next"], _ = currentNext(st, r.course, current.Stage)
 		}
 		return statusJSON(out)
 	}
@@ -666,12 +701,22 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 	if title != "" {
 		head = title + " — " + r.course
 	}
+	// Why progress is not live, in G721's words (QA WK1-C-1, G915): a 401 is
+	// "not signed in", another answer only stale, and "offline" only when
+	// nothing answered.
 	suffix := ""
 	switch src {
 	case "cache":
-		suffix = " · as of last sync"
+		suffix = " · " + cacheLabel(progressErr)
 	case "none":
 		suffix = " · progress unknown (offline)"
+		var ae *apiError
+		if errors.As(progressErr, &ae) {
+			suffix = " · progress unknown"
+			if ae.status == http.StatusUnauthorized {
+				suffix = " · progress unknown (not signed in)"
+			}
+		}
 	}
 	counts := fmt.Sprintf("%d of %d live labs verified", verifiedLive, live)
 	if verifiedLive == live && live > 0 {
@@ -760,7 +805,8 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 
 	switch {
 	case current != nil:
-		fmt.Printf("next:  %s               %s\n", p(ansiGreen, "sboot test"), p(ansiDim, "# grades "+current.Stage))
+		next, why := currentNext(st, r.course, current.Stage)
+		fmt.Printf("next:  %s%s%s\n", p(ansiGreen, next), strings.Repeat(" ", max(3, 25-len(next))), p(ansiDim, why))
 		fmt.Printf("stuck: sboot hint · read: %s/courses/%s/stages/%s\n", siteURL(), r.course, current.Stage)
 	case frontierNext != nil:
 		fmt.Printf("all live labs verified. lab %s is being built — `sboot courses` will show it the day it lands.\n",
@@ -773,12 +819,33 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 	return 0
 }
 
+// currentNext is the in-workspace screen's next move on the current lab: `sboot
+// test`, or — when the last practice run scored full marks with nothing failing —
+// the `sboot submit <stage>` that run itself just named (QA WK1-C-6, G920).
+//
+// The nudge comes off a run on THIS machine (G960): the server's practice row may
+// be another machine's, and a fresh clone of the workspace is a tree of stubs
+// whose `lastFailed` is empty only because nothing ran here. So only the local
+// score (state.json's, written by every graded run here) is read; the progress
+// list's ticks keep their own fallback to the server's.
+func currentNext(st *guidanceState, course, stage string) (next, why string) {
+	lp := st.LastScore[course+"/"+stage]
+	var got, of int
+	if n, _ := fmt.Sscanf(lp, "%d/%d", &got, &of); n == 2 && of > 0 && got == of {
+		if failing, _ := st.lastFailed(course, stage); len(failing) == 0 {
+			return "sboot submit " + stage, "# practice passed — the official grade"
+		}
+	}
+	return "sboot test", "# grades " + stage
+}
+
 // outOfRepoStatus is the S2/B3 view: who you are, your courses, how to start.
 func outOfRepoStatus(st *guidanceState, jsonOut bool) int {
 	var handle string
 	var started []string
 	src := "none"
-	if d, err := fetchCompletions(""); err == nil {
+	d, fetchErr := fetchCompletions("")
+	if fetchErr == nil {
 		src = "server"
 		handle = d.handle
 		started = startedCourses(d)
@@ -787,7 +854,7 @@ func outOfRepoStatus(st *guidanceState, jsonOut bool) int {
 			st.mergeSync(c, syncFromAttempts(d, c), d.handle, true)
 		}
 	} else {
-		debugf("completions fetch skipped (%v)", err)
+		debugf("completions fetch skipped (%v)", fetchErr)
 		if len(st.Sync) > 0 {
 			src = "cache"
 			for c := range st.Sync {
@@ -817,7 +884,7 @@ func outOfRepoStatus(st *guidanceState, jsonOut bool) int {
 	case handle != "":
 		header += " · connected as " + p(ansiAmber, "@"+handle)
 	case src == "cache":
-		header += p(ansiDim, " · offline — as of last sync")
+		header += p(ansiDim, " · "+cacheLabel(fetchErr))
 	}
 	fmt.Println(header)
 	fmt.Println()
@@ -845,12 +912,10 @@ func outOfRepoStatus(st *guidanceState, jsonOut bool) int {
 		fmt.Printf("read:  %s/courses\n", siteURL())
 		return 0
 	}
-	rows, sawDim := catalogRows(p, cat, nil, idW, titleW)
-	for _, line := range rows {
+	// Every catalog row, so no "(more in development — `sboot courses` lists
+	// everything)" under it: that list is this one (QA WK1-C-8, G922).
+	for _, line := range catalogRows(p, cat, nil, idW, titleW) {
 		fmt.Println(line)
-	}
-	if sawDim {
-		fmt.Printf("  %s\n", p(ansiDim, "(more in development — `sboot courses` lists everything)"))
 	}
 	fmt.Println()
 	first := firstLive(cat)
@@ -927,10 +992,9 @@ func freeLabel(c catalogCourse) string {
 }
 
 // catalogRows renders catalog lines (minus `skip`), live ones bright, the rest
-// dim with their status — and reports whether any dim rows were left out of the
-// bright list's world (for the "(more in development …)" note). Widths come from
-// courseColumns so parallel sections align.
-func catalogRows(p func(string, string) string, cat []catalogCourse, skip map[string]bool, idW, titleW int) (lines []string, sawDim bool) {
+// dim with their status. Widths come from courseColumns so parallel sections
+// align.
+func catalogRows(p func(string, string) string, cat []catalogCourse, skip map[string]bool, idW, titleW int) (lines []string) {
 	sorted := sortCatalog(cat)
 	for _, c := range sorted {
 		if skip[c.ID] {
@@ -950,7 +1014,6 @@ func catalogRows(p func(string, string) string, cat []catalogCourse, skip map[st
 			}
 			lines = append(lines, "  "+p(ansiAmber, padTo(c.ID, idW))+padTo(title, titleW)+meta)
 		} else {
-			sawDim = true
 			status := strings.ReplaceAll(c.Status, "-", " ")
 			if status == "" {
 				status = "coming soon"
@@ -958,7 +1021,7 @@ func catalogRows(p func(string, string) string, cat []catalogCourse, skip map[st
 			lines = append(lines, "  "+p(ansiDim, padTo(c.ID, idW)+padTo(title, titleW)+status))
 		}
 	}
-	return lines, sawDim
+	return lines
 }
 
 // yourCourseRows renders the started-course rows (the B3 shape, shared by the
@@ -1017,7 +1080,8 @@ func runCourses() int {
 
 	var started []string
 	progressSrc := "none"
-	if d, err := fetchCompletions(""); err == nil {
+	d, fetchErr := fetchCompletions("")
+	if fetchErr == nil {
 		progressSrc = "server"
 		started = startedCourses(d)
 		for _, c := range started {
@@ -1025,7 +1089,7 @@ func runCourses() int {
 			st.mergeSync(c, syncFromAttempts(d, c), d.handle, true)
 		}
 	} else {
-		debugf("completions fetch skipped (%v)", err)
+		debugf("completions fetch skipped (%v)", fetchErr)
 		if len(st.Sync) > 0 {
 			progressSrc = "cache"
 			for c := range st.Sync {
@@ -1044,8 +1108,11 @@ func runCourses() int {
 	}
 
 	note := "· cached for offline"
-	if catSrc == "cache" || progressSrc == "cache" {
+	switch {
+	case catSrc == "cache": // the public catalog did not answer either
 		note = "· offline — as of last sync"
+	case progressSrc == "cache":
+		note = "· " + cacheLabel(fetchErr) // G750
 	}
 
 	idW, titleW := courseColumns(cat, started)
@@ -1060,7 +1127,7 @@ func runCourses() int {
 			for _, id := range started {
 				skip[id] = true
 			}
-			rows, _ := catalogRows(p, cat, skip, idW, titleW)
+			rows := catalogRows(p, cat, skip, idW, titleW)
 			if len(rows) > 0 {
 				fmt.Println("catalog")
 				for _, line := range rows {
@@ -1074,7 +1141,7 @@ func runCourses() int {
 	}
 
 	fmt.Printf("catalog — %s/courses %s\n\n", siteURL(), p(ansiDim, note))
-	rows, _ := catalogRows(p, cat, nil, idW, titleW)
+	rows := catalogRows(p, cat, nil, idW, titleW)
 	for _, line := range rows {
 		fmt.Println(line)
 	}

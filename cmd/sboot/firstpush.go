@@ -91,6 +91,16 @@ func ghCredGit(dir string, args ...string) *exec.Cmd {
 	return cmd
 }
 
+// ghSaysSignedOut reports whether `gh auth status` says, in gh's own words, that
+// it is signed in nowhere: gh 2.x prints "You are not logged into any GitHub
+// hosts." (followed by "To log in, run: gh auth login" from 2.40, "Run gh auth
+// login to authenticate." before). A non-zero exit alone also means offline, a
+// proxy, or an invalid token, and none of those is "sign in".
+func ghSaysSignedOut() bool {
+	b, _ := exec.Command("gh", "auth", "status").CombinedOutput()
+	return strings.Contains(strings.ToLower(string(b)), "not logged into any github hosts")
+}
+
 // offerFirstPush handles a workspace whose origin is set but has never been
 // pushed to. handled=false means "not this case": the caller prints its
 // remote-already-set answer, unchanged.
@@ -108,8 +118,22 @@ func offerFirstPush(out *os.File, dir, url, shown string, yes bool) (code int, h
 		return 0, false
 	}
 	user, authed := ghAccount()
-	if !authed {
+	if !authed && !ghSaysSignedOut() {
+		// `gh auth status` failed for some other reason — offline, a proxy, a gh
+		// too old or broken to answer (G971). Telling a signed-in learner to log
+		// in would be a false diagnosis: fall through to the neutral answer.
 		return 0, false
+	}
+	if !authed {
+		// gh is here and one login away (G962). Falling through printed "remote
+		// already set — nothing to create" and a bare first push, which asks for
+		// the password GitHub refuses. gh's own login is the step; this command,
+		// run again, then finishes the push. Nothing runs from here.
+		fmt.Fprintf(out, "remote set → %s — never pushed from here, and gh is installed but not signed in.\n", shown)
+		fmt.Fprintln(out, "sign gh in, then run this again — it pushes with gh's login in one confirm:")
+		fmt.Fprintln(out, "  gh auth login")
+		fmt.Fprintln(out, "  sboot repo")
+		return 0, true
 	}
 	slug := owner + "/" + name
 	state := ghRepoState(slug)

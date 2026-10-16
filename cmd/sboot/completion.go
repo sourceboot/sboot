@@ -5,8 +5,9 @@ package main
 // harness/go.mod keeps zero requires. The table does not gate anything — the
 // dispatcher's own `default:` refuses an unknown command. What keeps the two
 // from drifting is completion_test.go: it holds the table's names equal to the
-// dispatcher's `case` labels (less the `update` alias, which is not offered) and
-// each command's flags equal to the per-command guards in parseCommon (G665, G670).
+// dispatcher's `case` labels (the `update` alias included since G752: a word the
+// dispatcher answers is a word the prompt offers) and each command's flags equal
+// to the per-command guards in parseCommon — an alias's, its target's (G665, G670).
 
 import (
 	"fmt"
@@ -38,6 +39,7 @@ var commandTable = []commandSpec{
 	{"fetch", nil},
 	{"where", nil},
 	{"upgrade", []string{"--force"}},
+	{"update", []string{"--force"}}, // the alias the dispatcher answers (G752)
 	{"completion", nil},
 	{"version", nil},
 	{"help", []string{"--all"}},
