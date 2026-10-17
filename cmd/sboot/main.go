@@ -1715,6 +1715,10 @@ func platformAnswerCode(status int) int {
 	return exitPlatform
 }
 
+// completedLabHint is the practice line's tail on a lab already Completed: neither
+// another submit nor Complete (G1001; the platform's practice hint says the same, G1002).
+const completedLabHint = "this lab is already complete; bare `sboot` names the next one"
+
 type practiceResp struct {
 	OK   bool   `json:"ok"`
 	User string `json:"user"`
@@ -1784,7 +1788,22 @@ func reportPractice(course, stage string, score, max int, passed bool, detail st
 		w = os.Stderr
 	}
 	if passed {
-		fmt.Fprintf(w, "\n→ practice run recorded ✅ — %s\n", r.Hint)
+		hint := r.Hint
+		// After a PASSED official grade this machine knows of (G1001, #31's
+		// follow-up): Complete is the step, not another submit, whatever an
+		// older platform's hint still says. currentNext's url is set exactly then.
+		// A lab this machine knows is Completed gets neither line (the platform's
+		// own answer since G1002), whatever record of a submit it still holds. The
+		// record overrides only the old submit hint: a platform that already says
+		// something else (Complete, or the lab is complete) knows better than a
+		// record written before the last web Complete.
+		st := loadState()
+		if st.isVerified(course, stage) {
+			hint = completedLabHint
+		} else if next, _, url := currentNext(st, course, stage); url != "" && strings.Contains(r.Hint, "sboot submit") {
+			hint = "your official grade already passed, so " + next + ": " + url
+		}
+		fmt.Fprintf(w, "\n→ practice run recorded ✅ — %s\n", hint)
 	} else {
 		fmt.Fprintf(w, "\n→ practice run recorded (%d/%d) — keep going.\n", score, max)
 	}
@@ -1909,7 +1928,9 @@ func submit(r repo, stage string, ga gradedArgs) int {
 	// Ask whether this stage is even open to us before spending a build and a boot
 	// on it. Being told "finish the previous lab first" after a two-minute local
 	// run is the one bad outcome the gate creates, and one cheap GET removes it.
-	if ae := submitPreflight(course, stage); ae != nil {
+	// Its answer also carries this run's nonce for a lab that boots with one.
+	nonce, ae := submitPreflightNonce(course, stage)
+	if ae != nil {
 		if ae.status == http.StatusUnauthorized {
 			reportSubmitAuthFailure(ae.msg, false)
 			return 2
@@ -1955,7 +1976,7 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		freshDefault = previousVerifiedLab(st, course, stage)
 	}
 
-	res := runGrader(run, course, stage, st.tierSpec(course, stage), capturePath, r.tree)
+	res := runGraderNonce(run, course, stage, st.tierSpec(course, stage), capturePath, r.tree, nonce)
 
 	// THE LADDER COUNTER (the failure-guidance spec), and the decision behind it.
 	//
@@ -2252,6 +2273,17 @@ func submit(r repo, stage string, ga gradedArgs) int {
 			// ReviewURL present it IS the server's URL — one mechanism, both verdicts.
 			fmt.Fprintf(vw, "  Submitted → %s\n", submissionLink(created.ReviewURL, course, stage, created.ID))
 			fmt.Fprintln(vw, "  read your review, then press Complete there — that's what finishes the lab")
+			// And bare `sboot` must say the same thing next, offline included: this
+			// stage is submitted, not verified (G972/G994). The next online answer
+			// that carries `passed_submissions` replaces the record.
+			score := ""
+			if deref(created.MaxScore) > 0 {
+				score = fmt.Sprintf("%d/%d", deref(created.Score), deref(created.MaxScore))
+			}
+			st.markSubmitted(course, stage, score, submissionLink(created.ReviewURL, course, stage, created.ID))
+			if err := st.save(); err != nil {
+				debugf("could not save state: %v", err)
+			}
 			return 0
 		}
 		// Keep the offline orientation truthful without a round trip: this stage
@@ -2373,38 +2405,47 @@ func reportGateFailure(stage, freshDefault string, res graderRun) {
 	fmt.Fprintf(os.Stderr, "     sboot submit %s --force\n", stage)
 }
 
-// submitPreflight asks the platform whether it would accept a submission for this
-// stage, before the gate spends a build and a boot on one it will refuse.
+// submitPreflightNonce asks the platform whether it would accept a submission
+// for this stage, before the gate spends a build and a boot on one it will refuse.
 //
 // DELIBERATELY PERMISSIVE: this is an optimisation, not a gate. Only an explicit
 // refusal counts; offline, a 5xx, or a platform too old to answer GET here all
 // return nil and the normal path continues, where the POST is still what decides.
 // `sboot submit` must never start refusing because of a network blip, and the
 // local check itself works with no network at all.
-func submitPreflight(course, stage string) *apiError {
+//
+// It also returns the run's NONCE, when the platform
+// issued one (2026-10-16, kernel-in-rust CONTRACT §A.2; ledger `G977`): the
+// additive `nonce` field of the preflight's `{ ok: true }`, 32 lowercase hex
+// characters. Anything else — no field, an older platform, a malformed value, no
+// answer at all — is "", and the run then boots with a nonce the engine draws
+// itself, which the platform refuses by name for a rubric that needs one. Only a
+// 200 is read for it: a refusal carries no nonce.
+func submitPreflightNonce(course, stage string) (string, *apiError) {
 	// SBOOT_OFFLINE promises "skip every network call", and this call is the
 	// easiest one to honor it with: it is an optimisation, and skipping it just
 	// means the POST decides. (Unreachable since 2026-10-04: submit refuses under
 	// SBOOT_OFFLINE before it gets here, G506. Until then this said the POST would
 	// decide by failing to send, which was only true on a machine really offline.)
 	if offline() {
-		return nil
+		return "", nil
 	}
 	url := fmt.Sprintf("%s/api/v1/submissions?course=%s&stage=%s", apiURL(), course, stage)
 	req, err := authedRequest("GET", url, nil)
 	if err != nil {
 		debugf("preflight: %v", err)
-		return nil
+		return "", nil
 	}
 	resp, err := send(&http.Client{Timeout: 10 * time.Second}, req)
 	if err != nil {
 		debugf("preflight: %v", err)
-		return nil
+		return "", nil
 	}
 	defer resp.Body.Close()
 	var r struct {
 		Err       string `json:"error"`
 		RenamedTo string `json:"renamed_to"`
+		Nonce     string `json:"nonce"`
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&r)
 	switch resp.StatusCode {
@@ -2412,7 +2453,7 @@ func submitPreflight(course, stage string) *apiError {
 		if r.Err == "" {
 			r.Err = "refused"
 		}
-		return &apiError{status: resp.StatusCode, msg: r.Err}
+		return "", &apiError{status: resp.StatusCode, msg: r.Err}
 	case http.StatusGone:
 		// A RENAMED COURSE (410 Gone, lib/api-gate.ts renamedResponse). On this route
 		// it can mean nothing else: the workspace's `course = "…"` names an id that
@@ -2429,7 +2470,7 @@ func submitPreflight(course, stage string) *apiError {
 			if msg == "" {
 				msg = fmt.Sprintf("this course was renamed to %q — edit course = %q in your workspace's sboot.toml", r.RenamedTo, r.RenamedTo)
 			}
-			return &apiError{status: resp.StatusCode, msg: msg, renamedTo: r.RenamedTo}
+			return "", &apiError{status: resp.StatusCode, msg: msg, renamedTo: r.RenamedTo}
 		}
 	case http.StatusNotFound:
 		// 404 is ambiguous in a way the others are not: it is our "unknown course or
@@ -2437,10 +2478,29 @@ func submitPreflight(course, stage string) *apiError {
 		// GET handler. Refuse only when the body says why — an empty 404 falls through
 		// to the POST rather than making a working submit stop working.
 		if r.Err != "" {
-			return &apiError{status: resp.StatusCode, msg: r.Err}
+			return "", &apiError{status: resp.StatusCode, msg: r.Err}
+		}
+	case http.StatusOK:
+		if validNonce(r.Nonce) {
+			return r.Nonce, nil
 		}
 	}
-	return nil
+	return "", nil
+}
+
+// validNonce is the engine's own rule (grader/nonce.go ValidNonce), restated here
+// because harness/ links nothing of the engine's: 32 lowercase hex characters.
+// The value goes on the engine's command line, so the CLI passes nothing else.
+func validNonce(s string) bool {
+	if len(s) != 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // submitBody packs a submission: the source tarball, and the capture of the boot

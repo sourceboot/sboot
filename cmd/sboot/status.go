@@ -201,6 +201,22 @@ func (a attemptRow) stage() string {
 type completionsData struct {
 	handle   string
 	attempts []attemptRow // newest first, as the server orders them
+	// The answer's `passed_submissions`, every course's when the fetch was
+	// unscoped (filtered per course by syncFromAttempts, as the rows are). nil when
+	// the platform sent no such key (one from before #31): unknown, not none.
+	passed *[]passedSubmission
+}
+
+// passedSubmission is one stage's newest PASSED official grade, as GET
+// /api/v1/completions appends it (2026-10-16, sprint 3 #31, ledger G972): the
+// row lib/db.ts latestPassedSubmissions answers, the same one G499 reads its
+// pair from. ADDED (/api/v1 is append-only): an older platform sends no key.
+type passedSubmission struct {
+	CourseID string `json:"course_id"`
+	StageID  string `json:"stage_id"`
+	ID       string `json:"id"`
+	Score    int    `json:"score"`
+	MaxScore int    `json:"max_score"`
 }
 
 // fetchCompletions asks the platform for this account's attempts. `course` may
@@ -225,9 +241,10 @@ func fetchCompletions(course string) (*completionsData, error) {
 	}
 	defer resp.Body.Close()
 	var r struct {
-		User     string       `json:"user"`
-		Attempts []attemptRow `json:"attempts"`
-		Err      string       `json:"error"`
+		User     string              `json:"user"`
+		Attempts []attemptRow        `json:"attempts"`
+		Passed   *[]passedSubmission `json:"passed_submissions"`
+		Err      string              `json:"error"`
 	}
 	decodeErr := json.NewDecoder(resp.Body).Decode(&r)
 	// The status first, the body only for its message (G768): a 401 whose body is
@@ -242,7 +259,7 @@ func fetchCompletions(course string) (*completionsData, error) {
 	if decodeErr != nil {
 		return nil, fmt.Errorf("HTTP %d: %w", resp.StatusCode, decodeErr)
 	}
-	d := &completionsData{handle: r.User}
+	d := &completionsData{handle: r.User, passed: r.Passed}
 	for _, a := range r.Attempts {
 		if course != "" && a.course() != course {
 			continue
@@ -284,6 +301,28 @@ func syncFromAttempts(d *completionsData, course string) *courseSync {
 		}
 		if cs.LastAttempt == "" {
 			cs.LastAttempt = a.stage()
+		}
+	}
+	// Submitted, not Completed (G972): a stage with a passed submission and no
+	// verified row. Only when the answer said (d.passed non-nil); mergeSync keeps
+	// the cached map when it did not.
+	if d.passed != nil {
+		cs.submittedKnown = true
+		for _, p := range *d.passed {
+			if p.CourseID != course || p.StageID == "" {
+				continue
+			}
+			if _, done := cs.Verified[p.StageID]; done {
+				continue
+			}
+			if cs.Submitted == nil {
+				cs.Submitted = map[string]*submittedGrade{}
+			}
+			g := &submittedGrade{URL: submissionLink("", course, p.StageID, p.ID)}
+			if p.MaxScore > 0 {
+				g.Score = fmt.Sprintf("%d/%d", p.Score, p.MaxScore)
+			}
+			cs.Submitted[p.StageID] = g
 		}
 	}
 	return cs
@@ -690,7 +729,11 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 		}
 		if current != nil {
 			out["current"] = current.Stage
-			out["next"], _ = currentNext(st, r.course, current.Stage)
+			next, _, url := currentNext(st, r.course, current.Stage)
+			out["next"] = next
+			if url != "" {
+				out["complete_url"] = url
+			}
 		}
 		return statusJSON(out)
 	}
@@ -805,9 +848,15 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 
 	switch {
 	case current != nil:
-		next, why := currentNext(st, r.course, current.Stage)
+		next, why, url := currentNext(st, r.course, current.Stage)
 		fmt.Printf("next:  %s%s%s\n", p(ansiGreen, next), strings.Repeat(" ", max(3, 25-len(next))), p(ansiDim, why))
-		fmt.Printf("stuck: sboot hint · read: %s/courses/%s/stages/%s\n", siteURL(), r.course, current.Stage)
+		if url != "" {
+			// Graded and passed: the page Complete is on, where `stuck:` would be;
+			// there is nothing left to be stuck on (G972).
+			fmt.Printf("       %s\n", url)
+		} else {
+			fmt.Printf("stuck: sboot hint · read: %s/courses/%s/stages/%s\n", siteURL(), r.course, current.Stage)
+		}
 	case frontierNext != nil:
 		fmt.Printf("all live labs verified. lab %s is being built — `sboot courses` will show it the day it lands.\n",
 			labNumber(frontierNext.Stage))
@@ -821,22 +870,41 @@ func repoStatus(st *guidanceState, r repo, jsonOut bool) int {
 
 // currentNext is the in-workspace screen's next move on the current lab: `sboot
 // test`, or — when the last practice run scored full marks with nothing failing —
-// the `sboot submit <stage>` that run itself just named (QA WK1-C-6, G920).
+// the `sboot submit <stage>` that run itself just named (QA WK1-C-6, G920), or —
+// once an official grade on it PASSED and the lab is not yet Completed — Complete
+// on the lab page, the only writer of a completion (QA DC16B-1, G972). url is that
+// page (the submission's Code Review deep link), "" for the other two.
+//
+// The submitted state beats the practice score either way: a passed official grade
+// stands whatever this machine ran since, and a second submit finishes nothing.
 //
 // The nudge comes off a run on THIS machine (G960): the server's practice row may
 // be another machine's, and a fresh clone of the workspace is a tree of stubs
 // whose `lastFailed` is empty only because nothing ran here. So only the local
 // score (state.json's, written by every graded run here) is read; the progress
 // list's ticks keep their own fallback to the server's.
-func currentNext(st *guidanceState, course, stage string) (next, why string) {
+func currentNext(st *guidanceState, course, stage string) (next, why, url string) {
+	if cs := st.Sync[course]; cs != nil {
+		if g := cs.Submitted[stage]; g != nil {
+			why = "# official grade passed — Complete finishes the lab"
+			if g.Score != "" {
+				why = "# official grade " + g.Score + " passed — Complete finishes the lab"
+			}
+			url = g.URL
+			if url == "" {
+				url = fmt.Sprintf("%s/courses/%s/stages/%s", siteURL(), course, stage)
+			}
+			return "press Complete on the lab page", why, url
+		}
+	}
 	lp := st.LastScore[course+"/"+stage]
 	var got, of int
 	if n, _ := fmt.Sscanf(lp, "%d/%d", &got, &of); n == 2 && of > 0 && got == of {
 		if failing, _ := st.lastFailed(course, stage); len(failing) == 0 {
-			return "sboot submit " + stage, "# practice passed — the official grade"
+			return "sboot submit " + stage, "# practice passed — the official grade", ""
 		}
 	}
-	return "sboot test", "# grades " + stage
+	return "sboot test", "# grades " + stage, ""
 }
 
 // outOfRepoStatus is the S2/B3 view: who you are, your courses, how to start.

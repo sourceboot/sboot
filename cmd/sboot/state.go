@@ -202,6 +202,25 @@ type courseSync struct {
 	// field, by `sboot start`'s seed, or with no handle in the answer — and such
 	// a cache is replaced, never merged.
 	Handle string `json:"handle,omitempty"`
+	// stage id -> the newest PASSED official grade on a stage not yet verified:
+	// submitted, not yet Completed (2026-10-16, sprint 3 #31, ledger G972). What
+	// turns bare `sboot`'s `next:` from `sboot submit` into Complete on the lab
+	// page, the only writer of a completion. Filled from the completions answer's
+	// appended `passed_submissions` (server truth), and by `sboot submit`'s own
+	// pass on this machine (markSubmitted), so the very next screen is right even
+	// offline. Append-only and omitempty, like every field here: an older binary
+	// ignores it.
+	Submitted map[string]*submittedGrade `json:"submitted,omitempty"`
+	// Whether the answer this was built from SAID which stages have a passed
+	// submission: false for a platform from before #31, which sends no
+	// `passed_submissions` key (unknown, not none). Never serialized.
+	submittedKnown bool
+}
+
+// submittedGrade is one passed, not-yet-Completed official grade.
+type submittedGrade struct {
+	Score string `json:"score,omitempty"` // "16/16"; "" when the maximum is unknown
+	URL   string `json:"url,omitempty"`   // the submission's Code Review page, where Complete lives
 }
 
 // catalogCache is the course catalog as of the last successful fetch.
@@ -817,9 +836,41 @@ func (s *guidanceState) mergeSync(course string, fresh *courseSync, handle strin
 			fresh.Verified[stage] = score
 			delete(fresh.Practice, stage)
 		}
+		// SUBMITTED IS NOT VERIFIED: it shrinks. An answer that carries
+		// `passed_submissions` is the whole truth and replaces the map (a reset
+		// deletes the submissions, and the list comes back empty). Only an answer
+		// WITHOUT the key — a platform from before #31 — keeps what this machine
+		// knew, so a new CLI against an older platform does not wipe its own
+		// submit's record and send the learner back to `sboot submit` (G997).
+		if !fresh.submittedKnown && len(old.Submitted) > 0 {
+			fresh.Submitted = map[string]*submittedGrade{}
+			for stage, g := range old.Submitted {
+				fresh.Submitted[stage] = g
+			}
+		}
+	}
+	for stage := range fresh.Verified { // a Completed lab is past Complete
+		delete(fresh.Submitted, stage)
 	}
 	s.setSync(course, fresh)
 	return fresh
+}
+
+// markSubmitted records a passing official grade that is not yet Completed — called
+// by `sboot submit` on a pass with a review URL, so the next bare `sboot` (offline
+// included) names Complete instead of the submit that just ran (G994). The next
+// online answer that carries `passed_submissions` replaces it.
+func (s *guidanceState) markSubmitted(course, stage, score, url string) {
+	cs := s.Sync[course]
+	if cs == nil {
+		cs = &courseSync{Verified: map[string]string{}}
+		s.Sync[course] = cs
+	}
+	if cs.Submitted == nil {
+		cs.Submitted = map[string]*submittedGrade{}
+	}
+	cs.Submitted[stage] = &submittedGrade{Score: score, URL: url}
+	s.dirty = true
 }
 
 // markVerified folds one freshly verified stage into the cache — called when a

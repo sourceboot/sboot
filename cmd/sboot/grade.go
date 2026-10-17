@@ -109,6 +109,18 @@ type taskRow struct {
 // staging spelling into the learner's (retree.go, F00-1), and nothing else
 // reads it.
 func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderRun {
+	return runGraderNonce(runDir, course, labID, tierSpec, captureOut, tree, "")
+}
+
+// runGraderNonce is runGrader for `sboot submit`, which holds the run's NONCE —
+// the token the platform issued on the submit preflight (kernel-in-rust CONTRACT
+// §A.2; ledger `G977`). It is handed to the engine as `grade --nonce` ONLY when
+// `resolve --grader` printed `nonce=1`: that line says the rubric boots with a
+// nonce AND that this engine takes the flag, so no engine older than the channel
+// is ever handed an argument it would refuse. With no nonce in hand (an older
+// platform, a preflight that did not answer) the engine draws its own, and the
+// platform refuses that upload by name — a run it did not issue the nonce for.
+func runGraderNonce(runDir, course, labID, tierSpec, captureOut, tree, nonce string) graderRun {
 	run := graderRun{}
 
 	// ── The engine ─────────────────────────────────────────────────────────────
@@ -309,6 +321,9 @@ func runGrader(runDir, course, labID, tierSpec, captureOut, tree string) graderR
 	if captureOut != "" {
 		args = append(args, "--capture-out", captureOut)
 	}
+	if nonce != "" && labGrader.nonce {
+		args = append(args, "--nonce", nonce)
+	}
 	// THE TASK LIST, WHEN THE LAB HAS ONE. The bundle of a converted lab carries
 	// tasks.json (grader/tasks.go); only then is the engine asked, so a bare
 	// `sboot test` on an unconverted lab sends the argv it always sent. An engine
@@ -501,6 +516,9 @@ func fileExists(p string) bool {
 type labGraderManifest struct {
 	build    string
 	artifact string
+	// nonce: the engine printed `nonce=1` — the rubric boots with a nonce and the
+	// engine takes `grade --nonce` (2026-10-16). False from every older engine.
+	nonce bool
 }
 
 // resolveLab runs `sboot-judge resolve --grader` and parses the lab directory
@@ -509,6 +527,7 @@ type labGraderManifest struct {
 //	<lab dir>
 //	build=<cmd or empty>
 //	artifact=<rel or empty>
+//	nonce=<1|0>        (engines from 2026-10-16 on; absent before)
 //
 // An engine cached before the flag existed exits 2 on it, so ANY exit failure is
 // retried once without the flag — course-level values then apply, which is
@@ -552,6 +571,8 @@ func resolveLab(engine, runDir, course, labID string) (labDir string, lg labGrad
 			lg.build = strings.TrimSpace(strings.TrimPrefix(l, "build="))
 		case strings.HasPrefix(l, "artifact="):
 			lg.artifact = strings.TrimSpace(strings.TrimPrefix(l, "artifact="))
+		case l == "nonce=1":
+			lg.nonce = true
 		}
 		// Unknown lines are ignored on purpose: the record list is append-only,
 		// and a CLI on a learner's machine must keep parsing a newer engine's
