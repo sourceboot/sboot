@@ -119,6 +119,16 @@ type guidanceState struct {
 	// Only a fingerprint is stored, never the compiler's text: BuildOut above
 	// already holds that, and is cleared with the failure it describes.
 	BuildHints map[string]*buildHintMark `json:"build_hints,omitempty"`
+	// "course/stage/check-id" -> how deep `sboot hint` has gone into the STUB-STATE
+	// ladder for a check whose last run stopped at a `todo!()` (stubhint.go,
+	// 2026-10-19, G1173), and for which FILE's `todo!()` (the sig; never the line).
+	//
+	// Its own counter, apart from Rungs, because the stub ladder is not the check's
+	// ladder: while a body is unwritten the check's own rungs are not spent, and
+	// unlike Rungs this one RESETS — recordListed drops it the moment a graded run's
+	// evidence for that check carries no `todo!()` panic (the panic is gone). Only
+	// the file is stored, never the evidence.
+	StubHints map[string]*buildHintMark `json:"stub_hints,omitempty"`
 	// course -> the stage of the most recent LOCAL run that produced no verdict at
 	// all, cleared by the next run in that course that grades anything.
 	//
@@ -268,6 +278,7 @@ func loadState() *guidanceState {
 		RunError:   map[string]string{},
 		BuildOut:   map[string]string{},
 		BuildHints: map[string]*buildHintMark{},
+		StubHints:  map[string]*buildHintMark{},
 		Blocked:    map[string]string{},
 		Sync:       map[string]*courseSync{},
 		LastScore:  map[string]string{},
@@ -310,6 +321,9 @@ func loadState() *guidanceState {
 	}
 	if loaded.BuildHints != nil {
 		s.BuildHints = loaded.BuildHints
+	}
+	if loaded.StubHints != nil {
+		s.StubHints = loaded.StubHints
 	}
 	if loaded.Blocked != nil {
 		s.Blocked = loaded.Blocked
@@ -444,6 +458,7 @@ func (s *guidanceState) recordListed(course, stage string, checks []localCheck, 
 				delete(s.Evidence, k)
 				s.dirty = true
 			}
+			s.clearStubHint(k)
 			continue
 		}
 		if c.pass {
@@ -460,6 +475,12 @@ func (s *guidanceState) recordListed(course, stage string, checks []localCheck, 
 			s.Fails[k]++
 			s.dirty = true
 			s.setEvidence(k, c.evidence)
+		}
+		// The stub ladder belongs to the `todo!()` it climbed (G1173): a run whose
+		// evidence for this check carries none — it passed, or it now fails on its
+		// merits — ends it, so the same stub met again later starts at the top.
+		if _, stubbed := classifyStub(s.Evidence[k]); !stubbed || c.pass {
+			s.clearStubHint(k)
 		}
 	}
 	if !haveIDs {

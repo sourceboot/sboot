@@ -399,9 +399,10 @@ build/
 // fallback is ALSO `cargo xtask build`, and its repo is stable Rust with the
 // workspace at `os/`, so the os-rust text ("nightly", `cd os/kernel && cargo
 // build --release`) would be false in every particular. Anything not matching
-// a known pair gets an honest section built around its actual command. A blank
-// command cannot happen (the default fills it), but an unrecognisable one
-// still names itself rather than guessing at a toolchain lecture.
+// a known pair gets an honest section built around its actual command — printed
+// only when that command runs in the learner's repo as written (runsInRepo), and
+// otherwise pointing at `sboot test`, which always does (S3D-1). A blank command
+// cannot happen (the default fills it).
 //
 // TWO THINGS THE GENERIC BRANCH GOT WRONG until 2026-08-23 (dogfood F00-3), both
 // because it took the command from the manifest and nothing else from anywhere:
@@ -448,6 +449,18 @@ and checks the markers.
 	if courseBoots(course) {
 		emulator = ", plus " + "`qemu-system-x86_64`" + " to run what it builds"
 	}
+	if !runsInRepo(build) {
+		// The command is the COURSE'S, not the repo's (S3D-1, 2026-10-21): naming it
+		// would hand the learner `error: no such command: xtask`. `sboot test` is the
+		// learner's interface (Puneet, 2026-10-03), so it is the build line here.
+		return `## Build it
+
+` + "`sboot test`" + ` builds it for you, with the same build the official grade uses (see
+*Grade it* below).
+
+` + toolchain + emulator + `.
+`
+	}
 	return `## Build it
 
 The course builds with one command — the same one ` + "`sboot test`" + ` runs for you:
@@ -456,6 +469,60 @@ The course builds with one command — the same one ` + "`sboot test`" + ` runs 
 
 ` + toolchain + emulator + `.
 `
+}
+
+// runsInRepo reports whether a course's build command, written against the
+// grader's staging root, also runs in the learner's repo as written once
+// repoBuildCmd has renamed the tree — which is the only case in which the README
+// may print it (S3D-1, 2026-10-21).
+//
+// The staging root holds more than the learner's tree: the course-owned `xtask/`
+// and the `.cargo/config.toml` whose alias makes `cargo xtask` a command. None of
+// that is in the repo, so `cargo xtask image` (kernel-in-rust) and the default
+// `cargo xtask build` (x86-64-essentials, which has no `grader:` block) answered
+// `error: no such command: xtask` in every repo that printed them. A command runs
+// in the repo only when BOTH hold:
+//   - its program is one the repo can answer: `make`, or `cargo` with a subcommand
+//     built into cargo (an alias or a `cargo-<x>` plugin is course tooling);
+//   - it addresses the learner's tree by path (`--manifest-path os/…`, `-C os`),
+//     because a command that names no path builds whatever the staging root's
+//     own manifest is, and that manifest is not in the repo either.
+//
+// Deliberately an allowlist: an unrecognised command falls back to `sboot test`,
+// which is always true, rather than to a line that might not run. The test
+// holding this (TestTheReadmeBuildLineRunsInTheLearnersRepo, G1335) checks every
+// committed course template against what the README names.
+func runsInRepo(build string) bool {
+	fields := strings.Fields(build)
+	if len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "make":
+	case "cargo":
+		if len(fields) < 2 || !cargoBuiltin[fields[1]] {
+			return false
+		}
+	default:
+		return false
+	}
+	for _, f := range fields[1:] {
+		if _, val, ok := strings.Cut(f, "="); ok {
+			f = val
+		}
+		if f == stagedTree || strings.HasPrefix(f, stagedTree+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// cargoBuiltin is the cargo subcommands that need nothing but a manifest — the
+// ones a course's build could plausibly be. Anything else is resolved through an
+// alias or a plugin, which is course tooling and not in the repo.
+var cargoBuiltin = map[string]bool{
+	"build": true, "check": true, "test": true, "run": true,
+	"clippy": true, "doc": true, "bench": true, "rustc": true,
 }
 
 func readme(course, title, firstStage, tree, build string) string {

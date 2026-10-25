@@ -930,9 +930,15 @@ func reportPracticeFailure(err error) {
 // it needs the same tools practice does.
 func reportGraderMissing(r repo, err error) {
 	tool := missingTool(err)
-	if tool == "" {
+	switch {
+	case tool == "":
 		fmt.Fprintf(os.Stderr, "sboot: could not run the grader: %v\n", err)
-	} else {
+	case tool == emulatorBinary:
+		// The run stops before the boot (G1451): say that nothing was scored, since
+		// the course's first lab is about exactly this tool and a score would read
+		// as a verdict on the learner's kernel.
+		fmt.Fprintf(os.Stderr, "sboot: %s is not installed (or is not on your PATH), and this lab boots your kernel in it — nothing ran, nothing was scored.\n", tool)
+	default:
 		fmt.Fprintf(os.Stderr, "sboot: %s is not installed (or is not on your PATH).\n", tool)
 	}
 	for _, line := range installHint(tool, rustChannel(r.dir)) {
@@ -943,6 +949,11 @@ func reportGraderMissing(r repo, err error) {
 		// Windows: the tool IS installed and this shell's PATH predates it
 		// (D-WIN-2 — the lab page says "open a new terminal"; the tool never did).
 		fmt.Fprintf(os.Stderr, "sboot:   %s\n", newTerminalNote())
+	}
+	if tool == emulatorBinary && r.course != "" {
+		// What the whole course needs, on the course page that renders it (the
+		// manifest's `requirements`, its "What do I need on my machine?" answer).
+		fmt.Fprintf(os.Stderr, "sboot:   what this course needs on your machine: %s/courses/%s#faq\n", siteURL(), r.course)
 	}
 }
 
@@ -2793,8 +2804,9 @@ func printFirstLab(course, dest, firstStage, firstTitle string) {
 	}
 	p := painter(os.Stdout)
 	current, fr := labInfo{}, (*frontierInfo)(nil)
+	var st *guidanceState
 	if !offline() {
-		st := loadState()
+		st = loadState()
 		lab, f, _, err := currentLab(st, course)
 		saveQuietly(st)
 		if err == nil {
@@ -2824,12 +2836,27 @@ func printFirstLab(course, dest, firstStage, firstTitle string) {
 	if firstStage != "" && firstTest != firstStage {
 		verb = "pick up at"
 	}
+	// The move is the one bare `sboot` names on the same lab (QA WK2-C-1, G1450):
+	// once an official grade on it PASSED and the lab is not yet Completed, that is
+	// Complete on the submission's page (G972), not another `sboot test`. Only that
+	// state is taken from currentNext — the one with a page to name — and only off
+	// the sync the current-lab rule just filled; offline the block is unchanged.
+	next, why, url := "sboot test", "# grades "+firstTest, ""
+	if st != nil && current.Stage == firstTest {
+		if n, w, u := currentNext(st, course, firstTest); u != "" {
+			next, why, url = n, w, u
+			verb = "finish"
+		}
+	}
 	fmt.Printf("\n%s lab %s — %s:\n", verb, labNumber(firstTest), p(ansiAmber, headline))
 	if dest != "." {
 		fmt.Printf("  cd %s\n", dest)
 	}
-	fmt.Printf("  %s                  %s\n", p(ansiGreen, "sboot test"), p(ansiDim, "# grades "+firstTest))
-	fmt.Printf("  %s/courses/%s/stages/%s\n", siteURL(), course, firstTest)
+	fmt.Printf("  %s%s%s\n", p(ansiGreen, next), strings.Repeat(" ", max(3, 28-len(next))), p(ansiDim, why))
+	if url == "" {
+		url = fmt.Sprintf("%s/courses/%s/stages/%s", siteURL(), course, firstTest)
+	}
+	fmt.Printf("  %s\n", url)
 }
 
 // fetchWorkspace downloads the course's starter tree into `dest`.

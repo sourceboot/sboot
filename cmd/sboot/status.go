@@ -328,7 +328,10 @@ func syncFromAttempts(d *completionsData, course string) *courseSync {
 	return cs
 }
 
-// startedCourses lists course ids by most-recent activity, newest first.
+// startedCourses lists course ids by most-recent activity, newest first: every
+// course with a practice run or an official grade in the answer. A course whose
+// only record is a passed official grade (no attempt row, G1331) comes after the
+// ones with attempts, since a passed submission carries no time to order it by.
 func startedCourses(d *completionsData) []string {
 	var out []string
 	seen := map[string]bool{}
@@ -336,6 +339,14 @@ func startedCourses(d *completionsData) []string {
 		if c := a.course(); !seen[c] {
 			seen[c] = true
 			out = append(out, c)
+		}
+	}
+	if d.passed != nil {
+		for _, p := range *d.passed {
+			if c := p.CourseID; c != "" && p.StageID != "" && !seen[c] {
+				seen[c] = true
+				out = append(out, c)
+			}
 		}
 	}
 	return out

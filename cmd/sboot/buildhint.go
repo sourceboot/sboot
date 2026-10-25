@@ -15,13 +15,23 @@
 // The build's output is already recorded (buildlog.go → state.json BuildOut). This
 // takes the FIRST compiler error from it and finds authored text for THIS lab:
 //
+//  0. since 2026-10-19 (sprint 3 #34, G1170): the lab's OWN build ladder,
+//     hints.json `labs.<stage>.build`, selected by the stage's name. Where a lab
+//     authors one it is the whole answer — its evidence rules (any diagnostic
+//     text, not only codes), its l1, its l2 — and steps 1–3 are never consulted,
+//     so a build failure there never gets a check's test-failure text. Steps 1–3
+//     are the fallback for a lab that authors none, until every live course has
+//     (plan.md "Retire compileTalkRe"):
+//
 //  1. an `evidence` rule on a compile-shaped check (`*.compiles`, or a `*.suite`
 //     whose ladder talks about a crate that does not compile) that matches the
 //     first error's own diagnostic text;
+//
 //  2. failing that, an evidence rule on any other check of this lab — but only a
 //     rule keyed on a rustc error CODE (`E0308`), because a rule written for a
 //     test's panic ("assertion", `_ "`) must never fire on compiler output that
 //     happens to contain the same characters;
+//
 //  3. failing that, the lab's compile-shaped check itself, with no evidence line.
 //
 // and serves it as a ladder, one step deeper per ask: the first error quoted →
@@ -381,16 +391,35 @@ func runBuildHint(r repo, stage, run string, st *guidanceState, buildOut, stuckU
 	quoted := quotedCompileError(ce, run, r.tree)
 
 	checkID, evidence := "", ""
+	var ladder *hintEntry
 	hf := loadHintsFile(run)
 	if hf != nil && compilerShaped(ce) {
-		checkID, evidence = selectBuildGuidance(*hf, labCheckIDs(run, stage), ce)
+		if lb := hf.Labs[stage].Build; lb != nil {
+			// THE LAB'S OWN BUILD LADDER, selected by the stage's name (G1170; the
+			// TPM's Q1/Q2 rulings, 2026-10-19). Where a lab authors one it is the
+			// whole answer: no check's text is consulted — not a `*.suite` whose
+			// ladder happens to talk about compiling, not a sibling row's E-code
+			// rule, not any check's l1/l2. Its evidence rules are written FOR
+			// compiler output, so any of them may match the diagnostic's text (lab
+			// 08's `lifetime may not live long enough` has no code), not only codes.
+			ladder, evidence = lb, selectEvidence(lb.Evidence, ce.Match)
+		} else {
+			// No build ladder authored for this lab: the 2026-09-13 selection over
+			// its checks, compileTalkRe included, until every live course has
+			// authored its build ladders (plan.md "Retire compileTalkRe").
+			checkID, evidence = selectBuildGuidance(*hf, labCheckIDs(run, stage), ce)
+			if checkID != "" {
+				e := hf.Checks[checkID]
+				ladder = &e
+			}
+		}
 	}
-	if checkID == "" {
+	if ladder == nil {
 		return renderUnhintedBuild(stage, quoted, stuckURL),
 			hintShown{check: buildCheck, rung: 0, kind: "build_unhinted"}, true
 	}
 
-	tiers := buildTiers(hf.Checks[checkID], evidence)
+	tiers := buildTiers(*ladder, evidence)
 	ask := st.bumpBuildHint(r.course, stage, ce.fingerprint())
 	shown = hintShown{check: buildCheck, rung: "past", kind: "build"}
 	if ask <= len(tiers) {
@@ -417,7 +446,7 @@ func renderBuildLadder(stage, checkID string, ce compileError, quoted []string, 
 	}
 	t := tiers[ask-1]
 	header := fmt.Sprintf("[hint %d of %d · build]", ask, n)
-	if t.rung == 1 || t.rung == 2 {
+	if checkID != "" && (t.rung == 1 || t.rung == 2) {
 		// The authored ladder it came from is named, so the learner can ask for
 		// the same check by id once their crate builds.
 		header = fmt.Sprintf("[hint %d of %d · build · %s]", ask, n, checkID)

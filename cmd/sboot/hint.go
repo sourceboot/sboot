@@ -117,6 +117,23 @@ func selectEvidence(rules []evidenceRule, observed string) string {
 // `_comment` and any future keys are ignored by construction.
 type hintsFile struct {
 	Checks map[string]hintEntry `json:"checks"`
+	// Per-LAB ladders, keyed by the full stage id (2026-10-19, sprint 3 #34; the
+	// TPM's Q1 ruling (a)): `build` is the lab's BUILD ladder, the one a compile
+	// error is answered from (buildhint.go — selected by the stage's name, never by
+	// a guess over a check's text), and `stub` the stub-state ladder a check gets
+	// while its run stops at a `todo!()` (stubhint.go). A binary older than this
+	// reads only `checks`, and so does the lab page (data.ts), so a course can author
+	// these before the CLI that serves them ships. The tutor is the one reader that
+	// sees them: platform/ai/bundle.ts buildExplainRequest puts the whole raw
+	// hints.json into its prompt, so `labs` text reaches the AI (harmless: it is
+	// free-tier text the tutor already sits above).
+	Labs map[string]labHints `json:"labs,omitempty"`
+}
+
+// labHints is one lab's entry under hints.json `labs`.
+type labHints struct {
+	Build *hintEntry `json:"build,omitempty"`
+	Stub  *stubEntry `json:"stub,omitempty"`
 }
 
 // runHint prints the next rung for one failing check. Exit codes: 0 for a hint
@@ -182,7 +199,7 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 			"to refresh them, and report it if it persists.\n", r.course, err, r.course)
 		return 2
 	}
-	if len(hf.Checks) == 0 {
+	if len(hf.Checks) == 0 && len(hf.Labs) == 0 {
 		fmt.Printf("no hints published for %s.\n", r.course)
 		return 0
 	}
@@ -216,8 +233,22 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 		return 0
 	}
 
+	// The stub state (stubhint.go, G1171): the target's own recorded run stopped at
+	// a `todo!()` in the learner's code, and this lab authors a stub ladder. It is
+	// chosen from the learner's evidence alone and answered with authored text; the
+	// check's own ladder is left where it was.
+	//
+	// NEVER while the stage's last run stopped at the build (requirement 2): a build
+	// that failed ran no test, so the evidence on record belongs to an older run,
+	// and a named `sboot hint <stage> <check>` still reaches here then.
+	stubbed, isStub := stubPanic{}, false
+	stub := hf.labStub(stage)
+	if stub != nil && st.lastRunError(r.course, stage) == "" {
+		stubbed, isStub = classifyStub(st.evidence(r.course, stage, target))
+	}
+
 	entry, ok := hf.Checks[target]
-	if !ok {
+	if !ok && !isStub {
 		fmt.Fprintf(os.Stderr, "No authored hint for `%s` yet. Re-run `sboot test %s` and read its failure evidence — it names what the check looked for and what it found instead.\n", target, stage)
 		return 1
 	}
@@ -253,6 +284,20 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 			}
 		}
 		fmt.Fprintln(os.Stderr)
+	}
+
+	if isStub {
+		ask := st.bumpStubHint(r.course, stage, target, stubbed.sig())
+		if err := st.save(); err != nil {
+			debugf("could not save hint state: %v", err)
+		}
+		fmt.Println(renderStubHint(stage, target, stubbed.where(run, r.tree), *stub, ask, stageStuckURL(r.course, stage)))
+		shown := hintShown{check: target, rung: ask, kind: "stub"}
+		if ask > len(stubTiers(*stub)) {
+			shown.rung = "past"
+		}
+		reportHintShown(r.course, stage, shown)
+		return 0
 	}
 
 	// Advance the rung by one on every ask; monotonic per (course, stage, check).

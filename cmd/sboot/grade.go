@@ -48,6 +48,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -164,6 +165,19 @@ func runGraderNonce(runDir, course, labID, tierSpec, captureOut, tree, nonce str
 	if labDir == "" {
 		run.launchFailed = true
 		run.launchErr = fmt.Errorf("%s resolve printed no lab directory", filepath.Base(engine))
+		return run
+	}
+
+	// ── The emulator (QA WK2-C-2, G1451) ───────────────────────────────────────
+	// A lab that boots needs QEMU on this machine, and the engine cannot say so: it
+	// prints `capture: could not start …`, scores the blank capture (every runtime
+	// row "your kernel never ran"), and the run was recorded as a practice score
+	// against the learner's kernel. Asked here, before a build is spent, and
+	// reported as the grader that could not START — the same path, words and
+	// `sboot hint` note as a missing cargo — so nothing is scored or recorded.
+	if emu := missingEmulator(runDir, labDir); emu != "" {
+		run.launchFailed = true
+		run.launchErr = &exec.Error{Name: emu, Err: exec.ErrNotFound}
 		return run
 	}
 
@@ -579,6 +593,65 @@ func resolveLab(engine, runDir, course, labID string) (labDir string, lg labGrad
 		// output (the same rule as parseVerdict).
 	}
 	return labDir, lg, nil
+}
+
+// emulatorBinary is the program the engine boots a lab's image in
+// (grader/qemu.go's qemuBinary; the same name every booted course installs).
+const emulatorBinary = "qemu-system-x86_64"
+
+// runtimeKindRe matches a lab.toml check whose evidence is the BOOT — the kinds
+// grader/lab.go (*Check).IsRuntime lists (TestRuntimeKindsMatchTheEngine holds the
+// two lists together). The CLI carries no TOML parser (harness/go.mod has no
+// requires), so it reads the spellings of the key a course chain could plausibly
+// emit, not every one TOML allows (G1471): at a line's start, indented or not;
+// inside an inline table (`checks = [{ id = "a", kind = "serial" }]`, after `{`
+// or `,`); bare or quoted
+// (`"kind"`, `'kind'`); the value in a basic, literal or multi-line string. The
+// kind must close its string, so `"serialx"` is not `serial`. Its one false
+// reading — the same text inside some other string, after a comma — would stop a
+// QEMU-less run of a lab that does not boot, loudly, never grade a blank capture.
+// NOT read: an escape in the key or the value (`"\u006bind" = "serial"`,
+// `kind = "s\u0065rial"`) — legal TOML the engine parses as a runtime row, which
+// the CLI would let through to grade without QEMU (its runtime rows scoring 0,
+// not stopped). No course chain emits one.
+var runtimeKindRe = regexp.MustCompile(`(?m)(?:^|[{,])[ \t]*(?:kind|"kind"|'kind')[ \t]*=[ \t]*(?:"""|'''|"|')(serial|vga|fb|ktap)(?:"""|'''|"|')`)
+
+// runTableRe matches a lab.toml `[[run]]` table: a lab whose evidence is the
+// output of commands it declares (the `capture: cmd` courses), never a boot. Every
+// spelling, as runtimeKindRe's (G1471): `[[run]]`, `[[ run ]]`, `[["run"]]`, and
+// the inline array `run = [{ … }]` (a check's own `run = "name"` is a string, not
+// an array, and is not matched).
+var runTableRe = regexp.MustCompile(`(?m)^[ \t]*(?:\[\[[ \t]*(?:run|"run"|'run')[ \t]*\]\]|(?:run|"run"|'run')[ \t]*=[ \t]*\[)`)
+
+// missingEmulator names the emulator when a row of this lab NEEDS the boot and
+// this machine cannot start one, else "": a runtime row (the engine's NeedsRun)
+// in a lab with no `[[run]]` table (whose evidence is commands, never a boot).
+//
+// Not the engine's whole boot rule (grader/cmd/sboot-judge/grade.go: `needRun :=
+// (lab.NeedsRun() || captureOut != "") && !hasRuns`). Its capture term makes
+// `sboot submit` boot even an all-`static` lab, for the private rubric's sake —
+// but with no emulator that boot only fails to start, and the engine grades the
+// static rows and uploads as it always has (TL delta read 2026-10-22: copying the
+// term refused every static-lab submit on a QEMU-less machine, CI's among them).
+// So the question is whether a row reads the capture, not whether the engine
+// tries to make one. TestEmulatorStopIsARowThatReadsTheBoot holds that against
+// the real engine. A lab.toml it cannot read is left to the engine, which grades
+// exactly as it did before.
+func missingEmulator(runDir, labDir string) string {
+	if !filepath.IsAbs(labDir) {
+		labDir = filepath.Join(runDir, labDir)
+	}
+	b, err := os.ReadFile(filepath.Join(labDir, "lab.toml"))
+	if err != nil {
+		return ""
+	}
+	if !runtimeKindRe.Match(b) || runTableRe.Match(b) {
+		return ""
+	}
+	if _, err := exec.LookPath(emulatorBinary); err != nil {
+		return emulatorBinary
+	}
+	return ""
 }
 
 // isCargo reports whether a build command is cargo — the one place this file
