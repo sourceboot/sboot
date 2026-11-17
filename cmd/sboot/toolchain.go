@@ -41,10 +41,25 @@ import (
 // testing reason with teeth: a Mac cannot run the Windows branch, so a pin that
 // only called the Windows helper directly would stay green after the CALL SITE
 // was reverted to a Unix string. Tests set this and drive the shipped paths
-// (onboarding_test.go withHostOS); nothing else ever writes it. The pre-existing
+// (onboarding_test.go withHostOS), or a test binary sets it at link time
+// (hostOSOverride below); nothing else ever writes it. The pre-existing
 // runtime.GOOS reads that decide FACTS about this machine (state.go's config
 // dir, the User-Agent tuple) deliberately do not go through it.
-var hostOS = runtime.GOOS
+var hostOS = hostOSFor(runtime.GOOS, hostOSOverride)
+
+// hostOSOverride is empty in every binary anyone installs. The one writer is a
+// harness test's `go build -ldflags "-X main.hostOSOverride=windows"`
+// (wsl2_test.go builtCLIAs): a refusal ends in os.Exit, so the Windows answer of
+// `sboot start` is only proved through a real process, and a Mac cannot run a
+// Windows one. Nothing reads the environment for it, so no learner can flip it.
+var hostOSOverride string
+
+func hostOSFor(goos, override string) string {
+	if override != "" {
+		return override
+	}
+	return goos
+}
 
 // linkerSignatures are the substrings (matched case-insensitively) that mean "this
 // machine has no linker", per OS.
@@ -204,7 +219,7 @@ func linkerHint(goos string) []string {
 // cltInstallLine is the one Command Line Tools remedy, printed by the linker hint
 // after a failed build and by `sboot start` before a doomed `git init`
 // (concierge.go localRepoStep) — ONE string so the two cannot quote two sizes.
-const cltInstallLine = "xcode-select --install     # about 1 GB on disk, once per machine; click through the dialog"
+const cltInstallLine = "xcode-select --install     # about 2 GB on disk, once per machine; click through the dialog"
 
 // tokenSetLine is how to put a pasted token into the environment on THIS shell.
 // PowerShell has no `export` (D-WIN-4, 2026-09-13): a Windows learner who typed the

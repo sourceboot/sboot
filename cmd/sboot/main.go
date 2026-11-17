@@ -704,6 +704,17 @@ func startNoArg() int {
 // (the workspace-split design "Entitlement: a server-issued grant").
 func prepare(r repo, stage string) string {
 	s, err := ensureSpec(r.course, stage)
+	// A course that runs inside WSL2 stops every command that builds on native
+	// Windows — test, submit, hint, debug — HERE, before the build and so in place
+	// of the rustup/MSVC advice a native build would earn (D-WINDOWS-2, sprint 8
+	// #112; wsl2.go). Asked after ensureSpec, so this run's manifest answers when
+	// the platform was reached, and before its error is reported, so a cached
+	// answer still stops a run the platform refused or could not be reached for.
+	// No request of its own.
+	if hostOS == "windows" && wsl2Stops(courseWindowsMode(r.course, loadState())) {
+		reportWSL2(os.Stderr, r.course, "nothing was built")
+		exitWith(2)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sboot: %v\n", err)
 		exitWith(2)
@@ -1949,8 +1960,10 @@ func submit(r repo, stage string, ga gradedArgs) int {
 		fmt.Fprintf(os.Stderr, "sboot: submission rejected: %s\n", ae.Error())
 		// The same table as the upload's answer (C6): the platform's refusal()
 		// checks the submit limit on this GET too, so a rate-limited learner meets
-		// the 429 HERE, and it must exit 3 exactly as the POST's would. Every other
-		// status the preflight acts on (403, 404, 410) is a 4xx refusal, so 2.
+		// the 429 HERE, and it must exit 3 exactly as the POST's would. So does a
+		// 501 (C3: a backend this deployment cannot serve), as the POST's 501 does.
+		// Every other status the preflight acts on (403, 404, 410) is a 4xx
+		// refusal, so 2.
 		return platformAnswerCode(ae.status)
 	}
 
@@ -2283,6 +2296,30 @@ func submit(r repo, stage string, ga gradedArgs) int {
 			// Through the same submissionLink the fail path uses (R2R-7): with a
 			// ReviewURL present it IS the server's URL — one mechanism, both verdicts.
 			fmt.Fprintf(vw, "  Submitted → %s\n", submissionLink(created.ReviewURL, course, stage, created.ID))
+			// A LAB ALREADY COMPLETED has no Complete button on that page (QA DC1025-1,
+			// G1720): a resubmit of a Completed lab said "press Complete there — that's
+			// what finishes the lab" under a review page reading `[ lab complete ]`. The
+			// submission answer does not carry the stage's completed state, so the
+			// question goes to what this machine knows: the cached progress first, and
+			// when that does not say Completed, the completions answer bare `sboot`
+			// reads (courseProgress: one GET, 10 s, best-effort — on any failure the
+			// cache stands, and the cache not saying Completed means the Complete line,
+			// as before). The same tail `sboot test` gives a Completed lab (G1001).
+			done := st.isVerified(course, stage)
+			if !done {
+				courseProgress(st, course)
+				done = st.isVerified(course, stage)
+			}
+			if done {
+				fmt.Fprintf(vw, "  %s\n", completedLabHint)
+				// No submitted record: a Completed lab is past Complete (mergeSync's
+				// rule, which drops one for every verified stage). Tidiness — every
+				// reader checks isVerified first — but the cache stays truthful (G1720).
+				if err := st.save(); err != nil {
+					debugf("could not save state: %v", err)
+				}
+				return 0
+			}
 			fmt.Fprintln(vw, "  read your review, then press Complete there — that's what finishes the lab")
 			// And bare `sboot` must say the same thing next, offline included: this
 			// stage is submitted, not verified (G972/G994). The next online answer
@@ -2420,7 +2457,8 @@ func reportGateFailure(stage, freshDefault string, res graderRun) {
 // for this stage, before the gate spends a build and a boot on one it will refuse.
 //
 // DELIBERATELY PERMISSIVE: this is an optimisation, not a gate. Only an explicit
-// refusal counts; offline, a 5xx, or a platform too old to answer GET here all
+// refusal counts (a 501 with an `error` is one: C3); offline, any other 5xx, or a
+// platform too old to answer GET here all
 // return nil and the normal path continues, where the POST is still what decides.
 // `sboot submit` must never start refusing because of a network blip, and the
 // local check itself works with no network at all.
@@ -2488,6 +2526,23 @@ func submitPreflightNonce(course, stage string) (string, *apiError) {
 		// stage", but it is also what some deployments answer for a route that has no
 		// GET handler. Refuse only when the body says why — an empty 404 falls through
 		// to the POST rather than making a working submit stop working.
+		if r.Err != "" {
+			return "", &apiError{status: resp.StatusCode, msg: r.Err}
+		}
+	case http.StatusNotImplemented:
+		// A STAGE THIS DEPLOYMENT CANNOT GRADE (ledger C3, 2026-11-07): its
+		// verification config assigns a backend nothing here serves, and the
+		// platform's preflight now says so with the POST's own 501 and sentence
+		// (submissions/route.ts backendRefusal). Refusing here is the value of the
+		// preflight: the POST would refuse the same submission, but only after the
+		// gate had spent a full build and boot on it. Exits 3 like the POST's 501
+		// (platformAnswerCode): no verdict, and the fault is on the platform's side.
+		//
+		// Only with an `error`, like the 404 above: a bare 501 is what some proxy or
+		// an older deployment could answer for a verb it does not route, and that
+		// must keep falling through to the POST rather than stop a working submit.
+		// A platform before the C3 fix never answers this route with a 501, so the
+		// "deliberately permissive" promise above holds against every one of them.
 		if r.Err != "" {
 			return "", &apiError{status: resp.StatusCode, msg: r.Err}
 		}
@@ -2603,7 +2658,32 @@ func runStart(course, dirFlag string, yes bool) {
 	// folder's name does not depend on it (`sourceboot-<course>`, workspaceName).
 	title, firstStage, firstTitle := course, "", ""
 	specTree := ""
-	if m, err := fetchManifest(course); err == nil {
+	m, err := fetchManifest(course)
+	// A course that runs inside WSL2 stops a native Windows start HERE — after the
+	// one request that asks, before a folder, a download or a toolchain line
+	// (D-WINDOWS-2, sprint 8 #112; wsl2.go). The manifest is the platform's word;
+	// when it gave none (a course this account cannot open yet, a network error,
+	// signed out), the catalog is asked once, on Windows only, and its cache after
+	// that, so a signed-in learner is not sent to an access refusal first only to
+	// be told about WSL2 after it. With the private-beta door up a signed-out
+	// caller's catalog is `{"private_beta":true}` (no field), so a signed-out start
+	// is told to log in first and meets the WSL2 line once signed in (G2282).
+	if hostOS == "windows" {
+		mode := ""
+		if err == nil {
+			mode = m.Windows
+		} else {
+			st := loadState()
+			cs, _ := catalog(st)
+			saveQuietly(st)
+			mode = catalogWindowsMode(cs, course)
+		}
+		if wsl2Stops(mode) {
+			reportWSL2(os.Stderr, course, "nothing was fetched or created")
+			exitWith(2)
+		}
+	}
+	if err == nil {
 		if m.Title != "" {
 			title = m.Title
 		}

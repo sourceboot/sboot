@@ -207,7 +207,7 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 	failing, graded := st.lastFailed(r.course, stage)
 
 	target := checkID
-	checkDefaulted := false
+	checkDefaulted, noTranscript := false, false
 	if target == "" {
 		if !graded {
 			fmt.Fprintf(os.Stderr, "Run `sboot test %s` first, then `sboot hint` picks up what failed "+
@@ -222,6 +222,16 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 		// header below), which is how the learner discovers they can target others.
 		target = defaultHintTarget(failing)
 		checkDefaulted = true
+		// A run with nothing on the wire answers with the course's no-output entry,
+		// not the first row it failed (G2538): see noTranscriptTarget.
+		if amb := noTranscriptTarget(hf, failing, st.evidence(r.course, stage, target),
+			allNotStarted(st, r.course, stage, failing)); amb != "" {
+			target, noTranscript = amb, true
+		}
+	} else if graded && len(failing) > 0 && target == ambientNoOutput(hf, failing) {
+		// The no-output entry is no row of the lab, so it is never "passing": named
+		// (the page's grading table and kernel-in-rust's starter name it), it is
+		// served while anything fails, at whatever rung the learner has reached.
 	} else if graded && !containsString(failing, target) {
 		// A passing check cannot be the thing to hint — and refusing here is what
 		// lets the rung marker stay monotonic-forever without ever gating a
@@ -235,20 +245,31 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 
 	// The stub state (stubhint.go, G1171): the target's own recorded run stopped at
 	// a `todo!()` in the learner's code, and this lab authors a stub ladder. It is
-	// chosen from the learner's evidence alone and answered with authored text; the
-	// check's own ladder is left where it was.
+	// chosen from the learner's evidence and answered with authored text; the
+	// check's own ladder is left where it was. When the learner's own source says the
+	// `todo!()` is in a function of theirs rather than a body the lab ships
+	// (stubPanic.owner, G2497), the check's own ladder answers instead, under the
+	// harness's one sentence naming their file:line.
 	//
 	// NEVER while the stage's last run stopped at the build (requirement 2): a build
 	// that failed ran no test, so the evidence on record belongs to an older run,
 	// and a named `sboot hint <stage> <check>` still reaches here then.
 	stubbed, isStub := stubPanic{}, false
+	ownNote := ""
 	stub := hf.labStub(stage)
 	if stub != nil && st.lastRunError(r.course, stage) == "" {
 		stubbed, isStub = classifyStub(st.evidence(r.course, stage, target))
+		if isStub && stubbed.owner(r.osDir()) == stubOwnerLearner {
+			ownNote, isStub = ownStubNote(stage, stubbed.where(run, r.tree)), false
+		}
 	}
 
 	entry, ok := hf.Checks[target]
 	if !ok && !isStub {
+		if ownNote != "" {
+			fmt.Println(ownNote)
+			fmt.Println()
+		}
 		fmt.Fprintf(os.Stderr, "No authored hint for `%s` yet. Re-run `sboot test %s` and read its failure evidence — it names what the check looked for and what it found instead.\n", target, stage)
 		return 1
 	}
@@ -270,6 +291,8 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 		switch {
 		case notStarted:
 			line += p(ansiDim, " # not started — your last run found no test for it yet, so this is what it will check")
+		case noTranscript:
+			line += p(ansiDim, " # no check reported: nothing in your last run's transcript came from the course's tests")
 		case checkDefaulted:
 			line += p(ansiDim, " # your failing check; sboot hint <check> targets another")
 		}
@@ -312,7 +335,11 @@ func runHint(r repo, stage, checkID string, stageDefaulted bool) int {
 	// recorded or nothing matches, which renders the rung unchanged.
 	observed := selectEvidence(entry.Evidence, st.evidence(r.course, stage, target))
 
-	fmt.Println(renderHint(stage, target, entry, rung, observed, stageStuckURL(r.course, stage)))
+	text := renderHint(stage, target, entry, rung, observed, stageStuckURL(r.course, stage))
+	if ownNote != "" {
+		text = withOwnStubNote(text, ownNote)
+	}
+	fmt.Println(text)
 	shown := hintShown{check: target, rung: rung, kind: "check"}
 	if rung > len(hintTiers(entry)) {
 		shown.rung = "past"
@@ -442,6 +469,57 @@ func defaultHintTarget(failing []string) string {
 		}
 	}
 	return failing[0]
+}
+
+// noTranscriptMark is the engine's Layer-0 sentence for a run whose transcript holds
+// no `# sboot nonce` line (grader/nonce.go nonceGate): the course's tests never
+// reached the serial line, so every row failed on that one fact and none of them
+// says anything about its own code. hint_test.go G2538 reads nonce.go to hold this
+// substring to the engine's wording.
+const noTranscriptMark = "transcript has no `# sboot nonce` line"
+
+// ambientNoOutput is the course's authored no-output entry for this lab: a hints.json
+// key `<seg>.no_output` (or `.no-output`) that is not one of the failing rows and
+// shares its first segment with one of them — the web's ambient-hint rule
+// (lib/data.ts stageHints, components/grading-ladder.tsx). "" when the course
+// authors none.
+func ambientNoOutput(hf hintsFile, failing []string) string {
+	for _, id := range failing {
+		seg, _, _ := strings.Cut(id, ".")
+		for _, k := range []string{seg + ".no_output", seg + ".no-output"} {
+			if _, ok := hf.Checks[k]; ok && !containsString(failing, k) {
+				return k
+			}
+		}
+	}
+	return ""
+}
+
+// noTranscriptTarget is the bare hint's target after a run with NOTHING on the wire
+// (QA UX lap 2 UXL2-1, G2538): kernel-in-rust lab 02 before task 4, where every
+// result travels over the learner's own write_str. Answering the first failing row
+// ("operands swapped…") blamed code that was right. The course's no-output entry is
+// the honest answer. The run says so one of two ways: under the task list (every
+// current CLI), the engine marks every row `absent` — no row's test ran — and
+// record() keeps no evidence for an absent row (allNotStarted); on the flat path,
+// each row's recorded evidence is the nonce gate's sentence. "" when the run's
+// transcript arrived or the course authors no such entry.
+func noTranscriptTarget(hf hintsFile, failing []string, evidence string, allNotStarted bool) string {
+	if !allNotStarted && !strings.Contains(evidence, noTranscriptMark) {
+		return ""
+	}
+	return ambientNoOutput(hf, failing)
+}
+
+// allNotStarted reports whether every failing row of the last run was `absent`: no
+// test of the lab ran at all.
+func allNotStarted(st *guidanceState, course, stage string, failing []string) bool {
+	for _, id := range failing {
+		if !st.notStarted(course, stage, id) {
+			return false
+		}
+	}
+	return len(failing) > 0
 }
 
 // renderBlockedHint answers a `sboot hint` whose last run produced no verdict: the

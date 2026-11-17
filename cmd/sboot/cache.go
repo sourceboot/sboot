@@ -127,6 +127,12 @@ type specManifest struct {
 	// field here — an older platform never sends it, and "" means "not a rename",
 	// which is exactly the behaviour this binary had before the field existed.
 	RenamedTo string `json:"renamed_to"`
+	// How this course runs on Windows when that is not natively: "wsl2" or ""
+	// (course.yaml `windows`, sprint 8 #112). Spread by the platform only when
+	// set, so "" is every other course AND every older platform — native, which
+	// refuses nothing (wsl2.go). Rides the manifest so `sboot test` knows it with
+	// no extra request, and offline from the spec.json materialise writes.
+	Windows string `json:"windows,omitempty"`
 }
 
 // specGrader mirrors the platform's `Grader` interface (platform/lib/content.ts).

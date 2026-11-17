@@ -47,6 +47,11 @@ type catalogCourse struct {
 	FreeStages int    `json:"free_stages"`
 	Path       string `json:"path"`
 	PathOrder  int    `json:"path_order"`
+	// "wsl2" or "" — the course's `windows` key (sprint 8 #112; wsl2.go). Absent
+	// from every row without the key and from every older platform. Kept in
+	// state.json's catalog cache, so `start` can still answer from it when the
+	// spec manifest would not.
+	Windows string `json:"windows,omitempty"`
 }
 
 // fetchCatalog pulls the catalog. It accepts both a `{"courses": [...]}` wrapper
