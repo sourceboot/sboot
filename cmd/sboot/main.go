@@ -121,6 +121,7 @@ type gradedArgs struct {
 	stage     string // "" until defaulted
 	check     string // hint, explain
 	defaulted bool   // the stage came from the current-lab rule, not the learner
+	lastRun   bool   // ...and from this machine's last run that did not pass (resolveGradedStage)
 	force     bool
 	jsonOut   bool
 	checks    bool // test: the flat per-check list, not the task list (lab page v2)
@@ -270,40 +271,36 @@ func resolveGradedStage(r repo, ga *gradedArgs, verb string, onFrontier func(*fr
 		fmt.Fprintf(os.Stderr, "sboot: name the lab instead: `sboot %s <stage>` — or reconnect (`sboot login`) and retry.\n", verb)
 		exitWith(2)
 	}
-	// BARE `sboot hint` FOLLOWS THE LAST FAILING RUN (2026-10-03 review round,
-	// D-WIN-2/D-LINUX-1, ledger G464). Below the frontier too, now: the learner who
-	// just ran `sboot test 06` red and typed the `stuck? sboot hint` it printed
-	// was answered about whatever lab the account frontier named — lab 00, once
-	// the verified window had slid. The red lab is fresher than any frontier.
-	// It yields to the frontier's own rule below (unchanged), and it is skipped
-	// when the account already holds the red lab VERIFIED: that is the stale red
-	// the 2026-09-23 skeptic measured (a lab fixed through submit and Complete on
-	// another machine), which must not answer every bare hint on the next lab. A
-	// local passing submit clears the red itself (runGraded → setLastRed).
-	if verb == "hint" && fr == nil {
-		if red := st.lastRedStage(r.course); red != "" && red != lab.Stage && !st.isVerified(r.course, red) {
-			return red
+	// BARE `sboot test` AND `sboot hint` FOLLOW THIS MACHINE'S LAST RUN THAT DID
+	// NOT PASS (sprint 11 #157, sboot-v0.24.0; the kir W1 review's D-LINUX-2 and
+	// K-8, ledger G2611/G2612). One rule, both verbs, both sides of the frontier:
+	//
+	//   the lab your last run here did not pass — a build that died (blocked),
+	//   else a graded run below full marks (red) — unless your account has
+	//   verified that lab since; otherwise the first live lab your account has
+	//   not verified.
+	//
+	// "Since" is mergeSync's (state.go forgetRunsVerifiedSince): a sync that shows
+	// the run's lab verified where the cache it replaces did not drops the run, so
+	// a red lab whose fix went up from another machine stops answering (the
+	// 2026-09-23 skeptic's stale red, G351/G464), while a red RE-TEST of a lab this
+	// machine already knew was verified keeps answering — the lap's `sboot test
+	// 05-idt-faults` on an account at lab 08, whose bare `sboot hint` said "Run
+	// `sboot test 08-own-the-map` first" three times, and whose bare `sboot test`
+	// recorded a 0/10 on the wrong lab. A full-marks run on that lab ends it (a
+	// local passing submit too: runGraded → setLastRed). Before 0.24.0 the rule
+	// held at the frontier only, and below it for `hint` alone, skipping every red
+	// run on a verified lab (G464). `submit`, `explain`, `reveal` and `debug` keep
+	// the account's current lab: a resubmit is a decision (R1-7).
+	if verb == "test" || verb == "hint" {
+		if run := st.unfinishedRun(r.course); run != "" && (fr != nil || run != lab.Stage) {
+			ga.lastRun = true
+			return run
 		}
 	}
 	if fr != nil {
-		// Every live lab is verified — and one of them just went red on THIS
-		// machine (D-MACOS-5 / D-WIN-6, 2026-09-13): bare `sboot test` after
-		// `sboot test 05` scored 8/14 answered "nothing new to grade", and bare
-		// `sboot hint` "nothing to hint", which is the account's truth and not the
-		// learner's. `test` and `hint` answer the red lab from here; a bare
-		// `submit` at the frontier keeps its own gate (a resubmit is a decision,
-		// R1-7), and nothing prefers it below the frontier (hintStage).
-		// A run that produced NO verdict comes first, as in hintStage: the
-		// returning learner whose lab 00 build died on a missing linker typed
-		// the bare `sboot test` the rung told them to (macOS lap, 2026-09-23).
-		if verb == "test" || verb == "hint" {
-			if blocked := st.blockedStage(r.course); blocked != "" {
-				return blocked
-			}
-			if red := st.lastRedStage(r.course); red != "" {
-				return red
-			}
-		}
+		// Every live lab is verified and nothing on this machine is unfinished:
+		// the frontier's own answer (D-MACOS-5 / D-WIN-6 put the red lab above).
 		exitWith(onFrontier(fr))
 	}
 	return lab.Stage
@@ -332,10 +329,13 @@ func resolveGradedStage(r repo, ga *gradedArgs, verb string, onFrontier func(*fr
 // on a new machine, which lab 00 tells them to do — left the frontier to answer,
 // and the frontier said "nothing to hint" over a run that had just printed
 // `stuck? sboot hint`. Since 2026-10-03 (G464, resolveGradedStage) it answers
-// below the frontier too — unless the account holds the red lab VERIFIED: a stale
-// red on lab 03, never re-run green locally because the fix went up through the
-// web's Complete from elsewhere, would otherwise answer every bare hint on lab 04
-// (skeptic, 2026-09-23 — measured). A local passing submit clears the red itself.
+// below the frontier too, and since sboot-v0.24.0 (G2611/G2612) for bare `sboot
+// test` as well, on a lab the account holds verified included — unless the
+// account verified it AFTER the run: a stale red on lab 03, never re-run green
+// locally because the fix went up through the web's Complete from elsewhere,
+// would otherwise answer every bare hint on lab 04 (skeptic, 2026-09-23 —
+// measured), and the sync that first shows 03 verified drops it (state.go
+// forgetRunsVerifiedSince). A local passing submit clears the red itself.
 func hintStage(r repo, ga *gradedArgs) string {
 	if ga.stage == "" {
 		if blocked := loadState().blockedStage(r.course); blocked != "" {
@@ -365,14 +365,21 @@ func frontierMessage(course string, fr *frontierInfo) int {
 // — "The glass cockpit"` — on stderr (messaging; the verdict on stdout must
 // survive `2>/dev/null`). When the stage was defaulted, the line says so and
 // names the override, which is what makes the default legible (§11.c).
-func gradedHeader(verbing, course, stage, verb string, defaulted bool) {
+//
+// A stage the rule took from this machine's last run that did not pass says so
+// (G2612): "your current lab" over lab 05 on an account at lab 08 would read as
+// a wrong answer, and naming why is what makes the rule legible.
+func gradedHeader(verbing, course, stage, verb string, ga gradedArgs) {
 	p := painter(os.Stderr)
 	line := verbing + " " + stage
 	if t := labTitle(course, stage); t != "" {
 		line += fmt.Sprintf(" — %q", t)
 	}
 	line = p(ansiAmber, line)
-	if defaulted {
+	switch {
+	case ga.defaulted && ga.lastRun:
+		line += p(ansiDim, "   # following your last run here, which did not pass — name a stage to pick another")
+	case ga.defaulted:
 		line += p(ansiDim, fmt.Sprintf("   # your current lab; sboot %s <stage> overrides", verb))
 	}
 	fmt.Fprintln(os.Stderr, line)
@@ -578,7 +585,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "sboot: all live labs are verified — name the stage to boot: `sboot debug <stage>`.")
 			return 2
 		})
-		gradedHeader("debugging", r.course, stage, "debug", ga.defaulted)
+		gradedHeader("debugging", r.course, stage, "debug", ga)
 		exitWith(runDebug(r, stage))
 
 	case "hint":
@@ -742,7 +749,7 @@ func runTest(r repo, stage string, ga gradedArgs) {
 // proof that a rebuilt machine really can grade — without a second copy of the
 // run, the ladder bookkeeping and the L2a "graded nothing" rule.
 func runTestCode(r repo, stage string, ga gradedArgs) int {
-	gradedHeader("grading", r.course, stage, "test", ga.defaulted)
+	gradedHeader("grading", r.course, stage, "test", ga)
 	// Where this course's work is, recorded on every test (resume.go): the
 	// command a learner runs most is what keeps the record current for a workspace
 	// made by an older CLI or moved since. And a starter graded against a later
@@ -1868,6 +1875,10 @@ type submissionResp struct {
 	Err       string `json:"error"`
 }
 
+// submitCompleteLine closes a passing `sboot submit` on a lab not yet Completed
+// (#168, G2690): true on every lab, with or without a code review.
+const submitCompleteLine = "Open the lab page and press Complete — that's what finishes the lab."
+
 // uploadBackoff is how long `sboot submit` waits before each RE-send of an upload
 // that failed transiently (ledger C2): three attempts in all, about seven seconds
 // of waiting — short beside the build and run it saves, long enough for a cold
@@ -1923,7 +1934,7 @@ func reportSubmitAuthFailure(msg string, ran bool) {
 
 func submit(r repo, stage string, ga gradedArgs) int {
 	force := ga.force
-	gradedHeader("submitting", r.course, stage, "submit", ga.defaulted)
+	gradedHeader("submitting", r.course, stage, "submit", ga)
 	if line := welcomeAheadLine(loadState(), r, stage, ga.defaulted); line != "" {
 		fmt.Fprintln(os.Stderr, painter(os.Stderr)(ansiDim, line))
 	}
@@ -2320,7 +2331,15 @@ func submit(r repo, stage string, ga gradedArgs) int {
 				}
 				return 0
 			}
-			fmt.Fprintln(vw, "  read your review, then press Complete there — that's what finishes the lab")
+			// One line for every lab (#168, UX-KIR-7): "read your review, then press
+			// Complete there" was false on a lab with no code review (kernel-in-rust
+			// 00-welcome, whose page says "Lab 00 has no code review."), and the
+			// submission answer cannot tell the two apart — the server sends
+			// review_url for a pass with a review row AND for a stage that grades no
+			// learner code (submission-view.ts), the same field either way, and B3
+			// ruled a new /api/v1 field too large. So the line names no review: the
+			// "Submitted →" line above it is the link (G2690).
+			fmt.Fprintln(vw, "  "+submitCompleteLine)
 			// And bare `sboot` must say the same thing next, offline included: this
 			// stage is submitted, not verified (G972/G994). The next online answer
 			// that carries `passed_submissions` replaces the record.
@@ -2793,7 +2812,7 @@ func runStart(course, dirFlag string, yes bool) {
 	fmt.Fprintln(os.Stderr, "── your history starts here")
 	localRepoStep(os.Stderr, abs, course, yes)
 
-	printFirstLab(course, dest, firstStage, firstTitle)
+	printFirstLabIn(course, dest, firstStage, firstTitle, true)
 }
 
 // repairStart is `sboot start` run against a workspace that already exists: put
@@ -2855,7 +2874,9 @@ func repairStart(course, dest, title, firstStage, firstTitle, specTree string, y
 	origin, _ := existingRemote(abs)
 	rememberWorkspace(course, abs, origin)
 	localRepoStep(os.Stderr, abs, course, yes)
-	printFirstLab(course, dest, firstStage, firstTitle)
+	// A repair can be over a starter nobody has touched yet (the first `start`, run
+	// again): that tree is as bare as a fresh one, and gets the same block.
+	printFirstLabIn(course, dest, firstStage, firstTitle, looksFresh(dest, course))
 }
 
 // printFirstLab is the handoff both paths end on: the lab to work next, the
@@ -2874,6 +2895,23 @@ func repairStart(course, dest, title, firstStage, firstTitle, specTree string, y
 // account resolves to the first lab exactly as before, and when the rule cannot
 // answer the first lab is the honest fallback.
 func printFirstLab(course, dest, firstStage, firstTitle string) {
+	printFirstLabIn(course, dest, firstStage, firstTitle, false)
+}
+
+// printFirstLabIn is printFirstLab told whether `dest` holds a bare starter.
+//
+// A BARE STARTER UNDER AN ACCOUNT PART-WAY THROUGH (QA WK1117-1, sprint 11 #157,
+// G2610). On a machine with no record of the learner's earlier workspace, `sboot
+// start` for an account at lab 04 said "pick up at lab 04 — sboot test # grades
+// 04-gdt-tss" over a tree holding none of labs 01–03's code; that `sboot test`
+// scored 0/5 on kernel-in-rust and `sboot hint` blamed lab 04. The block now says
+// what is true — a fresh starter, without those labs' code — and the two ways on:
+// the learner's own copy (`sboot resume`, the remote when this machine recorded
+// one), or the earlier labs again here, each by name, grades kept (a completed lab
+// stays verified forever). Nothing is fetched or stored for it: the labs before
+// the current one are verified by the current-lab rule's own definition, and the
+// welcome lab (00) holds no code, so it is never one of them.
+func printFirstLabIn(course, dest, firstStage, firstTitle string, fresh bool) {
 	firstTest := firstStage
 	if firstTest == "" {
 		firstTest = "01-boot"
@@ -2893,14 +2931,23 @@ func printFirstLab(course, dest, firstStage, firstTitle string) {
 			current, fr = lab, f
 		}
 	}
+	var missing []labInfo // the labs whose code a bare starter lacks
+	if fresh && st != nil && (current.Stage != "" || fr != nil) {
+		missing = codeLabsBefore(course, current.Stage)
+	}
 	if current.Stage != "" || fr != nil {
 		lab := current
 		if fr != nil {
 			fmt.Printf("\nevery live lab in %s is already verified on this account.\n", course)
+			reprove := "# re-proves any lab on this machine"
+			if len(missing) > 0 {
+				freshStarterLines(p, st, course, dest, missing)
+				reprove = "# re-proves a lab once its code is here"
+			}
 			if dest != "." {
 				fmt.Printf("  cd %s\n", dest)
 			}
-			fmt.Printf("  %s            %s\n", p(ansiGreen, "sboot test <lab>"), p(ansiDim, "# re-proves any lab on this machine"))
+			fmt.Printf("  %s            %s\n", p(ansiGreen, "sboot test <lab>"), p(ansiDim, reprove))
 			fmt.Printf("  %s                       %s\n", p(ansiGreen, "sboot"), p(ansiDim, "# the map"))
 			return
 		}
@@ -2929,6 +2976,19 @@ func printFirstLab(course, dest, firstStage, firstTitle string) {
 		}
 	}
 	fmt.Printf("\n%s lab %s — %s:\n", verb, labNumber(firstTest), p(ansiAmber, headline))
+	if len(missing) > 0 {
+		freshStarterLines(p, st, course, dest, missing)
+		if url == "" { // not the Complete block, which needs no code: redo by name
+			// Each by name while more than one is missing: once the first passes in
+			// full, a bare `sboot test` goes back to the account's current lab.
+			next = "sboot test " + missing[0].Stage
+			why = "# or redo " + labSpan(missing) + " here"
+			if len(missing) > 1 {
+				why += ", naming each lab"
+			}
+			why += "; your grades are kept"
+		}
+	}
 	if dest != "." {
 		fmt.Printf("  cd %s\n", dest)
 	}
@@ -2937,6 +2997,48 @@ func printFirstLab(course, dest, firstStage, firstTitle string) {
 		url = fmt.Sprintf("%s/courses/%s/stages/%s", siteURL(), course, firstTest)
 	}
 	fmt.Printf("  %s\n", url)
+}
+
+// codeLabsBefore is the live labs before `stage` in the course's order that hold
+// code — every one but the welcome lab — or, for stage "" (the frontier), every
+// such live lab. The current-lab rule names the first live lab the account has
+// not verified, so each of these is verified. Reads only the lab list this
+// command already fetched or cached.
+func codeLabsBefore(course, stage string) []labInfo {
+	labs, _ := cachedLabsInfo(course)
+	var out []labInfo
+	for _, l := range labs {
+		if stage != "" && l.Stage == stage {
+			break
+		}
+		if l.Live && !isWelcomeLab(l.Stage) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// labSpan names a run of labs the way the CLI says them: "lab 01", "labs 01–03".
+func labSpan(labs []labInfo) string {
+	first, last := labNumber(labs[0].Stage), labNumber(labs[len(labs)-1].Stage)
+	if len(labs) == 1 {
+		return "lab " + first
+	}
+	return "labs " + first + "–" + last
+}
+
+// freshStarterLines are the three lines a bare starter gets under an account with
+// verified code labs (G2610): what is missing, and the way back to the learner's
+// own code as one command that works from where it is printed (ownCodeLine) —
+// the remote this machine recorded, else the placeholder resume.go's notes use.
+func freshStarterLines(p func(string, string) string, st *guidanceState, course, dest string, missing []labInfo) {
+	fmt.Printf("  this folder is a fresh starter, without %s's code (verified on your account).\n", labSpan(missing))
+	url, why := repoURLPlaceholder, "  your own code instead, if you pushed it with `sboot repo`:"
+	if rec := st.Workspaces[course]; rec != nil && rec.Remote != "" {
+		url, why = rec.Remote, "  your own code instead:"
+	}
+	fmt.Println(p(ansiDim, why))
+	fmt.Printf("    %s\n", p(ansiGreen, ownCodeLine(url, course, besideStarter(dest))))
 }
 
 // fetchWorkspace downloads the course's starter tree into `dest`.

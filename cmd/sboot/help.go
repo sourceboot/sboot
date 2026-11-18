@@ -79,6 +79,11 @@ flags:
   --no-color            no ANSI color (NO_COLOR is honored too)
   --                    end of options; everything after is positional
 
+the lab a bare test or hint picks:
+  the lab your last run on this machine did not pass (a failed build, or a score
+  below full marks), unless your account has verified it since; otherwise the
+  first live lab your account has not verified. Name a stage to pick another.
+
 environment:
   SBOOT_API_URL      platform URL           (default %s)
   SBOOT_TOKEN        your API token         (overrides `+"`sboot login`"+`'s stored one)

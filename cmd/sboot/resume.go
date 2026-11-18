@@ -375,17 +375,69 @@ func earlierWork(w io.Writer, rec *workspaceRecord, course, here string) bool {
 	if !said {
 		return false
 	}
+	// Each line is a way on by itself, so a second one says "or": read top to
+	// bottom, `cd <keep>` and then a clone would land inside the old workspace.
 	fmt.Fprintln(w, "   to carry on from your own code rather than a fresh starter:")
+	or := ""
 	if keep != "" {
 		fmt.Fprintf(w, "     cd %s\n", quoteIfSpaced(keep))
+		or = "or: "
 	}
+	beside := besideStarter(here)
 	if rec.Remote != "" {
-		fmt.Fprintf(w, "     sboot resume %s\n", rec.Remote)
+		fmt.Fprintf(w, "     %s%s\n", or, ownCodeLine(rec.Remote, course, beside))
 	}
 	if keep == "" && rec.Remote == "" {
-		fmt.Fprintln(w, "     sboot resume <your repo's url>   # if you pushed it with `sboot repo`")
+		fmt.Fprintf(w, "     %s   # if you pushed it with `sboot repo`\n", ownCodeLine(repoURLPlaceholder, course, beside))
 	}
 	return true
+}
+
+// repoURLPlaceholder stands for the learner's repo when this machine recorded none.
+const repoURLPlaceholder = "<your repo's url>"
+
+// ownCodeLine is the way back to the learner's own repo as ONE command that works
+// from the folder it is printed in (#157 review). `sboot resume <url>` clones into
+// a folder named after the repo, and `sboot repo` names the repo sourceboot-<course>
+// — the folder `sboot start` unpacks the starter into — so a bare `sboot resume
+// <url>` next to the starter is refused ("already exists and is not empty"), and
+// one typed inside it clones a folder deep, into the starter's own repo. So the
+// clone gets a name of its own, my-<course>, in `beside` (the folder holding the
+// starter; "" when that is where the learner already is), and resume takes the
+// folder. No new flag: two commands the learner has, in the order that works.
+func ownCodeLine(url, course, beside string) string {
+	dir := "my-" + course
+	line := "git clone " + url + " " + dir + " && sboot resume " + dir
+	if beside != "" {
+		line = "cd " + quoteIfSpaced(beside) + " && " + line
+	}
+	return line
+}
+
+// besideStarter is the folder that holds `starter` — the folder the clone in
+// ownCodeLine goes to — or "" when that is the current folder (or cannot be told).
+func besideStarter(starter string) string {
+	if starter == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(starter)
+	if err != nil {
+		return ""
+	}
+	parent := filepath.Dir(abs)
+	wd, err := os.Getwd()
+	if err != nil {
+		return parent
+	}
+	if a, err1 := filepath.EvalSymlinks(wd); err1 == nil {
+		if b, err2 := filepath.EvalSymlinks(parent); err2 == nil && a == b {
+			return ""
+		}
+	}
+	if wd == parent {
+		return ""
+	}
+	return parent
 }
 
 // looksFresh reports whether `dir` is still exactly the starter `sboot start`
@@ -434,7 +486,7 @@ func freshScaffoldNote(w io.Writer, st *guidanceState, r repo) {
 	fmt.Fprintf(w, "      has already verified labs in %s. Each lab builds on your code from the labs before it.\n", r.course)
 	if !earlierWork(w, st.Workspaces[r.course], r.course, r.dir) {
 		fmt.Fprintln(w, "   to carry on from your own code rather than a fresh starter:")
-		fmt.Fprintln(w, "     sboot resume <your repo's url>   # if you pushed it with `sboot repo`")
+		fmt.Fprintf(w, "     %s   # if you pushed it with `sboot repo`\n", ownCodeLine(repoURLPlaceholder, r.course, besideStarter(r.dir)))
 	}
 	fmt.Fprintln(w)
 }

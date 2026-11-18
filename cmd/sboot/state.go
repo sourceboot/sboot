@@ -42,8 +42,24 @@ const l2Threshold = 3
 // Bump only for a change an old reader would MISREAD, not merely miss.
 const stateVersion = 1
 
+// rulesVersion is the marker for a change in what a field MEANS that an older
+// file cannot carry: stateVersion cannot move for it (above), so the file says
+// which rules its bookkeeping was written under, and loadState repairs a file
+// written under older ones, once (upgradeRules).
+//
+//	0 (absent)  before sboot-v0.24.0
+//	1           sboot-v0.24.0, sprint 11 #157: `last_red_stage` is read on a lab
+//	            the account holds verified too (G2611/G2612)
+//
+// An older binary ignores the key and drops it on its next save, which is right:
+// what it writes is bookkeeping under the old rules, and the next load repairs it.
+const rulesVersion = 1
+
 type guidanceState struct {
 	Version int `json:"version"`
+	// The rules this file's bookkeeping was written under (rulesVersion); 0 for a
+	// file from before sboot-v0.24.0. Written by every save.
+	RulesVersion int `json:"rules_version,omitempty"`
 	// "course/stage/check-id" -> consecutive failures. A row is deleted the moment
 	// its check passes, so the file stays small and self-pruning.
 	Fails map[string]int `json:"consecutive_failures"`
@@ -153,8 +169,10 @@ type guidanceState struct {
 	// course -> the stage of the most recent LOCAL graded run that did NOT pass
 	// in full, cleared when that same stage later passes in full.
 	//
-	// The second question a bare `sboot hint` (and, at the frontier, a bare
-	// `sboot test`) asks before the account (D-MACOS-5 / D-WIN-6, 2026-09-13):
+	// The second question a bare `sboot hint` and a bare `sboot test` ask before
+	// the account (D-MACOS-5 / D-WIN-6, 2026-09-13; for `test` below the frontier
+	// since sboot-v0.24.0, G2612 — and dropped by the sync that first shows its
+	// lab verified, forgetRunsVerifiedSince):
 	// Blocked above covers a run with no verdict; this covers a run that graded
 	// red on a lab the account already holds verified — the returning learner
 	// re-proving lab 05 on a new machine — who was told "all live labs are
@@ -342,7 +360,42 @@ func loadState() *guidanceState {
 	}
 	s.Workspaces = loaded.Workspaces
 	s.Catalog = loaded.Catalog
+	s.upgradeRules(loaded.RulesVersion)
 	return s
+}
+
+// upgradeRules repairs, once, a file written under older rules (rulesVersion),
+// and marks it dirty so the next save writes the marker.
+//
+// To 1 (sboot-v0.24.0, G2706): every red on a lab this file's cache holds verified
+// is dropped. Before 0.24.0 such a red was skipped at READ time below the frontier
+// (`!isVerified(red)` in resolveGradedStage), so nothing ever forgot it — and the
+// file cannot say whether it was a re-test or a run the account verified past since.
+// Read by 0.24.0's rule, the cache "knew" the lab, so the red would count as a
+// deliberate re-test (forgetRunsVerifiedSince) and bare `test`/`hint` would grade
+// it until a full-marks run. Dropping it is the pre-0.24.0 answer — the account's
+// current lab (at the frontier, where the old CLI did follow it, the frontier's
+// own answer) — and costs at most one re-test red, which the next red run puts
+// back. A blocked run is left alone: it was always the very last run, and the old
+// CLI already followed it on a verified lab for `hint` (hintStage) and for `test`
+// at the frontier — but NOT for bare `test` below the frontier, which 0.23 answered
+// with the current lab. So a build that died on lab N, N verified elsewhere and a
+// pre-0.24 sync on this machine recording it, has 0.24's first bare `test` grade N
+// once (the cache "knew" N); the next run that grades anything clears it. That one
+// stale grade is the cost accepted: dropping blocked runs here would send bare
+// `hint` away from a genuine re-prove build failure (D-WIN-4).
+func (s *guidanceState) upgradeRules(from int) {
+	if from >= rulesVersion {
+		return
+	}
+	if from < 1 {
+		for course, stage := range s.LastRed {
+			if s.isVerified(course, stage) {
+				delete(s.LastRed, course)
+			}
+		}
+	}
+	s.dirty = true
 }
 
 // nudgeDue reports whether a once-a-day nudge has not been printed today.
@@ -377,6 +430,7 @@ func (s *guidanceState) save() error {
 		return err
 	}
 	s.Version = stateVersion
+	s.RulesVersion = rulesVersion
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
@@ -786,9 +840,12 @@ func (s *guidanceState) recordScore(course, stage string, score, max int) {
 }
 
 // setLastRed records a graded run's colour for the course: a red run makes its
-// stage the one a bare hint answers; a full-marks run on that same stage ends the
-// claim. A full-marks run on a DIFFERENT stage leaves it — the red lab is still
-// red, and still the freshest failing thing on this machine.
+// stage the one bare `test` and `hint` answer; a full-marks run on ANY stage ends
+// the claim (sboot-v0.24.0, #157's review). The rule `sboot help` states is "the
+// lab your last run on this machine did not pass": once the last run passed, there
+// is no such lab. Before 0.24.0 a full-marks run on a different stage left the red
+// — harmless while only bare hint read it, wrong once bare test follows it too
+// (red on 06, then 04 passes in full: bare test graded 06, not the current 05).
 func (s *guidanceState) setLastRed(course, stage string, red bool) {
 	switch {
 	case red:
@@ -796,10 +853,11 @@ func (s *guidanceState) setLastRed(course, stage string, red bool) {
 			return
 		}
 		s.LastRed[course] = stage
-	case s.LastRed[course] == stage:
-		delete(s.LastRed, course)
 	default:
-		return
+		if _, had := s.LastRed[course]; !had {
+			return
+		}
+		delete(s.LastRed, course)
 	}
 	s.dirty = true
 }
@@ -807,6 +865,49 @@ func (s *guidanceState) setLastRed(course, stage string, red bool) {
 // lastRedStage is the stage of this course's most recent local red run, or "".
 func (s *guidanceState) lastRedStage(course string) string {
 	return s.LastRed[course]
+}
+
+// unfinishedRun is the lab of this machine's last run in the course that did not
+// pass: one that produced no verdict (Blocked) first, else one that graded below
+// full marks (LastRed), else "". What bare `sboot test` and `sboot hint` answer
+// ahead of the account's current lab (main.go resolveGradedStage, sboot-v0.24.0).
+func (s *guidanceState) unfinishedRun(course string) string {
+	if b := s.Blocked[course]; b != "" {
+		return b
+	}
+	return s.LastRed[course]
+}
+
+// forgetRunsVerifiedSince drops this course's unfinished run — the blocked stage,
+// the red stage, each on its own — when the answer being merged shows that lab
+// verified and the cache it replaces did not, for the same account: the account
+// verified it AFTER the run (a fix that went up from another machine, or through
+// the web), so the run no longer says where the learner is (the 2026-09-23
+// skeptic's stale red; G351, G464). A run on a lab this machine already knew was
+// verified is a deliberate re-test, and stays (D-LINUX-2, G2611/G2612).
+//
+// When the old cache cannot say — none, the `sboot start` seed, another account —
+// a verified lab drops the run: the pre-0.24.0 answer, and the safe one, since it
+// falls back to the account's current lab. No timestamp is stored: the ORDER of
+// two facts this file already keeps is the whole signal.
+func (s *guidanceState) forgetRunsVerifiedSince(course string, old, fresh *courseSync, handle string) {
+	knew := func(stage string) bool {
+		if old == nil || old.Handle == "" || old.Handle != handle {
+			return false
+		}
+		_, ok := old.Verified[stage]
+		return ok
+	}
+	for _, m := range []map[string]string{s.Blocked, s.LastRed} {
+		stage := m[course]
+		if stage == "" {
+			continue
+		}
+		if _, now := fresh.Verified[stage]; now && !knew(stage) {
+			delete(m, course)
+			s.dirty = true
+		}
+	}
 }
 
 // isVerified reports whether the cached server progress holds this stage verified.
@@ -846,7 +947,8 @@ func (s *guidanceState) setSync(course string, sync *courseSync) {
 // Returns the course's progress as stored, which is what the caller should render.
 func (s *guidanceState) mergeSync(course string, fresh *courseSync, handle string, serverHasRows bool) *courseSync {
 	fresh.Handle = handle
-	if old := s.Sync[course]; old != nil && serverHasRows && handle != "" && old.Handle == handle {
+	old := s.Sync[course]
+	if old != nil && serverHasRows && handle != "" && old.Handle == handle {
 		for stage, score := range old.Verified {
 			if _, have := fresh.Verified[stage]; have {
 				continue
@@ -873,6 +975,7 @@ func (s *guidanceState) mergeSync(course string, fresh *courseSync, handle strin
 	for stage := range fresh.Verified { // a Completed lab is past Complete
 		delete(fresh.Submitted, stage)
 	}
+	s.forgetRunsVerifiedSince(course, old, fresh, handle)
 	s.setSync(course, fresh)
 	return fresh
 }
